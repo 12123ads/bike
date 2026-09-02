@@ -158,3 +158,127 @@ async def test_wrong_ca_is_rejected(prepared, tmp_path):
                             cafile=str(other / "ca.crt"))
     finally:
         await svc.stop()
+
+
+# --- mode="cert"（mTLS） -----------------------------------------------------
+
+CERT_PORT = 21886
+
+
+@pytest.fixture
+def cert_mode(tmp_path):
+    """mode="cert" 的完整环境：CA + 服务端证书 + 设备证书。"""
+    certs_dir = tmp_path / "certs"
+    certs.ensure_ca(certs_dir)
+    certs.ensure_server_cert(certs_dir, "127.0.0.1")
+    dev_key, dev_crt = certs.make_device_cert(certs_dir, "bike01", "ebike.local")
+
+    cfg = ServerConfig(
+        db_path=str(tmp_path / "t.db"),
+        api_token="t",
+        mqtt=MqttConfig(
+            plain_bind="",
+            tls_bind=f"127.0.0.1:{CERT_PORT}",
+            certfile=str(certs_dir / "server.crt"),
+            keyfile=str(certs_dir / "server.key"),
+            cafile=str(certs_dir / "ca.crt"),
+            mode="cert",
+            cert_uri_domain="ebike.local",
+            password_file=str(tmp_path / "passwd"),
+        ),
+        devices=[DeviceConfig(id="bike01")],
+    )
+    return cfg, certs_dir, str(dev_crt), str(dev_key)
+
+
+async def test_cert_mode_device_can_publish_and_subscribe(cert_mode):
+    """mode="cert" 必须端到端可用，不只是「CONNECT 通过」。
+
+    **这条防的是一个真实缺陷**：上游的 `UserAuthCertPlugin` 只比对证书 SAN
+    与 client_id，**从不设 `session.username`**（`amqtt/contrib/cert.py:57-83`），
+    而 ACL 插件按 username 查表，None 时退化成 `"anonymous"` → 空列表 → 一律拒。
+    表现是 CONNECT 成功但 **SUBSCRIBE 返回 0x80**，设备永远收不到
+    `dn/cmd` 和 `dn/secret`（远程指令和密钥轮换全废）。
+    `DeviceCertAuthPlugin` 补上 username 之后才真正可用。
+    """
+    import asyncio
+
+    from ebike_server import contract as ct
+
+    cfg, certs_dir, dev_crt, dev_key = cert_mode
+    svc = Service(cfg)
+    await svc.start()
+    try:
+        c = MQTTClient(client_id="bike01", config={
+            "auto_reconnect": False, "keep_alive": 5, "check_hostname": True,
+            "connection": {"cafile": str(certs_dir / "ca.crt"),
+                           "certfile": dev_crt, "keyfile": dev_key},
+        })
+        await c.connect(f"mqtts://127.0.0.1:{CERT_PORT}/",
+                        cafile=str(certs_dir / "ca.crt"))
+
+        granted = await c.subscribe([(f"{ct.PREFIX}/bike01/dn/#", 1)])
+        assert granted == [1], f"订阅被拒（{granted}）—— ACL 拿不到身份"
+
+        # 下行真的能到设备
+        dn_id = await svc.enqueue_cmd("bike01", "locate")
+        msg = await asyncio.wait_for(c.deliver_message(), timeout=5)
+        assert dn_id in msg.data.decode()
+
+        # 上行也能落库
+        await c.publish(ct.topic("bike01", ct.UP_LOC),
+                        ct.dumps({"t": 1, "q": 1, "s": "g",
+                                  "la": 31.230416, "lo": 121.473701}), qos=1)
+        for _ in range(60):
+            if await svc.store.last_loc("bike01"):
+                break
+            await asyncio.sleep(0.05)
+        assert await svc.store.last_loc("bike01") is not None
+        await c.disconnect()
+    finally:
+        await svc.stop()
+
+
+async def test_cert_mode_acl_still_scoped_to_own_device(cert_mode):
+    """补上 username 不能顺手把 ACL 放开：订别的车仍然要被拒。"""
+    from ebike_server import contract as ct
+
+    cfg, certs_dir, dev_crt, dev_key = cert_mode
+    svc = Service(cfg)
+    await svc.start()
+    try:
+        c = MQTTClient(client_id="bike01", config={
+            "auto_reconnect": False, "keep_alive": 5, "check_hostname": True,
+            "connection": {"cafile": str(certs_dir / "ca.crt"),
+                           "certfile": dev_crt, "keyfile": dev_key},
+        })
+        await c.connect(f"mqtts://127.0.0.1:{CERT_PORT}/",
+                        cafile=str(certs_dir / "ca.crt"))
+        refused = await c.subscribe([(f"{ct.PREFIX}/bike99/dn/#", 1)])
+        assert refused == [128], f"订到了别的车的下行（{refused}）"
+        await c.disconnect()
+    finally:
+        await svc.stop()
+
+
+def test_publish_acl_assertion_covers_every_device():
+    """原来的断言是「publish_acl 非空」，而 build_acl 里已经塞了 svc 键 ——
+    那条 raise 永远不会触发。改成逐设备检查之后才真的是一道保险。"""
+    cfg = ServerConfig(devices=[DeviceConfig(id="bike01")])
+    cfg.mqtt.plain_bind = "127.0.0.1:1883"
+    cfg.mqtt.tls_bind = ""
+
+    import ebike_server.broker as bmod
+    real = bmod.build_acl
+
+    def drop_device(c):
+        pub, sub = real(c)
+        pub.pop("bike01", None)          # 模拟漏配
+        return pub, sub
+
+    bmod.build_acl = drop_device
+    try:
+        with pytest.raises(RuntimeError, match="publish ACL"):
+            build_broker_config(cfg)
+    finally:
+        bmod.build_acl = real

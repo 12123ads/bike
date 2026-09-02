@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from amqtt.broker import BrokerContext
+from amqtt.contrib.cert import UserAuthCertPlugin
 from amqtt.plugins.base import BasePlugin
 from amqtt.session import ApplicationMessage, Session
 
@@ -85,6 +86,36 @@ class IngestPlugin(BasePlugin[BrokerContext]):
         用 dacite 严格模式填充它）。"""
 
 
+class DeviceCertAuthPlugin(UserAuthCertPlugin):
+    """mTLS 认证 + **把身份写进 session.username**。
+
+    上游的 `UserAuthCertPlugin` 只比对证书 SAN 与 client_id 然后返回布尔，
+    **从不设置 `session.username`**（`amqtt/contrib/cert.py:57-83`）。
+    而 `TopicAccessControlListPlugin` 是按 `session.username` 查 ACL 的，
+    None 时退化成 `"anonymous"`（`amqtt/plugins/topic_checking.py:77-79`），
+    查出来是空列表 → 一律拒。
+
+    本机实测（mode="cert"，设备证书 SAN = spiffe://ebike.local/device/bike01）：
+
+    - CONNECT 通过（认证本身没问题）
+    - SUBSCRIBE 返回 **0x80 拒绝** → **设备永远收不到 dn/cmd 和 dn/secret**，
+      远程指令和密钥轮换全废
+    - PUBLISH 的报文**仍然落了库** —— 但那是因为 IngestPlugin 挂的
+      MESSAGE_RECEIVED 早于 ACL 检查（`amqtt/broker.py:753`），
+      broker 的转发其实也被拒了。靠一个巧合工作，不是设计。
+
+    所以这里补上 username。用 `client_id` 而不是 SAN 里的 device id：
+    父类已经断言过两者相等（`cert.py:78` 的 `match.group(1) == session.client_id`），
+    取哪个都一样，但 client_id 不用再解析一次证书。
+    """
+
+    async def authenticate(self, *, session: Session) -> bool | None:
+        ok = await super().authenticate(session=session)
+        if ok and not session.username:
+            session.username = session.client_id
+        return ok
+
+
 def build_acl(cfg: ServerConfig) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
     """契约 §3 的那张表，生成出来。
 
@@ -115,9 +146,12 @@ def build_broker_config(cfg: ServerConfig) -> dict[str, Any]:
     映射，dict 形式和文档一致，也更容易在测试里改一两项。
     """
     publish_acl, subscribe_acl = build_acl(cfg)
-    if not publish_acl:
-        # amqtt 的坑 #1：publish-acl 空 = 全放行。这里不允许发生。
-        raise RuntimeError("publish ACL 为空，会导致发布全放行")
+    # amqtt 的坑 #1：publish-acl 空 = 全放行（`topic_checking.py:69-71`）。
+    # 断言的是「每个已配置设备都有 publish 条目」而不是「字典非空」——
+    # 后者恒真（build_acl 里已经塞了 svc 键），那条断言从来不会触发。
+    missing = [d.id for d in cfg.devices if not publish_acl.get(d.id)]
+    if missing:
+        raise RuntimeError(f"这些设备没有 publish ACL 条目，会导致发布全放行：{missing}")
 
     listeners: dict[str, Any] = {}
     if cfg.mqtt.plain_bind:
@@ -145,8 +179,10 @@ def build_broker_config(cfg: ServerConfig) -> dict[str, Any]:
     listeners["default"] = listeners.pop(first)
 
     if cfg.mqtt.mode == "cert":
+        # 用自己的子类而不是上游的 UserAuthCertPlugin：后者不设 session.username，
+        # 导致 ACL 查 "anonymous" 然后一律拒（见 DeviceCertAuthPlugin 的说明）。
         auth_plugin: dict[str, Any] = {
-            "amqtt.contrib.cert.UserAuthCertPlugin": {
+            "ebike_server.broker.DeviceCertAuthPlugin": {
                 "uri_domain": cfg.mqtt.cert_uri_domain,
             }
         }
