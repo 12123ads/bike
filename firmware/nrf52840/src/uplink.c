@@ -13,11 +13,111 @@
 #include <string.h>
 #include <errno.h>
 
+#include <zephyr/drivers/hwinfo.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/sys/reboot.h>
 
 LOG_MODULE_REGISTER(uplink, CONFIG_EBIKE_LOG_LEVEL);
+
+/* --- 复位原因（契约 §5.1 的 rst 五值闭集） ---------------------------------
+ *
+ * `hwinfo_get_reset_cause()` 在 nRF52840 上读的是 `POWER->RESETREAS`，
+ * 映射由 `drivers/hwinfo/hwinfo_nrf.c` 完成。两条必须知道的事实：
+ *
+ * 1. **上电复位（POR/BOR）什么位都不置，`cause == 0`。** nRF 驱动没有
+ *    「reason==0 → RESET_POR」这条，flags 从 0 开始逐位 OR 而已。
+ *    nRF52840 上 `RESET_POR` 只在 VBUS 位（USB 插入唤醒）时出现，语义是错配的，
+ *    别拿它判 POR。所以 `por` 必须映射成 `cause == 0`。
+ * 2. **RESETREAS 是累积寄存器**，只有写 1 清位或断电才归零。不清的话，
+ *    有史以来按过一次 RESET 键就永远带着 `RESET_PIN`，`cause == 0`
+ *    这个「por」判据从此永不成立。所以**开机读完立刻清**。
+ *
+ * ⚠ `RESET_LOW_POWER_WAKE` 在 nRF52840 上是三合一的：System OFF 的
+ * GPIO DETECT(bit16)、LPCOMP(bit17)、NFC 场唤醒(bit19) 都映到它。
+ * 本工程开着 NFCT，如果将来启用 NFC 场唤醒，要区分「运动唤醒」和
+ * 「手机贴上来唤醒」就得自己读原始 RESETREAS。当前只用 System OFF，
+ * 所以统一报 `off` 是准确的。
+ */
+static const char *reset_cause_str(void)
+{
+	/* **只读一次**：下面会清掉 RESETREAS，第二次读就是 0（= "por"）了。
+	 * 一次开机里所有 hello 都该报同一个真实原因。 */
+	static const char *cached;
+
+	if (cached != NULL) {
+		return cached;
+	}
+	cached = "por";
+
+	uint32_t cause = 0;
+	int rc = hwinfo_get_reset_cause(&cause);
+
+	if (rc != 0) {
+		/* -ENOSYS = 这个平台没有 hwinfo 实现（weak stub）。
+		 * 编译期发现不了，只能在这里暴露出来。 */
+		LOG_WRN("读不到复位原因 rc=%d —— 上报 por", rc);
+		return cached;
+	}
+
+	/* 读完立刻清，否则下次开机读到历史位（见上面第 2 条）。
+	 * 失败只记日志：清不掉不影响本次上报，只影响下次的准确性。 */
+	if (hwinfo_clear_reset_cause() != 0) {
+		LOG_WRN("清复位原因失败 —— 下次的 rst 可能带历史位");
+	}
+
+	/* 顺序要紧：同一次复位可能置多位，先判具体原因，最后才落到通用的。 */
+	if (cause == 0) {
+		cached = "por";               /* 上电/欠压，见上面第 1 条 */
+	} else if (cause & RESET_PIN) {
+		cached = "pin";
+	} else if (cause & RESET_WATCHDOG) {
+		cached = "wdt";
+	} else if (cause & RESET_LOW_POWER_WAKE) {
+		cached = "off";               /* System OFF 被 GPIO DETECT 唤醒 */
+	} else if (cause & RESET_SOFTWARE) {
+		cached = "soft";              /* sys_reboot() / NVIC_SystemReset() */
+	} else {
+		/* 剩下的（CPU lockup、调试事件）契约里没有对应取值。
+		 * 报 por 而不是编一个新值 —— 发契约里没写的值是污染。 */
+		LOG_INF("复位原因 0x%08x 不在契约的五值里，上报 por", cause);
+		cached = "por";
+	}
+
+	LOG_INF("复位原因 0x%08x → rst=\"%s\"", cause, cached);
+	return cached;
+}
+
+/* --- 欠压状态（DESIGN.md §6） ----------------------------------------------- */
+
+static atomic_t batt_level;   /* 0~3，见 battery.h */
+
+void uplink_note_battery(int mv, int level)
+{
+	int old = (int)atomic_set(&batt_level, level);
+
+	if (level != old) {
+		LOG_WRN("欠压等级 %d → %d（%d mV）：%s", old, level, mv,
+			level == 0 ? "恢复正常" :
+			level == 1 ? "降低上报频率" :
+			level == 2 ? "停周期上报，只保留离线开锁" :
+				     "准备进 System OFF");
+	}
+}
+
+int uplink_batt_level(void)
+{
+	return (int)atomic_get(&batt_level);
+}
+
+bool uplink_should_report(void)
+{
+	/* 等级 2/3：停周期上报。手机 NFC 开锁完全离线（DESIGN.md §5.2），
+	 * 不受影响；运动事件仍然会经 uplink_request_now() 强行上报一轮 ——
+	 * 车在这个电量下被动了，比省那点电重要。 */
+	return uplink_batt_level() < 2;
+}
 
 /* 待发事件队列。省电档下不为单条事件开模组，攒到下一轮一起发。
  * 8 个：一次骑行过程里的 motion/still/unlock 加起来通常不超过这个数，
@@ -279,7 +379,7 @@ int uplink_cycle(bool want_gnss)
 	 * 判断要不要补发密钥，也靠它触发下行队列冲刷。 */
 	int n = proto_enc_hello(msg_buf, sizeof(msg_buf), modem_utc(),
 				nvstore_next_q(), nvstore_boot_count(),
-				"por", unlock_current_kid());
+				reset_cause_str(), unlock_current_kid());
 	if (n > 0) {
 		(void)modem_publish(TOPIC_UP_HELLO, (const uint8_t *)msg_buf,
 				    (size_t)n, 1);
@@ -339,7 +439,17 @@ int uplink_cycle(bool want_gnss)
 		.volt = mv > 0 ? (float)mv / 1000.0f : 0.0f,
 		.csq = (int8_t)modem_csq(),
 		.uptime = (uint32_t)(k_uptime_get() / 1000),
-		.temp = 0,
+		/* ⚠ **不报芯片温度。** 以前这里硬编码 `.temp = 0`，那是假数据 ——
+		 * 服务端会当真值落库，图上出现一条 0 °C 的直线，而没人知道它是假的。
+		 *
+		 * 真读也不值得：nRF52840 的内置传感器测的是**结温**不是环境温度
+		 * （旁边 modem 一发射就自热几度），而且精度是 ±5 °C
+		 * （TTEMP,ACC，外加 ±2.5 °C 的 25 °C 点偏移）—— 真实 25 °C 可能报 20
+		 * 也可能报 30。它还要拉 HFXO（PS 要求晶振才能达到标称精度）。
+		 * 一个 ±5 °C 的数字不值得为它付这些，也不值得占报文字节。
+		 * 契约 §5.3 明确写了 tmp 可省，所以整个字段不发。
+		 */
+		.has_temp = false,
 	};
 	n = proto_enc_tele(msg_buf, sizeof(msg_buf), &tele);
 	if (n > 0) {
@@ -347,7 +457,8 @@ int uplink_cycle(bool want_gnss)
 				    (size_t)n, 1);
 	}
 
-	/* 欠压检查（DESIGN.md §6 的软件兜底） */
+	/* 欠压兜底（DESIGN.md §6）。四级里这里做前两级的**上报**，
+	 * 第 2/3/4 级的**行为**由 uplink_低压档 那套在下面和主循环里执行。 */
 	int lvl = battery_low_level(mv);
 	if (lvl > 0) {
 		char detail[48];
@@ -355,6 +466,7 @@ int uplink_cycle(bool want_gnss)
 			       lvl, (double)tele.volt);
 		(void)uplink_queue_event(EV_LOWBATT, detail);
 	}
+	uplink_note_battery(mv, lvl);
 
 	flush_events();
 

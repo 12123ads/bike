@@ -136,12 +136,3 @@ int motion_init(motion_cb cb)
 	LOG_INF("运动检测就绪");
 	return 0;
 }
-
-int motion_prepare_for_sleep(void)
-{
-	/* LIS2DW12 的中断是电平/脉冲输出，nRF52840 侧靠 GPIOTE PORT 事件
-	 * 从 System OFF 唤醒（prj.conf 里 CONFIG_GPIO_NRFX_INTERRUPT_DETECT_MODE_PORT=y）。
-	 * 驱动已经把引脚配成中断源了，这里不需要额外动作 —— 留这个函数是为了
-	 * 让休眠路径上有一个明确的挂钩点，将来要加「关掉 low-noise」之类的省电动作时有地方放。 */
-	return 0;
-}

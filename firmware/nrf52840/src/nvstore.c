@@ -61,10 +61,24 @@ static int on_setting(const char *name, size_t len, settings_read_cb read_cb,
 	}
 	if (settings_name_steq(name, "users", NULL)) {
 		/* 长度必须精确匹配，否则说明落盘格式变了 —— 宁可当没有，
-		 * 也不要把错位的字节当密钥用。 */
-		if (len != sizeof(user_mirror)) {
+		 * 也不要把错位的字节当密钥用。
+		 *
+		 * 落盘块 = 1 字节版本号 + MAX_USERS 个 user_key。版本号让
+		 * 「改了 struct user_key 布局但大小没变」这种情况也能被发现 ——
+		 * 只校长度的话那种改动会静默读出乱码密钥。 */
+		uint8_t ver = 0;
+
+		if (len != sizeof(ver) + sizeof(user_mirror)) {
 			LOG_ERR("密钥块长度 %zu，期望 %zu —— 忽略（格式变了？）",
-				len, sizeof(user_mirror));
+				len, sizeof(ver) + sizeof(user_mirror));
+			return 0;
+		}
+		if (read_cb(cb_arg, &ver, sizeof(ver)) < 0) {
+			return -EINVAL;
+		}
+		if (ver != NVSTORE_USERS_VERSION) {
+			LOG_ERR("密钥块版本 %u，期望 %u —— 忽略（升级了格式？）",
+				ver, NVSTORE_USERS_VERSION);
 			return 0;
 		}
 		if (read_cb(cb_arg, user_mirror, sizeof(user_mirror)) < 0) {
@@ -78,6 +92,20 @@ static int on_setting(const char *name, size_t len, settings_read_cb read_cb,
 
 SETTINGS_STATIC_HANDLER_DEFINE(ebike, "ebike", NULL, on_setting, NULL, NULL);
 
+/* --- users 落盘（带版本号） --------------------------------------------------- */
+
+/* 写 `1 字节版本 + MAX_USERS 个 user_key`。读侧在 on_setting 里校两样：
+ * 总长度和版本号。只校长度的话，「改了 user_key 布局但大小没变」会静默
+ * 读出乱码密钥 —— 那是最难查的一类 bug。**必须持 lock 调。** */
+static int save_users_locked(void)
+{
+	uint8_t blob[sizeof(uint8_t) + sizeof(user_mirror)];
+
+	blob[0] = NVSTORE_USERS_VERSION;
+	memcpy(&blob[1], user_mirror, sizeof(user_mirror));
+	return settings_save_one(KEY_USERS, blob, sizeof(blob));
+}
+
 /* --- counter 延迟写 ---------------------------------------------------------- */
 
 static void counter_work_fn(struct k_work *work)
@@ -85,8 +113,7 @@ static void counter_work_fn(struct k_work *work)
 	ARG_UNUSED(work);
 	k_mutex_lock(&lock, K_FOREVER);
 	if (counter_dirty) {
-		int rc = settings_save_one(KEY_USERS, user_mirror,
-					   sizeof(user_mirror));
+		int rc = save_users_locked();
 		if (rc != 0) {
 			LOG_ERR("counter 落盘失败 rc=%d", rc);
 		} else {
@@ -157,7 +184,7 @@ int nvstore_save_users(const struct user_key *users, size_t n, uint16_t kid)
 	k_mutex_lock(&lock, K_FOREVER);
 	memcpy(user_mirror, users, sizeof(user_mirror));
 	p.kid = kid;
-	int rc = settings_save_one(KEY_USERS, user_mirror, sizeof(user_mirror));
+	int rc = save_users_locked();
 	if (rc == 0) {
 		counter_dirty = false;
 		rc = settings_save_one(KEY_KID, &p.kid, sizeof(p.kid));

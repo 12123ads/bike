@@ -58,7 +58,18 @@ config EBIKE_LOW_VOLT_2
 	int "第二欠压阈值（毫伏）"
 	default 44000
 	help
-	  跨过只保留开锁与被查询，停止周期上报。
+	  跨过就停止周期上报，只保留手机 NFC 开锁（那条路完全离线，不吃车电池
+	  的通信开销）。运动事件仍然会触发一次上报 —— 车在这个电量下被动了，
+	  比省那点电重要。
+
+config EBIKE_LOW_VOLT_3
+	int "第三欠压阈值（毫伏）"
+	default 42000
+	help
+	  跨过就主动进 System OFF，只留运动唤醒（DESIGN.md §6 第 4 级）。
+	  这一级是保护**车电池**不被抽空，不是保护设备自己（设备没有独立电源）。
+	  42 V 是 48 V 铅酸 12 节 × 1.75 V/节 的物理底线；锂电要按 BMS 截止点改。
+	  必须 < LOW_VOLT_2，否则第 2 级永远不会生效。
 
 config EBIKE_ALLOW_REMOTE_UNLOCK
 	bool "接受下行的 unlock 指令"

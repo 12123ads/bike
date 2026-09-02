@@ -77,7 +77,10 @@ struct proto_tele {
 	float volt;        /* 电池电压 V */
 	int8_t csq;        /* AT+CSQ 的 rssi，负数缺省 */
 	uint32_t uptime;
+	/* 芯片结温，摄氏度。**不能用负数当缺省标记** —— 冬天真的会是负的，
+	 * 所以缺省靠下面的 has_temp。契约 §5.3 说 tmp 可省。 */
 	int8_t temp;
+	bool has_temp;
 };
 
 /* 解析出来的下行指令 */

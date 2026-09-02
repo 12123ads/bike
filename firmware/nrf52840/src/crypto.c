@@ -1,4 +1,5 @@
-/* PSA Crypto 封装。见 crypto.h 的两条硬要求。 */
+/* PSA Crypto 封装。见 crypto.h：DMA 只能到 SRAM，以及为什么不用手动关
+ * CryptoCell（驱动自己引用计数管 ENABLE）。 */
 
 #include "crypto.h"
 

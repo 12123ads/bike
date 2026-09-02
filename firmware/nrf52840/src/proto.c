@@ -158,8 +158,16 @@ int proto_enc_tele(char *buf, size_t len, const struct proto_tele *t)
 		}
 		n += k;
 	}
-	int k = snprintf(buf + n, len - n, ",\"tmp\":%d}", t->temp);
-	return finish(n + k, len);
+	if (t->has_temp) {
+		int k = snprintf(buf + n, len - n, ",\"tmp\":%d", t->temp);
+		if (k < 0 || (size_t)(n + k) >= len) {
+			return -ENOMEM;
+		}
+		n += k;
+	}
+	/* 契约 §5.3：tmp 可省。没读到温度就整个字段不发 ——
+	 * 发一个假的 0 会被服务端当真值落库，图上出现一条 0 °C 的直线。 */
+	return finish(n + snprintf(buf + n, len - n, "}"), len);
 }
 
 int proto_enc_event(char *buf, size_t len, uint32_t t, uint32_t q,

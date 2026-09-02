@@ -31,9 +31,14 @@ int motion_init(motion_cb cb);
 /* 设阈值。100~200 mg 是电瓶车的起调范围。 */
 int motion_set_threshold_mg(uint16_t mg);
 
+/* 当前状态。**注意 main.c 用的是自己那份 `moving`** —— 那份由回调更新，
+ * 是「上次事件说的」；这个是查询驱动状态机。两者一致，留这个是给调试用。 */
 enum motion_state motion_current(void);
 
-/* 进 System OFF 前调：确认中断被配成能唤醒芯片的形式。 */
-int motion_prepare_for_sleep(void);
+/* 曾经有个 motion_prepare_for_sleep()：已删除。
+ * 它是个空壳，注释还声称「驱动已经把引脚配好了不用额外动作」——那是错的：
+ * 驱动配的是边沿触发（GPIOTE IN 事件），而 GPIOTE 在 System OFF 下断电。
+ * 正确的武装动作（改成 level sense + 等引脚回低 + suspend 外设）有严格顺序，
+ * 整段放在 main.c 的 enter_system_off() 里。 */
 
 #endif /* EBIKE_MOTION_H */

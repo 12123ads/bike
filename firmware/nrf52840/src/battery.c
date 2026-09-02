@@ -108,11 +108,14 @@ int battery_low_level(int mv)
 	if (mv <= 0) {
 		return 0;   /* 读失败不当欠压处理 —— 误报会让人白跑一趟 */
 	}
+	if (mv < CONFIG_EBIKE_LOW_VOLT_3) {
+		return 3;   /* 主动进 System OFF，只留运动唤醒（§6 第 4 级） */
+	}
 	if (mv < CONFIG_EBIKE_LOW_VOLT_2) {
-		return 2;
+		return 2;   /* 停周期上报，只保留离线开锁（§6 第 3 级） */
 	}
 	if (mv < CONFIG_EBIKE_LOW_VOLT_1) {
-		return 1;
+		return 1;   /* 降低上报频率并上报状态（§6 第 2 级） */
 	}
 	return 0;
 }

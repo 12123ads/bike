@@ -14,21 +14,36 @@
 
 / {
 	aliases {
+		/* ⚠ **只保留真正被 DT_ALIAS 取用的那一个。**
+		 * 其余六个（lock-drive / lock-sense / batt-gate / gnss-power /
+		 * modem-pwrkey / modem-ri）删掉了：所有 .c 文件一律用
+		 * `DT_NODELABEL(...)`，那些别名是纯装饰，留着只会让人以为
+		 * 换引脚时改别名就够了。
+		 *
+		 * `motion-int` 留着是因为 main.c 的 `enter_system_off()` 用
+		 * `DT_ALIAS(motion_int)` 拿这根线 —— 它要绕过 LIS2DW12 驱动
+		 * 自己把触发方式从边沿改成 level sense（GPIOTE 在 System OFF
+		 * 下断电，只有 SENSE→DETECT 能唤醒）。 */
 		motion-int = &motion_int;
-		lock-drive = &lock_drive;
-		lock-sense = &lock_sense;
-		batt-gate = &batt_gate;
-		gnss-power = &gnss_power;
-		modem-pwrkey = &modem_pwrkey;
-		modem-ri = &modem_ri;
 	};
 
 	ebike_gpios {
 		compatible = "gpio-keys";
 
-		/* LIS2DW12 INT1。必须是 PORT 事件（prj.conf 里配了），
-		 * 且传感器侧必须配成推挽高有效 —— 开漏+上拉会让引脚停在
-		 * VIL/VIH 之间，nRF52840 手册明确说那会增加电流（DESIGN.md §3.7）。 */
+		/* LIS2DW12 INT1。
+		 * ⚠ **这个节点和 `&lis2dw12` 的 `irq-gpios` 是同一根物理线**
+		 * （都是 P1.11）。两处声明是故意的、也是必需的：
+		 * 传感器驱动按边沿触发配它（`GPIO_INT_EDGE_TO_ACTIVE`），
+		 * 而进 System OFF 前应用层必须把它重配成 level sense
+		 * （见 main.c 的 `enter_system_off()`）—— 那需要一个
+		 * 独立于传感器驱动的 `gpio_dt_spec`，就是这个节点。
+		 *
+		 * `gpio-keys` 只是借用一个通用的 GPIO 容器 binding；
+		 * `CONFIG_GPIO_KEYS` 没开，所以上游 gpio_keys 驱动不会实例化它。
+		 *
+		 * 传感器侧必须配成推挽高有效 —— 开漏+上拉会让引脚停在
+		 * VIL/VIH 之间，nRF52840 手册明确说那会增加电流（DESIGN.md §3.7），
+		 * 而且悬空电平会让 level sense 反复自触发。 */
 		motion_int: motion_int {
 			gpios = <&gpio1 11 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
 			label = "LIS2DW12 INT1";
@@ -80,10 +95,19 @@
 		 * ⚠ 必须配 AT^WAKEUPHEX 把 RI 限定到魔术下行串，否则每条例行 URC
 		 * 都会把主控从 System OFF 拽出来，功耗预算直接崩（DESIGN.md §8.3）。
 		 * ⚠⚠ 这两条命令在 AT 固件 V1011 上能不能用**未核实**（§8.7），
-		 * R0 阶段用一根 UART 线先验。 */
+		 * R0 阶段用一根 UART 线先验。
+		 *
+		 * ⚠⚠⚠ **两件事都还没落地，这个节点目前只是声明**：
+		 * 1. P0.26 是**占位脚号**（DESIGN.md §11 #18）。真实的 MAIN_RI
+		 *    脚号至今无来源（`docs.openluat.com/4Gmodulepin/` 404），
+		 *    **布板前必须查 `Air780EP硬件手册V1.1.pdf`**。
+		 * 2. **没有任何 C 代码取用它**（全 src 搜 `modem_ri` 只有这里）。
+		 *    modem.c 发了 `AT+CFGRI=1`，但主控侧没人监听这根线 ——
+		 *    「模组主动唤醒主控」这条链目前是半条。
+		 *    定完脚号之后还要写监听代码。 */
 		modem_ri: modem_ri {
 			gpios = <&gpio0 26 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
-			label = "Air780EP MAIN_RI";
+			label = "Air780EP MAIN_RI (占位脚号，无代码取用)";
 		};
 	};
 

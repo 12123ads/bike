@@ -27,7 +27,11 @@ struct user_key;   /* unlock.h */
  * 省电档 15 分钟一报的话，够 52 天。 */
 #define NVSTORE_Q_BATCH   5000
 
-/* 密钥落盘格式的版本。改 struct user_key 的布局必须升这个数。 */
+/* 密钥落盘格式的版本。**它真的参与校验**：落盘块是
+ * `1 字节版本 + MAX_USERS 个 user_key`，读侧同时校总长度和版本号。
+ * 改 struct user_key 的布局必须升这个数 —— 只靠长度校验的话，
+ * 「布局改了但大小没变」会静默读出乱码密钥。
+ * 升版本号之后老设备开机会 `LOG_ERR` 并当作没有密钥（只能用机械钥匙）。 */
 #define NVSTORE_USERS_VERSION 1
 
 int nvstore_init(void);

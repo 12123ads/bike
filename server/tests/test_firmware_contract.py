@@ -140,7 +140,27 @@ def test_hello_field_names(proto_c, field):
 
 @pytest.mark.parametrize("field", ["v", "csq", "up", "tmp"])
 def test_tele_field_names(proto_c, field):
+    """契约 §5.3。`tmp` 的编码路径仍然在（有真值时会发），
+    只是当前固件不采温度所以恒缺席 —— 见 test_tele_temp_is_optional。"""
     assert f'\\"{field}\\":' in proto_c
+
+
+def test_tele_temp_is_optional(proto_c):
+    """契约 §5.3 说 `tmp` 可省。**不能用假值占位。**
+
+    固件曾经硬编码 `.temp = 0`，服务端会把它当真值落库 ——
+    图上出现一条 0 °C 的直线，而没人知道它是假的。
+    现在靠 `has_temp` 决定发不发，缺省时整个字段不出现。
+    """
+    assert "has_temp" in proto_c, "tmp 没有可选开关，可能又在发假值"
+    m = re.search(r"if \(t->has_temp\)", proto_c)
+    assert m, "tmp 不是条件发送的"
+
+    uplink = (FW / "src" / "uplink.c").read_text(encoding="utf-8")
+    assert re.search(r"\.has_temp\s*=\s*false", uplink), \
+        "uplink 没有显式声明不报温度"
+    assert not re.search(r"\.temp\s*=\s*0\s*,", uplink), \
+        "uplink 又在用 .temp = 0 当占位值"
 
 
 def test_ack_fields(proto_c):
@@ -201,3 +221,86 @@ def test_low_volt_thresholds_ordered():
     assert v2 < v1, f"第二阈值 {v2} 不低于第一阈值 {v1}"
     # 48V 系统：满充 58.8V，BMS 截止通常在 40~42V
     assert 38000 < v2 < v1 < 52000
+
+
+def test_low_volt_three_thresholds_ordered():
+    """DESIGN.md §6 是**四级**兜底，需要三个阈值。
+
+    顺序必须 v3 < v2 < v1，否则 battery_low_level 的判断链会短路 ——
+    比如 v3 > v2 时第 2 级永远不会生效。
+    """
+    text = KCONFIG.read_text(encoding="utf-8")
+    v = {}
+    for n in (1, 2, 3):
+        m = re.search(rf"config EBIKE_LOW_VOLT_{n}.*?default (\d+)", text, re.S)
+        assert m, f"Kconfig 里没有 EBIKE_LOW_VOLT_{n}"
+        v[n] = int(m.group(1))
+    assert v[3] < v[2] < v[1], f"阈值顺序不对：{v}"
+    # 48V 铅酸的物理底线是 12 节 × 1.75 V = 42 V
+    assert 38000 <= v[3] < 52000
+
+
+def test_battery_implements_four_levels():
+    """§6 承诺四级，代码就得有四级（0/1/2/3）。
+    只做两级又不标注，是「看着做完了其实是半的」。"""
+    src = (FW / "src" / "battery.c").read_text(encoding="utf-8")
+    for lvl, cfg in ((3, "LOW_VOLT_3"), (2, "LOW_VOLT_2"), (1, "LOW_VOLT_1")):
+        assert f"CONFIG_EBIKE_{cfg}" in src, f"battery.c 没用 {cfg}"
+        assert re.search(rf"return {lvl};", src), f"battery.c 不会返回等级 {lvl}"
+
+
+def test_reset_cause_maps_to_contract_closed_set():
+    """契约 §5.1 的 `rst` 是 por/pin/wdt/soft/off 五值。
+
+    固件曾经硬编码 "por"（假数据），现在走 hwinfo。两件必须做对的事：
+    1. `cause == 0` 才是 POR —— nRF 驱动对上电复位什么位都不置，
+       而 nRF52840 的 `RESET_POR` 只在 USB VBUS 唤醒时出现，语义是错配的。
+    2. 读完必须清 —— RESETREAS 是累积寄存器，不清的话按过一次 RESET 键
+       就永远带着 RESET_PIN，`cause == 0` 这个 POR 判据从此不成立。
+    """
+    src = (FW / "src" / "uplink.c").read_text(encoding="utf-8")
+    assert "hwinfo_get_reset_cause" in src, "没读复位原因"
+    assert "hwinfo_clear_reset_cause" in src, "读完没清 RESETREAS"
+    assert "cause == 0" in src, "没有把 cause==0 当作 POR"
+    assert "RESET_LOW_POWER_WAKE" in src, "没有把 System OFF 唤醒映射成 off"
+
+    for value in ("por", "pin", "wdt", "soft", "off"):
+        assert f'"{value}"' in src, f"rst 闭集里缺 {value!r}"
+    # 不能再有那个硬编码的占位
+    assert not re.search(r'nvstore_boot_count\(\),\s*\n\s*"por"', src), \
+        "hello 还在硬编码 rst=\"por\""
+
+
+def test_system_off_uses_level_sense_not_edge():
+    """GPIOTE 在 System OFF 下断电，边沿触发唤不醒芯片 ——
+    只有 GPIO 的 SENSE→DETECT 能，而 Zephyr 只在 level 模式下写 SENSE。
+
+    LIS2DW12 驱动配的是 `GPIO_INT_EDGE_TO_ACTIVE`，所以进 System OFF 前
+    必须由应用层重配成 level。这条防的是「关机了但再也醒不过来」。
+    """
+    src = (FW / "src" / "main.c").read_text(encoding="utf-8")
+    assert "sys_poweroff" in src, "没有进 System OFF 的路径"
+    assert "GPIO_INT_LEVEL_ACTIVE" in src, \
+        "唤醒脚没配 level sense —— System OFF 之后醒不过来"
+    assert "PM_DEVICE_ACTION_SUSPEND" in src, \
+        "没 suspend EasyDMA 外设（引脚会继续漏电）"
+
+
+def test_prj_conf_has_no_nonexistent_symbols():
+    """两个曾经写在 prj.conf 里的符号是不存在的，Kconfig 会 warn，
+    而 Zephyr 把这类 warn 升级成 error：
+
+    - `CONFIG_PM`：nRF52 的 SoC Kconfig 只 select HAS_POWEROFF，没有 HAS_PM
+    - `CONFIG_GPIO_NRFX_INTERRUPT_DETECT_MODE_PORT`：整棵树里没有这个符号
+      （`drivers/gpio/Kconfig.nrfx` 只有 GPIO_NRFX 和 GPIO_NRFX_INTERRUPT）
+    """
+    text = (FW / "prj.conf").read_text(encoding="utf-8")
+    live = [ln.strip() for ln in text.splitlines()
+            if ln.strip() and not ln.strip().startswith("#")]
+    assert not [ln for ln in live if ln.startswith("CONFIG_PM=")], \
+        "prj.conf 又有 CONFIG_PM=（nRF52 没有 HAS_PM）"
+    assert not [ln for ln in live if "DETECT_MODE" in ln], \
+        "prj.conf 又有那个不存在的 DETECT_MODE 符号"
+    # 该有的两个
+    assert "CONFIG_POWEROFF=y" in live
+    assert "CONFIG_PM_DEVICE=y" in live
