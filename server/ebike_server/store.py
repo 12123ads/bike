@@ -3,9 +3,14 @@
 为什么服务端必须落库（DESIGN.md §9.1）：设备侧库层没有重发，
 broker 或服务端任一环没接住的报文在库层就没有第二次机会。
 
-用裸 aiosqlite 而不是 SQLAlchemy ORM：表只有五张，查询都是手写 SQL，
-ORM 在这个规模只增加一层间接。SQLAlchemy 仍在依赖里，因为 amqtt 的
-持久化插件要用。
+用裸 aiosqlite 而不是 SQLAlchemy ORM：表只有六张，查询都是手写 SQL，
+ORM 在这个规模只增加一层间接。
+
+SQLAlchemy 仍在依赖里，但**不是因为「amqtt 的持久化插件要用」**（本项目
+从未使用那个插件）。真实原因：`certs.py` 导入 `amqtt.contrib.cert`，
+而 `amqtt/contrib/__init__.py` 顶层就 `from sqlalchemy import ...`。
+同理 `pwdlib` 也是 `certs.py` 直接 import 的、靠 amqtt 的传递依赖装进来的 ——
+已在 pyproject 里显式声明，免得 amqtt 换版本时突然 ImportError。
 """
 
 from __future__ import annotations

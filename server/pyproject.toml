@@ -7,7 +7,11 @@ dependencies = [
     "amqtt==0.12.0",
     "cryptography==48.0.1",
     "aiosqlite==0.21.0",
+    # amqtt.contrib.cert 顶层 import sqlalchemy，而 certs.py 用那个模块
     "sqlalchemy[asyncio]==2.0.44",
+    # certs.py 直接 import pwdlib（argon2 口令）。它本来是 amqtt 的传递依赖，
+    # 显式声明是为了 amqtt 换版本或去掉 [argon2] extra 时不会突然 ImportError。
+    "pwdlib[argon2]==0.3.1",
     "fastapi==0.121.2",
     "uvicorn==0.41.0",
 ]

@@ -43,12 +43,21 @@ UP_SUFFIXES = frozenset({UP_HELLO, UP_LOC, UP_TELE, UP_EVENT, UP_ACK})
 #: 服务端可以发布的下行
 DN_SUFFIXES = frozenset({DN_CMD, DN_SECRET})
 
+#: retain 策略。**这三个是文档化的常量，发布路径不读它们** ——
+#: `service.publish_state` 无条件调 `retain_message`，
+#: `flush_downlinks` 走的 `internal_message_broadcast` 天生不设 retain。
+#: 留着是因为 `tests/test_contract.py` 拿它们钉住契约里的这三条决定，
+#: 改契约时会先在这里红。
+#:
 #: 下行**一律不 retain**。契约 §4.1：retain 每 topic 只留一条，
 #: 连续两次密钥轮换会让第一把永久丢失，而它可能是唯一还能开锁的那把。
 DN_RETAIN = False
 #: `state` retain —— 「重启 HA 立即有位置」这条验收成立的全部原因。契约 §7
 STATE_RETAIN = True
-#: LWT retain。用途不是判离线（§4.2），是留一条「非优雅断连」的痕迹
+#: LWT 的 retain 由**设备**决定（`AT+MCONFIG` 的 will_retain），服务端不参与。
+#: 固件主动发的那条 `{"lwt":0}` 是普通 publish、retain=0，覆盖不了 broker 的
+#: retain 表 —— 但端到端仍然对，因为 `_on_lwt` 靠收到消息更新 DB，不靠 retain。
+#: 契约 §4 那段说明记录了这个分裂。
 LWT_RETAIN = True
 
 #: `up/event` 的 `e` 闭集。契约 §5.4
@@ -117,11 +126,6 @@ def parse_topic(t: str) -> ParsedTopic:
     if suffix not in UP_SUFFIXES | DN_SUFFIXES | {LWT, STATE}:
         raise ContractError(f"未知 topic 后缀: {suffix!r}")
     return ParsedTopic(device_id, suffix)
-
-
-def sub_all_up(device_id: str = "+") -> str:
-    """服务端订阅用。单车下也带 `<id>` 层级，加第二辆车不用改代码。"""
-    return f"{PREFIX}/{device_id}/up/#"
 
 
 def sub_all_state() -> str:

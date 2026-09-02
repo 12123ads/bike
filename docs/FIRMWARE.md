@@ -87,7 +87,7 @@ nrfjprog -f NRF52 --program nice_nano_bootloader-0.6.0_s140_6.1.1.hex --chiperas
 | **`crypto.h` 声称「用完关 CryptoCell」而实现里没有** | 注释-实现矛盾。核实后**结论是不需要做**：cc3xx 平台库自己引用计数管 `NRF_CRYPTOCELL->ENABLE`，连 abort 路径都关。头注释已改成记录这个结论 |
 | **两个不存在的 Kconfig 符号** | `CONFIG_PM=y`（nRF52 的 SoC Kconfig 没有 `HAS_PM`）和 `CONFIG_GPIO_NRFX_INTERRUPT_DETECT_MODE_PORT=y`（整棵树里没这个符号）。Zephyr 把未满足依赖的 Kconfig warning 升级成 error，**这两行可能直接让构建失败** |
 | **console 会抢 uart0 或起 USB** | 板级默认把 console 挂到 **USB CDC ACM** 并开机就初始化 USB 栈（毫安级，而本设计 USB 口根本不引出）。改成 RTT —— J-Link 本来就是必备工具 |
-| **死代码** | `motion_prepare_for_sleep()`（空壳，注释还声称"驱动已经配好了不用额外动作"，那是错的）、overlay 里 7 个无人使用的 alias、`NVSTORE_USERS_VERSION`（定义了但不参与校验，现在真的写进落盘块并校验）、`firmware/luatos/` 空目录 |
+| **死代码** | `motion_prepare_for_sleep()`（空壳，注释还声称"驱动已经配好了不用额外动作"，那是错的）、overlay 里 6 个无人使用的 alias（7 个里只留 `motion-int`，因为 `enter_system_off()` 真的用 `DT_ALIAS` 取它）、`NVSTORE_USERS_VERSION`（定义了但不参与校验，现在真的写进落盘块并校验）、`firmware/luatos/` 空目录、`contract.py` 的 `sub_all_up()`、`web_assets.py` 的遗留占位标记 |
 
 ## 4. R0 阶段必须先验的两件事
 

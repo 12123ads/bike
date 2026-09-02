@@ -95,8 +95,6 @@ tok.focus();
 </html>
 """
 
-# <!--INDEX_PLACEHOLDER-->
-
 INDEX_HTML = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
