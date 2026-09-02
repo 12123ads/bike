@@ -16,6 +16,7 @@ from .const import (
     ATTR_LAST_SEEN,
     ATTR_UNGRACEFUL,
     DOMAIN,
+    F_FW,
     F_LAST_SEEN,
     F_LWT,
 )
@@ -33,7 +34,11 @@ class EbikeEntity(Entity):
         self.coordinator = coordinator
         self._entry = entry
         self._key = key
-        self._attr_unique_id = f"{entry.entry_id}_{key}"
+        # ⚠ **用 device_id 而不是 entry_id。** entry_id 是 ULID，删掉集成再加
+        # 同一辆车会得到新的 entry_id → 新的 unique_id → 实体 id 带 _2 后缀，
+        # 历史曲线、自定义名字、dashboard 引用全断。device_id 是设备出厂烧的，
+        # 而且 entry 的 unique_id 本来就是它（config_flow.py），天然唯一。
+        self._attr_unique_id = f"{coordinator.device_id}_{key}"
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -43,22 +48,29 @@ class EbikeEntity(Entity):
             name=f"电瓶车 {self.coordinator.device_id}",
             manufacturer="自制",
             model="nRF52840 + Air780EP",
-            sw_version=self._entry.data.get("fw_version"),
+            # 固件版本走 state 的 fw 字段（契约 §5.1 的 up/hello → §7 的 state）。
+            # 以前这里读 entry.data["fw_version"]，而**没有任何代码往那里写**，
+            # 所以设备卡片上永远是空的。
+            sw_version=self.coordinator.get(F_FW),
         )
 
     @property
     def available(self) -> bool:
-        """还没收到过任何 state = 不可用。
+        """两个条件：MQTT 连着，且收到过至少一条 state。
 
-        ⚠ **注意这和「车离线」是两件事**：车离线时我们**仍然收得到** state
+        ⚠ **「车离线」不在这两个条件里。** 车离线时我们**仍然收得到** state
         （服务端算出 `on=false` 并 retain 发布），那时候实体是**可用**的，
-        只是 `binary_sensor` 显示离线。真正不可用只有「HA 刚启动还没收到 retain」
-        或「MQTT 断了」——后者 HA 自己会处理。
+        只是 `binary_sensor.在线` 显示 off。
+        混在一起的后果：车一离线所有实体变 unavailable、历史图断掉、
+        **看不到最后一次在哪** —— 那恰恰是车被偷时最需要的信息。
 
-        把两者混在一起的后果：车一离线所有实体变成 unavailable，
-        历史图断掉，而且看不到「最后一次在哪」——那恰恰是车被偷时最需要的信息。
+        ⚠ **MQTT 断开必须自己判。** HA 的自动 unavailable 只作用于
+        `MqttAvailabilityMixin` 的实体（`mqtt/entity.py`），而本集成的实体
+        属于自己 domain 的三个平台，不继承那个 mixin。不判的话 broker 挂掉后
+        9 个实体会继续显示最后一次的值并标记为可用 —— 位置、在线、锁状态
+        全部静默陈旧，而使用者分不清是真值还是过期值。
         """
-        return self.coordinator.has_data
+        return self.coordinator.mqtt_connected and self.coordinator.has_data
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:

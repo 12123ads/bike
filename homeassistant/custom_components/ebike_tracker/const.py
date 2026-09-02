@@ -48,6 +48,7 @@ F_GEOFENCE: Final = "gf"     # in / out / null
 F_LAST_SEEN: Final = "ls"    # 最后一次收到上行的服务端时刻
 F_LWT: Final = "lwt"         # 上次断连是否非优雅
 F_LOCKED: Final = "lk"       # 锁着吗。null = 未知（没接反馈开关）
+F_FW: Final = "fw"           # 固件版本（来自 up/hello，契约 §5.1）。null = 还没 hello
 
 MODE_MOVING: Final = "moving"
 MODE_PARKED: Final = "parked"
@@ -70,8 +71,8 @@ COORD_GCJ02: Final = "gcj02"
 #: 用 WGS84 会整体偏几百米。要用 OSM 底图就在选项里切回 wgs84。
 DEFAULT_COORD_SYSTEM: Final = COORD_GCJ02
 
-#: 没收到过 state 时，实体的 `available` 怎么算。
-#: MQTT 断了 HA 会自己把实体标成不可用，所以这里只管「连着但没数据」。
+# --- 实体属性名 ---------------------------------------------------------------
+
 ATTR_SOURCE: Final = "source"
 ATTR_LAST_SEEN: Final = "last_seen"
 ATTR_UNGRACEFUL: Final = "last_disconnect_ungraceful"

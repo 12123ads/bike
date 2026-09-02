@@ -33,25 +33,54 @@ class EbikeCoordinator:
         #: 收到过至少一条 state 吗。实体的 available 靠它 ——
         #: 空 dict 和「设备离线」是两件事：前者是我们还不知道，后者是我们知道它离线。
         self.has_data = False
+        #: HA 的 MQTT 连接是否还在。**必须自己跟踪**：HA 的自动 unavailable
+        #: 只作用于 MqttAvailabilityMixin 的实体，本集成的实体不继承它。
+        #: 不跟踪的话 broker 挂掉后实体会继续显示陈旧值且标记可用。
+        self.mqtt_connected = True
         self._listeners: list[Callable[[], None]] = []
         self._unsub: Callable[[], None] | None = None
+        self._unsub_conn: Callable[[], None] | None = None
 
     @property
     def topic(self) -> str:
         return state_topic(self.device_id)
 
     async def async_start(self) -> None:
-        """订阅。QoS 1 —— 和契约 §4 的 state 一致。"""
+        """订阅 state，并跟踪 MQTT 连接状态。QoS 1 —— 和契约 §4 的 state 一致。"""
+        self.mqtt_connected = mqtt.is_connected(self.hass)
+        self._unsub_conn = mqtt.async_subscribe_connection_status(
+            self.hass, self._connection_changed
+        )
         self._unsub = await mqtt.async_subscribe(
             self.hass, self.topic, self._message_received, qos=1
         )
-        _LOGGER.debug("已订阅 %s", self.topic)
+        _LOGGER.debug("已订阅 %s（MQTT 连接=%s）", self.topic, self.mqtt_connected)
 
     @callback
     def async_stop(self) -> None:
         if self._unsub is not None:
             self._unsub()
             self._unsub = None
+        if self._unsub_conn is not None:
+            self._unsub_conn()
+            self._unsub_conn = None
+
+    @callback
+    def _connection_changed(self, connected: bool) -> None:
+        """MQTT 连上/断开。断开时实体要变 unavailable，而不是显示陈旧值。
+
+        **不清 `data`**：重连后 broker 会重推 retain 的 state（契约 §7），
+        但在那之前保留旧值比清空好 —— 实体已经是 unavailable，
+        旧值只用于重连瞬间还没收到新 state 的那一小段时间。
+        """
+        if connected == self.mqtt_connected:
+            return
+        self.mqtt_connected = connected
+        _LOGGER.log(logging.INFO if connected else logging.WARNING,
+                    "MQTT %s（%s）", "已连接" if connected else "已断开",
+                    self.topic)
+        for update_callback in self._listeners:
+            update_callback()
 
     @callback
     def _message_received(self, msg: mqtt.ReceiveMessage) -> None:

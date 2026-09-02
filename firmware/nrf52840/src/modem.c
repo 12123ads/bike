@@ -272,17 +272,31 @@ static int at_cmd_expect(const char *cmd, const char *expect,
 			continue;
 		}
 
-		if (resp != NULL && resp_len > 0 && line[0] != '\0') {
-			/* 只留最后一条非空的信息行 —— 查询命令的结果在那里 */
+		/* ⚠ **只有信息行才写 resp。**
+		 *
+		 * 原来这里无条件 strncpy 再判 expect，于是查询命令的数据行先被
+		 * 存进 resp，紧随其后的终结码 "OK" **又覆盖一次** ——
+		 * `AT+CGREG?` 的 `strstr(resp, ",1")` 和 `AT+CSQ` 的
+		 * `strchr(resp, ':')` 因此恒不匹配：附着检测会在 60 秒后必然
+		 * 返回 -ENETUNREACH（连不上网），csq 恒为 -1。
+		 *
+		 * 判 `strcmp(line,"OK")` 而不是 `strstr`：`CONNECT OK` /
+		 * `CONNACK OK` 这些**是**要交给调用方的信息行（它们同时也是
+		 * 某些命令的 expect），不能一起排除掉。 */
+		bool is_final_ok = (strcmp(line, "OK") == 0);
+		bool matched = (strstr(line, expect) != NULL);
+		bool errored = (!matched && strstr(line, "ERROR") != NULL);
+
+		if (resp != NULL && resp_len > 0 && line[0] != '\0' && !is_final_ok) {
 			strncpy(resp, line, resp_len - 1);
 			resp[resp_len - 1] = '\0';
 		}
 
-		if (strstr(line, expect) != NULL) {
+		if (matched) {
 			ret = 0;
 			break;
 		}
-		if (strstr(line, "ERROR") != NULL) {
+		if (errored) {
 			LOG_WRN("命令失败：%s → %s", cmd ? cmd : "(等待)", line);
 			ret = -EIO;
 			break;
@@ -419,12 +433,32 @@ int modem_connect(void)
 	/* TLS 配置。证书用 AT+FSWRITE 预先写进模组 FS（§8.2），
 	 * 本函数假设已经写好 —— 灌证书是产线动作，不是每次连接都做。
 	 * ⚠ 契约 §2 把设备侧从双向 TLS 降级成「TLS + 口令」，
-	 * 所以这里只配 CA 和 hostname 校验，不配客户端证书。 */
-	(void)at_cmd("AT+SSLCFG=\"cacert\",0,\"ca.crt\"");
+	 * 所以这里只配 CA 和 hostname 校验，不配客户端证书。
+	 *
+	 * **这三条都必须检查返回值。** 前两条原来是 `(void)`：
+	 * cacert 静默失败 → 没有可信根；seclevel 静默失败而模组默认 0
+	 * → **TLS 退化成「加密但不认证」，中间人可以冒充服务端收走位置、
+	 * 下发伪造的开锁指令**。宁可连不上也不要连上一个不认证的通道。 */
+	rc = at_cmd("AT+SSLCFG=\"cacert\",0,\"ca.crt\"");
+	if (rc != 0) {
+		LOG_ERR("配 CA 失败 —— ca.crt 是否已用 AT+FSWRITE 写进模组 FS？"
+			"（DESIGN.md §8.8 的产线动作）");
+		return rc;
+	}
 	/* seclevel 1 = 只校验服务端证书。2 才是双向。 */
-	(void)at_cmd("AT+SSLCFG=\"seclevel\",0,1");
-	if (at_cmd("AT+SSLCFG=\"hostname\",0,\"" CONFIG_EBIKE_MQTT_HOST "\"") != 0) {
-		LOG_WRN("配 hostname 失败 —— TLS 握手可能因证书 CN 不匹配而失败");
+	rc = at_cmd("AT+SSLCFG=\"seclevel\",0,1");
+	if (rc != 0) {
+		LOG_ERR("配 seclevel 失败 —— 不能在不校验服务端证书的情况下继续");
+		return rc;
+	}
+	/* hostname 校验：证书 CN 必须等于 CONFIG_EBIKE_MQTT_HOST
+	 * （= 服务端 `ebike-server init --hostname` 填的那个）。
+	 * 这一条失败也是致命的：不校验 hostname 等于接受任何持有
+	 * 「某个我们信任的 CA 签发的证书」的服务端。 */
+	rc = at_cmd("AT+SSLCFG=\"hostname\",0,\"" CONFIG_EBIKE_MQTT_HOST "\"");
+	if (rc != 0) {
+		LOG_ERR("配 hostname 失败 —— 会导致不校验证书 CN，拒绝继续");
+		return rc;
 	}
 
 	/* MQTT 参数。LWT 在这里配（契约 §4.2：payload 是 {"lwt":1}，retain）。 */
@@ -442,8 +476,20 @@ int modem_connect(void)
 		return rc;
 	}
 
-	/* HEX 模式：二进制安全，代价是串口字节数翻倍（契约 §5 的算术前提）。 */
-	(void)at_cmd("AT+MQTTMODE=1");
+	/* HEX 模式：二进制安全，代价是串口字节数翻倍（契约 §5 的算术前提）。
+	 *
+	 * **必须检查返回值。** 这是唯一一条「配置状态决定报文编码」的命令：
+	 * modem_publish 无条件把 payload 转成 HEX，但 AT+MPUBEX 的长度参数填的是
+	 * **原始字节数**。这条静默失败 → 模组按裸字节解释 → 长度对不上 →
+	 * **每一条上行都畸形或被拒**，而日志只会显示「等 '>' 超时」，
+	 * 排查方向会完全跑偏。同理 handle_msub 的 hex_decode 会对非 HEX 的
+	 * 下行整片返回 -EINVAL。 */
+	rc = at_cmd("AT+MQTTMODE=1");
+	if (rc != 0) {
+		LOG_ERR("AT+MQTTMODE=1 失败 —— HEX 编码没生效，"
+			"所有上行都会畸形，拒绝继续");
+		return rc;
+	}
 
 	/* 加密连接。明文是 AT+MIPSTART。 */
 	n = snprintf(cmd, sizeof(cmd), "AT+SSLMIPSTART=\"%s\",%d",

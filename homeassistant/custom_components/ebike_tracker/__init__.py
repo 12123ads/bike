@@ -35,6 +35,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     except Exception as err:  # MQTT 未就绪等
         raise ConfigEntryNotReady(f"订阅 {coordinator.topic} 失败: {err}") from err
 
+    # 取消订阅挂在 entry 上，而不是只在 async_unload_entry 里调 ——
+    # 下面 async_forward_entry_setups 抛异常时 setup 算失败，
+    # unload 不会被调用，订阅就悬空了（每次重试再叠一个）。
+    entry.async_on_unload(coordinator.async_stop)
+
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -53,8 +58,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
-        coordinator: EbikeCoordinator = hass.data[DOMAIN].pop(entry.entry_id)
-        coordinator.async_stop()
+        # 取消订阅不在这里做 —— 它已经注册进 entry.async_on_unload（见上），
+        # HA 会在本函数返回后调用。两处都调也无害（async_stop 是幂等的），
+        # 但只留一处更不容易漏。
+        hass.data[DOMAIN].pop(entry.entry_id, None)
     return unload_ok
 
 

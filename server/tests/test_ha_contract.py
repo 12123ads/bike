@@ -143,6 +143,7 @@ FIELD_MAP = {
     "F_LAST_SEEN": "ls",
     "F_LWT": "lwt",
     "F_LOCKED": "lk",
+    "F_FW": "fw",
 }
 
 
@@ -203,6 +204,55 @@ async def test_lk_is_none_without_lock_sensor(tmp_path):
     finally:
         await store.close()
     assert state["lk"] is None
+
+
+async def test_fw_reaches_ha_from_hello(tmp_path):
+    """设备卡片的「固件版本」必须真的有值。
+
+    以前 HA 读 `entry.data["fw_version"]`，而**没有任何代码往那里写** ——
+    设备卡片上永远空白。现在走 up/hello 的 fw（契约 §5.1）→ state.fw（§7）。
+    """
+    cfg = ServerConfig(db_path=str(tmp_path / "t.db"), api_token="x",
+                       mqtt=MqttConfig(plain_bind="", tls_bind=""),
+                       devices=[DeviceConfig(id="bike01")])
+    store = Store(cfg.db_path)
+    await store.open()
+    try:
+        # 还没收到 hello → fw 是 None，HA 侧显示空
+        st = await build_state(store, "bike01", cfg, now=10_000)
+        assert "fw" in st and st["fw"] is None
+
+        await store.set_dev_fields("bike01", fw="0.1.0")
+        st = await build_state(store, "bike01", cfg, now=10_000)
+        assert st["fw"] == "0.1.0"
+    finally:
+        await store.close()
+
+
+def test_ha_tracks_mqtt_connection_state():
+    """MQTT 断开时实体必须变 unavailable，不能继续显示陈旧值。
+
+    HA 的自动 unavailable 只作用于 `MqttAvailabilityMixin` 的实体，
+    本集成三个平台都不继承它 —— 所以必须自己订 connection status。
+    """
+    coord = (HA / "coordinator.py").read_text(encoding="utf-8")
+    assert "async_subscribe_connection_status" in coord, \
+        "coordinator 没有订阅 MQTT 连接状态"
+    assert "mqtt.is_connected" in coord, "没有取初始连接状态"
+
+    ent = (HA / "entity.py").read_text(encoding="utf-8")
+    assert "mqtt_connected" in ent, "available 没有把 MQTT 连接算进去"
+
+
+def test_ha_unique_id_is_stable_across_reinstall():
+    """unique_id 不能绑 entry_id：entry_id 是 ULID，删了重加就变，
+    实体 id 会带 _2 后缀，历史曲线和 dashboard 引用全断。"""
+    ent = (HA / "entity.py").read_text(encoding="utf-8")
+    m = re.search(r"_attr_unique_id = f\"\{([a-z_.]+)\}_\{key\}\"", ent)
+    assert m, "entity.py 里找不到 unique_id 的构造"
+    assert "entry_id" not in m.group(1), \
+        f"unique_id 用了不稳定的 {m.group(1)}"
+    assert "device_id" in m.group(1)
 
 
 # --- 枚举值 ------------------------------------------------------------------

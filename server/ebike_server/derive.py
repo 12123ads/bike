@@ -114,6 +114,9 @@ async def build_state(store: Store, dev: str, cfg: ServerConfig,
         "lwt": int(ds.get("lwt") or 0),
         # 锁状态。None = 没接反馈开关或还没上报过（契约 §7）
         "lk": await derive_locked(store, dev),
+        # 固件版本，来自 up/hello 的 fw（契约 §5.1）。None = 还没收到过 hello。
+        # HA 用它填设备卡片的「固件版本」。
+        "fw": ds.get("fw"),
     }
 
     if last:

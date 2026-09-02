@@ -49,6 +49,9 @@ async def async_setup_entry(
 class EbikeTracker(EbikeEntity, TrackerEntity):
     _attr_name = None          # 用设备名，界面上就是「电瓶车 bike01」
     _attr_icon = "mdi:moped"
+    # BaseTrackerEntity 把 _attr_entity_category 钉成 DIAGNOSTIC，
+    # 不覆盖的话地图实体会被折叠进设备页的「诊断」区。它是主实体，要在主区。
+    _attr_entity_category = None
 
     def __init__(self, coordinator: EbikeCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator, entry, "tracker")
@@ -78,16 +81,22 @@ class EbikeTracker(EbikeEntity, TrackerEntity):
         return self.coordinator.get(F_LON)
 
     @property
-    def location_accuracy(self) -> int:
-        """误差圈半径，米。
+    def location_accuracy(self) -> float:
+        """误差圈半径，米。这就是「误差圈可见」那条验收（DESIGN.md §9.4）。
 
-        HA 的类型是 int。`None` 会被当成 0 = 「精确到点」，那是撒谎——
-        所以拿不到精度时给一个明确表示「很不确定」的值。
+        core 的类型是 **float**（`TrackerEntity.location_accuracy -> float`），
+        不是 int —— 不取整，8.0 和 1000.0 原样给出去。
+
+        **精度缺失时不自己编一个数。** core 的默认值就是 0，而 0 的语义是
+        「精确到点」；真正表达「不知道位置」的方式是让 latitude/longitude
+        为 None —— core 的 `state_attributes` 在坐标缺失时连 `gps_accuracy`
+        一起不发，实体变 unknown。所以这里缺失时回落到 core 的默认值，
+        由坐标那一侧去表达「没有位置」。
         """
         acc = self.coordinator.get(F_ACCURACY)
         if acc is None:
-            return 0
-        return int(round(float(acc)))
+            return 0.0
+        return float(acc)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:

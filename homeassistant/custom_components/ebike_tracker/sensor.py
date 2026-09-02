@@ -19,7 +19,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, UnitOfElectricPotential
+from homeassistant.const import PERCENTAGE, UnitOfElectricPotential, UnitOfLength
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -79,7 +79,7 @@ SENSORS: tuple[EbikeSensorDescription, ...] = (
         key="accuracy",
         translation_key="accuracy",
         state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement="m",
+        native_unit_of_measurement=UnitOfLength.METERS,
         icon="mdi:circle-outline",
         suggested_display_precision=0,
         value_fn=lambda c: c.get(F_ACCURACY),
