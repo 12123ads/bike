@@ -1,0 +1,160 @@
+"""证书与 TLS listener 测试。
+
+这一层要挡住的是「TLS 配好了但设备连不上」——那种错误在设备侧只表现为一个
+`ERROR`，隔着 9600 baud 的 AT 链路极难诊断（DESIGN.md §8.7）。
+所以在这里用真的 TLS 客户端连一次真的 TLS listener。
+"""
+
+from __future__ import annotations
+
+import pytest
+from amqtt.client import MQTTClient
+from cryptography import x509
+
+from ebike_server import certs
+from ebike_server.broker import build_broker_config
+from ebike_server.config import DeviceConfig, MqttConfig, ServerConfig
+from ebike_server.service import Service
+
+TLS_PORT = 21884
+
+
+@pytest.fixture
+def prepared(tmp_path):
+    """生成 CA + 服务端证书 + 口令，返回一份配好 TLS 的 ServerConfig。"""
+    certs_dir = tmp_path / "certs"
+    certs.ensure_ca(certs_dir)
+    # CN 必须是设备实际连接用的名字 —— 这里是 127.0.0.1
+    certs.ensure_server_cert(certs_dir, "127.0.0.1")
+    passwd = tmp_path / "passwd"
+    dev_pw = certs.make_password(passwd, "bike01")
+
+    cfg = ServerConfig(
+        db_path=str(tmp_path / "t.db"),
+        api_token="t",
+        mqtt=MqttConfig(
+            plain_bind="",                       # 只开 TLS
+            tls_bind=f"127.0.0.1:{TLS_PORT}",
+            certfile=str(certs_dir / "server.crt"),
+            keyfile=str(certs_dir / "server.key"),
+            cafile=str(certs_dir / "ca.crt"),
+            password_file=str(passwd),
+        ),
+        devices=[DeviceConfig(id="bike01")],
+    )
+    return cfg, certs_dir, dev_pw
+
+
+def test_ca_is_reused_not_regenerated(tmp_path):
+    """重复跑 init 不能换掉 CA —— 换了之后已经烧进模组 FS 的 ca.crt 就废了。"""
+    d = tmp_path / "certs"
+    k1, c1 = certs.ensure_ca(d)
+    b1 = c1.read_bytes()
+    k2, c2 = certs.ensure_ca(d)
+    assert c2.read_bytes() == b1
+
+
+def test_server_cert_cn_matches_hostname(tmp_path):
+    """设备侧 AT+SSLCFG="hostname" 校验这个值，填错就握手失败。"""
+    d = tmp_path / "certs"
+    certs.ensure_server_cert(d, "mqtt.example.com")
+    crt = x509.load_pem_x509_certificate((d / "server.crt").read_bytes())
+    cn = crt.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)[0].value
+    assert cn == "mqtt.example.com"
+
+
+def test_private_keys_are_not_world_readable(tmp_path):
+    d = tmp_path / "certs"
+    certs.ensure_ca(d)
+    certs.ensure_server_cert(d, "127.0.0.1")
+    for name in ("ca.key", "server.key"):
+        mode = (d / name).stat().st_mode & 0o777
+        assert mode == 0o600, f"{name} 权限是 {oct(mode)}"
+
+
+def test_password_file_is_argon2_and_private(tmp_path):
+    """amqtt 的 FileAuthPlugin 只认 argon2，不是 mosquitto_passwd 格式。"""
+    p = tmp_path / "passwd"
+    certs.make_password(p, "bike01")
+    line = p.read_text(encoding="utf-8").strip()
+    assert line.startswith("bike01:$argon2")
+    assert (p.stat().st_mode & 0o777) == 0o600
+
+
+def test_rewriting_password_replaces_not_duplicates(tmp_path):
+    p = tmp_path / "passwd"
+    certs.make_password(p, "bike01")
+    certs.make_password(p, "ha")
+    pw3 = certs.make_password(p, "bike01")     # 轮换
+    lines = [ln for ln in p.read_text(encoding="utf-8").splitlines() if ln]
+    assert len(lines) == 2
+    assert sum(1 for ln in lines if ln.startswith("bike01:")) == 1
+
+
+def test_device_cert_san_matches_amqtt_expectation(tmp_path):
+    """UserAuthCertPlugin 用正则匹配 spiffe://<domain>/device/<id>，
+    格式差一个字符就认不出来。"""
+    d = tmp_path / "certs"
+    certs.ensure_ca(d)
+    certs.make_device_cert(d, "bike01", "ebike.local")
+    crt = x509.load_pem_x509_certificate((d / "bike01.crt").read_bytes())
+    san = crt.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+    uris = san.value.get_values_for_type(x509.UniformResourceIdentifier)
+    assert uris == ["spiffe://ebike.local/device/bike01"]
+
+
+def test_missing_cert_file_fails_loudly(prepared):
+    """amqtt 的 ListenerConfig.__post_init__ 会检查文件存在，
+    所以配错路径是启动失败而不是「起来了但没有 TLS」。"""
+    cfg, certs_dir, _ = prepared
+    cfg.mqtt.certfile = str(certs_dir / "nope.crt")
+    with pytest.raises(Exception):
+        build_broker_config(cfg)
+        # 实际抛在 Broker(config) 里，这里先确认配置能构造出来
+        from amqtt.broker import Broker
+        Broker(build_broker_config(cfg))
+
+
+async def test_device_connects_over_tls(prepared):
+    """端到端：真的 TLS 握手 + 口令认证 + 发一条位置。"""
+    cfg, certs_dir, dev_pw = prepared
+    svc = Service(cfg)
+    await svc.start()
+    try:
+        from ebike_server import contract as ct
+        c = MQTTClient(client_id="bike01",
+                       config={"auto_reconnect": False, "keep_alive": 5,
+                               "check_hostname": True})
+        await c.connect(f"mqtts://bike01:{dev_pw}@127.0.0.1:{TLS_PORT}/",
+                        cafile=str(certs_dir / "ca.crt"))
+        await c.publish(ct.topic("bike01", ct.UP_LOC),
+                        ct.dumps({"t": 1, "q": 1, "s": "g",
+                                  "la": 31.230416, "lo": 121.473701}), qos=1)
+        import asyncio
+        for _ in range(60):
+            if await svc.store.last_loc("bike01"):
+                break
+            await asyncio.sleep(0.05)
+        row = await svc.store.last_loc("bike01")
+        assert row is not None and row["lat"] == 31.230416
+        await c.disconnect()
+    finally:
+        await svc.stop()
+
+
+async def test_wrong_ca_is_rejected(prepared, tmp_path):
+    """客户端拿着别的 CA 连不上 —— 否则中间人可以冒充服务端收走位置。"""
+    cfg, _, dev_pw = prepared
+    other = tmp_path / "other"
+    certs.ensure_ca(other)
+
+    svc = Service(cfg)
+    await svc.start()
+    try:
+        c = MQTTClient(client_id="bike01",
+                       config={"auto_reconnect": False})
+        with pytest.raises(Exception):
+            await c.connect(f"mqtts://bike01:{dev_pw}@127.0.0.1:{TLS_PORT}/",
+                            cafile=str(other / "ca.crt"))
+    finally:
+        await svc.stop()

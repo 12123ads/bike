@@ -1,0 +1,220 @@
+/*
+ * 板级 overlay：nRF52840 ProMicro 克隆板。
+ *
+ * ⚠ 两处必须自己确认的（DESIGN.md §3.4 / §3.5）：
+ *
+ * 1. **pinctrl 冲突**：上游 promicro_nrf52840-pinctrl.dtsi 的 uart0 是
+ *    TX=P0.09 / RX=P0.10，而这两个脚是 NFC1/NFC2。下面把 uart0 挪到
+ *    P0.06/P0.08，并新开 uart1 给 Air780EP。**引脚号是按 J2/J4 的可用脚挑的，
+ *    实物到手要对着板子核一遍。**
+ *
+ * 2. **GPIO 余量是 19 个**（21 可用 − NFCT 占 2）。下面用掉 17 个。
+ *    如果锁要 3 根线，就是 19/19 零余量，INT2 那根潜在的第二中断线没地方接。
+ */
+
+/ {
+	aliases {
+		motion-int = &motion_int;
+		lock-drive = &lock_drive;
+		lock-sense = &lock_sense;
+		batt-gate = &batt_gate;
+		gnss-power = &gnss_power;
+		modem-pwrkey = &modem_pwrkey;
+		modem-ri = &modem_ri;
+	};
+
+	ebike_gpios {
+		compatible = "gpio-keys";
+
+		/* LIS2DW12 INT1。必须是 PORT 事件（prj.conf 里配了），
+		 * 且传感器侧必须配成推挽高有效 —— 开漏+上拉会让引脚停在
+		 * VIL/VIH 之间，nRF52840 手册明确说那会增加电流（DESIGN.md §3.7）。 */
+		motion_int: motion_int {
+			gpios = <&gpio1 11 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
+			label = "LIS2DW12 INT1";
+		};
+
+		/* 锁位置反馈微动开关 */
+		lock_sense: lock_sense {
+			gpios = <&gpio1 13 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+			label = "lock feedback";
+		};
+	};
+
+	ebike_outputs {
+		compatible = "gpio-leds";
+
+		/* 锁驱动。电磁锁 vs 电机锁还没定（DESIGN.md §7 第 1 条），
+		 * 这里按「一根线，高有效，脉冲驱动」写，定了之后可能要改成半桥两根线。 */
+		lock_drive: lock_drive {
+			gpios = <&gpio1 15 GPIO_ACTIVE_HIGH>;
+			label = "lock actuator";
+		};
+
+		/* 电池采样分压的门控 MOSFET。1M+1M 分压对 58.8V 是 29 µA 常流，
+		 * 比整机静态电流大一个量级，所以只在测的瞬间开（DESIGN.md §3.6）。 */
+		batt_gate: batt_gate {
+			gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
+			label = "battery divider gate";
+		};
+
+		/* GNSS 电源门控。开关管型号未定（DESIGN.md §7.2）。 */
+		gnss_power: gnss_power {
+			gpios = <&gpio0 11 GPIO_ACTIVE_HIGH>;
+			label = "GNSS power";
+		};
+
+		/* Air780EP PWRKEY：开集拉低 >1 s 开机。
+		 * ⚠ 模组内部已有 5.6k 上拉，**不要外加上拉**（DESIGN.md §8.1）。
+		 * 模组上电不自启动，所以这根线是必须的。 */
+		modem_pwrkey: modem_pwrkey {
+			gpios = <&gpio0 12 GPIO_ACTIVE_LOW>;
+			label = "Air780EP PWRKEY";
+		};
+	};
+
+	ebike_inputs {
+		compatible = "gpio-keys";
+
+		/* MAIN_RI：AT+CFGRI=1 之后出 120 ms 低脉冲。
+		 * ⚠ 必须配 AT^WAKEUPHEX 把 RI 限定到魔术下行串，否则每条例行 URC
+		 * 都会把主控从 System OFF 拽出来，功耗预算直接崩（DESIGN.md §8.3）。
+		 * ⚠⚠ 这两条命令在 AT 固件 V1011 上能不能用**未核实**（§8.7），
+		 * R0 阶段用一根 UART 线先验。 */
+		modem_ri: modem_ri {
+			gpios = <&gpio0 26 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+			label = "Air780EP MAIN_RI";
+		};
+	};
+
+	/* 电池电压采样。ADC 只有 3 个真脚（DESIGN.md §3.5）：
+	 * P0.02(AIN0) / P0.29(AIN5) / P0.31(AIN7)。用 P0.31。
+	 * ZMK 的 A6~A10 别名不是 SAADC 通道，别当模拟脚用。 */
+	vbatt: vbatt {
+		compatible = "voltage-divider";
+		io-channels = <&adc 7>;
+		output-ohms = <1000000>;
+		full-ohms = <2000000>;
+		power-gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+&adc {
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	channel@7 {
+		reg = <7>;
+		zephyr,gain = "ADC_GAIN_1_6";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)>;
+		zephyr,input-positive = <NRF_SAADC_AIN7>;
+		zephyr,resolution = <12>;
+	};
+};
+
+/* --- I2C：LIS2DW12 ---------------------------------------------------------
+ * 地址 0x19 要求 SA0/SDO 接 VDD_IO。
+ * ⚠ SA0 接地的话内部 20.4~54.4 kΩ 上拉会白烧 110~160 µA（DESIGN.md §3.7）。
+ */
+&i2c0 {
+	status = "okay";
+	compatible = "nordic,nrf-twim";
+	clock-frequency = <I2C_BITRATE_STANDARD>;
+	pinctrl-0 = <&i2c0_default>;
+	pinctrl-1 = <&i2c0_sleep>;
+	pinctrl-names = "default", "sleep";
+
+	lis2dw12: lis2dw12@19 {
+		compatible = "st,lis2dw12";
+		reg = <0x19>;
+		irq-gpios = <&gpio1 11 GPIO_ACTIVE_HIGH>;   /* 属性名是 irq-gpios */
+		int-pin = <1>;
+		odr = <12>;                  /* 12.5 Hz → 1 µA @LP mode 1 */
+		range = <2>;                 /* ±2 g，阈值一格 31.25 mg */
+		power-mode = <LIS2DW12_DT_LP_M1>;
+		wakeup-duration = <LIS2DW12_DT_WAKEUP_2_ODR>;
+	};
+};
+
+/* --- UART0：GNSS（ATGM336H-5N，NMEA 9600） --------------------------------- */
+&uart0 {
+	status = "okay";
+	current-speed = <9600>;
+	pinctrl-0 = <&uart0_default>;
+	pinctrl-1 = <&uart0_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+/* --- UART1：Air780EP AT 链路 -----------------------------------------------
+ * 9600 锁死：AT+IPR 默认自适应太脆，而两种低功耗模式都要求 9600
+ * 才能可靠唤醒（DESIGN.md §8.1）。出厂 AT+IPR=9600;&W 设一次。
+ */
+&uart1 {
+	status = "okay";
+	current-speed = <9600>;
+	pinctrl-0 = <&uart1_default>;
+	pinctrl-1 = <&uart1_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+&pinctrl {
+	/* ⚠ 把 uart0 从 P0.09/P0.10 挪开 —— 那两个脚给 NFCT 了。
+	 * 上游 promicro_nrf52840-pinctrl.dtsi 的默认值会和 NFC 撞（DESIGN.md §3.4）。 */
+	uart0_default: uart0_default {
+		group1 {
+			psels = <NRF_PSEL(UART_TX, 0, 6)>;
+		};
+		group2 {
+			psels = <NRF_PSEL(UART_RX, 0, 8)>;
+			bias-pull-up;
+		};
+	};
+
+	uart0_sleep: uart0_sleep {
+		group1 {
+			psels = <NRF_PSEL(UART_TX, 0, 6)>,
+				<NRF_PSEL(UART_RX, 0, 8)>;
+			low-power-enable;
+		};
+	};
+
+	uart1_default: uart1_default {
+		group1 {
+			psels = <NRF_PSEL(UART_TX, 0, 17)>;
+		};
+		group2 {
+			psels = <NRF_PSEL(UART_RX, 0, 20)>;
+			bias-pull-up;
+		};
+	};
+
+	uart1_sleep: uart1_sleep {
+		group1 {
+			psels = <NRF_PSEL(UART_TX, 0, 17)>,
+				<NRF_PSEL(UART_RX, 0, 20)>;
+			low-power-enable;
+		};
+	};
+
+	i2c0_default: i2c0_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 24)>,
+				<NRF_PSEL(TWIM_SCL, 0, 22)>;
+		};
+	};
+
+	i2c0_sleep: i2c0_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 24)>,
+				<NRF_PSEL(TWIM_SCL, 0, 22)>;
+			low-power-enable;
+		};
+	};
+};
+
+/* SPI1 在 ZMK 的默认 pinctrl 里把 MOSI 放在 P0.10 —— 和 NFC2 撞，关掉。 */
+&spi1 {
+	status = "disabled";
+};

@@ -1,0 +1,77 @@
+menu "电瓶车定位固件"
+
+config EBIKE_DEVICE_ID
+	string "设备 id（等于 MQTT 用户名，出现在 topic 层级里）"
+	default "bike01"
+	help
+	  必须匹配 [a-z0-9-]{1,32}，且服务端配置里要有同名设备。
+	  契约 §4：id 在 topic 层级里，ACL 靠前缀隔离。
+
+config EBIKE_FW_VERSION
+	string "固件版本（上报在 up/hello 的 fw 字段）"
+	default "0.1.0"
+
+config EBIKE_MQTT_HOST
+	string "MQTT 服务端主机名或 IP"
+	default "192.168.1.10"
+	help
+	  必须与服务端证书的 CN 一致 —— 模组的 AT+SSLCFG="hostname" 会校验它。
+	  填错的话设备侧只会看到一个 ERROR，隔着 9600 baud 极难诊断。
+
+config EBIKE_MQTT_PORT
+	int "MQTT 端口"
+	default 8883
+
+config EBIKE_MQTT_PASSWORD
+	string "MQTT 口令"
+	default ""
+	help
+	  由服务端的 `ebike-server init` 生成，只显示一次。
+	  ⚠ 这个值会明文进固件二进制。设备装在车上，拆开就能读 flash
+	  （DESIGN.md §5.4 第 1 条已承认这个攻击面），所以它和客户端证书
+	  私钥的安全等级一样 —— 这正是契约 §2 决定不做 mTLS 的理由。
+
+config EBIKE_REPORT_INTERVAL
+	int "默认上报周期（秒）"
+	default 900
+	help
+	  服务端的离线判定 = 本值 × 3 + 120（契约 §4.2），
+	  改这里要同时改服务端配置的 report_interval。
+
+config EBIKE_MOTION_THRESHOLD_MG
+	int "运动唤醒阈值（mg）"
+	default 150
+	range 31 2000
+	help
+	  LIS2DW12 的 WAKE_UP_THS 一格 = 31.25 mg（±2 g 量程）。
+	  电瓶车从 100~200 mg 起调（DESIGN.md §3.7）。
+	  阈值只能运行时设，不是 DTS 属性。
+
+config EBIKE_LOW_VOLT_1
+	int "第一欠压阈值（毫伏）"
+	default 46000
+	help
+	  跨过就降低上报频率并报 lowbatt lv=1（DESIGN.md §6）。
+	  具体值依赖实际电池组的 BMS 截止点，采购后实测确定。
+
+config EBIKE_LOW_VOLT_2
+	int "第二欠压阈值（毫伏）"
+	default 44000
+	help
+	  跨过只保留开锁与被查询，停止周期上报。
+
+config EBIKE_ALLOW_REMOTE_UNLOCK
+	bool "接受下行的 unlock 指令"
+	default n
+	help
+	  远程开锁绕过 §5.2 的挑战应答，信的只是 MQTT 那层的 TLS + 口令。
+	  服务端侧默认也是关的（契约 §6.1），两边都要打开才生效。
+
+config EBIKE_LOG_LEVEL
+	int "本项目模块的日志等级"
+	default 3
+	range 0 4
+
+endmenu
+
+source "Kconfig.zephyr"

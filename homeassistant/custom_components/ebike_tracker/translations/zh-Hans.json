@@ -1,0 +1,60 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "电瓶车定位",
+        "description": "设备 id 要和固件里的 CONFIG_EBIKE_DEVICE_ID、以及服务端配置里的设备 id 一致。集成通过 Home Assistant 已配置的 MQTT 连接订阅 ebike/v1/<设备id>/state。",
+        "data": {
+          "device_id": "设备 id",
+          "coord_system": "坐标系"
+        },
+        "data_description": {
+          "device_id": "小写字母、数字和短横线，1~32 个字符",
+          "coord_system": "国内地图卡（高德/腾讯）用 GCJ-02；OSM 底图用 WGS84"
+        }
+      }
+    },
+    "error": {
+      "invalid_device_id": "设备 id 只能是小写字母、数字和短横线，1~32 个字符"
+    },
+    "abort": {
+      "already_configured": "这辆车已经添加过了",
+      "mqtt_required": "请先配置 Home Assistant 的 MQTT 集成（要填 broker 地址、ha 账号口令，以及服务端生成的 ca.crt）"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "电瓶车定位选项",
+        "data": {
+          "coord_system": "坐标系"
+        },
+        "data_description": {
+          "coord_system": "改这一项会重载集成"
+        }
+      }
+    }
+  },
+  "selector": {
+    "coord_system": {
+      "options": {
+        "gcj02": "GCJ-02（高德/腾讯底图）",
+        "wgs84": "WGS84（OSM 底图）"
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "voltage": { "name": "电池电压" },
+      "battery_percent": { "name": "电量" },
+      "accuracy": { "name": "定位精度" },
+      "fix_source": { "name": "定位方式" },
+      "last_seen": { "name": "最后上报" }
+    },
+    "binary_sensor": {
+      "online": { "name": "在线" },
+      "moving": { "name": "移动中" },
+      "locked": { "name": "车锁" }
+    }
+  }
+}

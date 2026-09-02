@@ -1,0 +1,19 @@
+# 构建上下文里不需要的东西。
+# 主要作用是别把 .venv（几百 MB）和 run/（含私钥）送进构建上下文。
+.venv/
+venv/
+run/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# 测试不进镜像 —— 要跑测试用 compose 的 test profile（挂源码进去跑）
+tests/
+
+# 文档在仓库根的 docs/，不在构建上下文里
+*.md

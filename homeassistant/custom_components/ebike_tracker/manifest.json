@@ -1,0 +1,13 @@
+{
+  "domain": "ebike_tracker",
+  "name": "电瓶车定位",
+  "version": "0.1.0",
+  "documentation": "https://github.com/local/ebike-tracker/blob/main/docs/HA.md",
+  "issue_tracker": "https://github.com/local/ebike-tracker/issues",
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": ["mqtt"],
+  "iot_class": "local_push",
+  "integration_type": "device",
+  "requirements": []
+}

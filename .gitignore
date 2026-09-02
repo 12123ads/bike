@@ -1,0 +1,14 @@
+.venv/
+run/
+
+# 凭据：docker-compose.yml 要求把高德 key 放进 .env（那里注释说本文件会进 git）
+.env
+*.key
+*.crt
+passwd
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+.pytest_cache/
+.ruff_cache/

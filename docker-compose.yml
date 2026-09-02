@@ -1,0 +1,55 @@
+services:
+  ebike-server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    image: ebike-server:0.1.0
+    container_name: ebike-server
+    restart: unless-stopped
+
+    # 数据全在这一个卷里：config.json、SQLite、证书、口令文件。
+    # 用具名卷而不是 bind mount：容器里跑的是 uid 1000，bind 一个 root 拥有的
+    # 目录会 PermissionError（实测过）。要用 bind 就先 chown 1000:1000。
+    volumes:
+      - ebike-data:/data
+      # 高德地图 key，只读挂进去（不进镜像也不进卷）。
+      # ⚠ 容器以 uid 1000 跑，而 /root/gaode.key 默认是 0600 root:root ——
+      # **那样挂进来读不到**（实测：PermissionError，网页地图空着）。
+      # 两条路，选一条：
+      #   a) chmod 644 /root/gaode.key          ← 简单，但同宿主其他用户能读
+      #   b) 删掉这行挂载，改用下面的 EBIKE_GAODE_KEY 环境变量
+      # JS API 的 key 本来就要发给浏览器（任何用高德地图的网页都能看到），
+      # 真正的保护手段是在高德控制台配域名白名单，所以 (a) 是可以接受的。
+      - /root/gaode.key:/run/secrets/gaode.key:ro
+
+    ports:
+      # 设备走这个（MQTT over TLS）。要让车上的模组连到，这个必须对外。
+      - "8883:8883"
+      # HTTP API **和网页界面**都在这个端口，只对本机开 ——
+      # 它们能下发指令（包括远程开锁，如果你打开了）。
+      # 要从别的机器访问就放个反向代理，别直接把 8080 摊到公网上。
+      - "127.0.0.1:8080:8080"
+      # 明文 MQTT (1883) 刻意不映射：容器里默认就没开
+      # （init 生成的容器配置把 plain_bind 留空了）。
+
+    environment:
+      - TZ=Asia/Shanghai
+      # 想覆盖配置文件里的 token 就设这个；不设则用 config.json 里的
+      # - EBIKE_API_TOKEN=
+      # 上面那个挂载读不到时的退路：直接把 key 传进来。
+      # 用 `.env` 文件放值，别写在这里（这个文件会进 git）。
+      # - EBIKE_GAODE_KEY=${EBIKE_GAODE_KEY}
+
+    # 日志别涨到把磁盘吃满 —— amqtt 在 -v 下每个包一行
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # 这个服务不需要任何提权
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  ebike-data:
