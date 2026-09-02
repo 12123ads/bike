@@ -192,6 +192,33 @@ async def test_ha_cannot_subscribe_raw_uplink(running):
     await ha.disconnect()
 
 
+async def test_device_cannot_write_under_another_id(running):
+    """**用自己的合法凭据往别的设备 id 下灌报文必须被丢掉。**
+
+    这条针对的是 `Service.ingest` 里那层自己做的身份校验。amqtt 的
+    MESSAGE_RECEIVED 在 ACL 之前触发（`amqtt/broker.py:753`），所以 broker 的
+    publish ACL 拦不住这条路径上的落库 —— 校验必须在 ingest 里做，
+    而且**不能挂在「dev 已配置」的条件上**：那样未配置的 id 反而成了后门。
+    """
+    svc, _, dev_pw, _ = running
+    dev = await connect_as("bike01", dev_pw)
+
+    # bike99 没配置；bike01 的凭据不该能在它名下写东西
+    await dev.publish(f"{ct.PREFIX}/bike99/up/loc",
+                      ct.dumps({"t": 1, "q": 1, "s": "g",
+                                "la": 31.2, "lo": 121.4}), qos=1)
+    await asyncio.sleep(0.4)
+    assert await svc.store.track("bike99", 0, 2**31, 10, 0) == []
+
+    # 自己名下照样写得进去 —— 别把正常路径一起挡了
+    await dev.publish(ct.topic("bike01", ct.UP_LOC),
+                      ct.dumps({"t": 1, "q": 1, "s": "g",
+                                "la": 31.2, "lo": 121.4}), qos=1)
+    rows = await wait_for(lambda: svc.store.track("bike01", 0, 2**31, 10, 0))
+    assert rows and len(rows) == 1
+    await dev.disconnect()
+
+
 # --- state retain -----------------------------------------------------------
 
 

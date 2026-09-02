@@ -148,6 +148,11 @@ class ServerConfig:
     #: 轨迹保留天数。0 = 永久。DESIGN.md §11 #9 的一半答案。
     track_retention_days: int = 365
 
+    #: 已确认的下行行保留天数。0 = 永久。
+    #: 未确认的行**永不删**（契约 §4.1：那可能是唯一还能开锁的密钥），
+    #: 这里只清 `acked=1` 的历史行，否则 pending_downlink 会无限增长。
+    downlink_retention_days: int = 30
+
     #: 判「移动」的位移阈值，米。低于它认为是 GPS 漂移不是真的动了。
     moving_threshold_m: float = 30.0
 
@@ -259,6 +264,7 @@ def write_default(path: str | Path, *, docker: bool = False) -> Path:
         "offline_grace": cfg.offline_grace,
         "allow_remote_unlock": cfg.allow_remote_unlock,
         "track_retention_days": cfg.track_retention_days,
+        "downlink_retention_days": cfg.downlink_retention_days,
         "moving_threshold_m": cfg.moving_threshold_m,
         "mqtt": {
             "plain_bind": cfg.mqtt.plain_bind,

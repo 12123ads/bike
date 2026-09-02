@@ -99,6 +99,151 @@ async def test_unacked_survives_resend(store):
     assert len(rows) == 1 and rows[0]["tries"] == 2
 
 
+async def test_dn_seq_survives_restart(tmp_path):
+    """**重启后第一条指令不能撞主键。**
+
+    序号只活在进程内存里时，重启后生成的 `c-1` 会撞上历史那一行
+    （`mark_acked` 只置 acked=1，从不删行），IntegrityError 一路冒到
+    FastAPI 变成 500。这条用同一个 db_path 起停两次来钉住它 ——
+    其余测试全用全新 tmp_path，结构上测不到。
+    """
+    from ebike_server.config import MqttConfig
+    from ebike_server.service import Service
+
+    db = str(tmp_path / "t.db")
+
+    def mk():
+        return ServerConfig(db_path=db, api_token="x",
+                            mqtt=MqttConfig(plain_bind="", tls_bind=""),
+                            devices=[DeviceConfig(id="bike01")])
+
+    s1 = Service(mk())
+    await s1.store.open()
+    first = await s1.enqueue_cmd("bike01", "locate")
+    await s1.store.close()
+
+    s2 = Service(mk())
+    await s2.store.open()
+    second = await s2.enqueue_cmd("bike01", "locate")     # 撞主键就在这里炸
+    await s2.store.close()
+
+    assert first != second, "重启后下行 id 重复了"
+
+
+async def test_dn_seq_recovers_from_legacy_rows(store):
+    """旧库里已经有 c-7，而 meta 表是新建的 —— 高水位必须抬上去。"""
+    await store.enqueue_downlink("c-7", "bike01", ct.DN_CMD, b"{}")
+    await store.sync_dn_seq_to_existing()
+    assert await store.reserve_dn_seq() == 8
+
+
+async def test_prune_downlinks_keeps_unacked(store):
+    """未确认的下行**永不删** —— 它可能是唯一还能开锁的那把密钥（契约 §4.1）。"""
+    import time as _t
+    old = int(_t.time()) - 90 * 86400
+    await store.enqueue_downlink("s-1", "bike01", ct.DN_SECRET, b"{}")
+    await store.enqueue_downlink("s-2", "bike01", ct.DN_SECRET, b"{}")
+    await store.mark_acked("s-1", True, None)
+    await store.db.execute("UPDATE pending_downlink SET created=?", (old,))
+    await store.db.commit()
+
+    assert await store.prune_downlinks(30) == 1          # 只删了已确认那条
+    assert await store.downlink("s-1") is None
+    rows = await store.pending_downlinks("bike01")
+    assert [r["id"] for r in rows] == ["s-2"]
+
+
+async def test_prune_downlinks_zero_days_keeps_all(store):
+    await store.enqueue_downlink("s-1", "bike01", ct.DN_SECRET, b"{}")
+    await store.mark_acked("s-1", True, None)
+    assert await store.prune_downlinks(0) == 0
+    assert await store.downlink("s-1") is not None
+
+
+# --- interval 指令回写（契约 §4.2 的阈值联动） --------------------------------
+
+
+async def test_acked_interval_updates_offline_threshold(tmp_path):
+    """`interval` 指令被 ack 之后，离线阈值必须跟着走。
+
+    不跟的话：把周期调大到 3600 s，而阈值仍按 900 算（2820 s），
+    健康的车会在两次上报之间被判离线（契约 §4.2）。
+    """
+    from ebike_server.config import MqttConfig
+    from ebike_server.service import Service
+
+    cfg = ServerConfig(db_path=str(tmp_path / "t.db"), api_token="x",
+                       mqtt=MqttConfig(plain_bind="", tls_bind=""),
+                       devices=[DeviceConfig(id="bike01", report_interval=900)])
+    svc = Service(cfg)
+    await svc.store.open()
+    try:
+        assert cfg.offline_after("bike01") == 900 * 3 + 120
+
+        dn_id = await svc.enqueue_cmd("bike01", "interval", {"s": 3600})
+        # 队列里还没送到 → 周期不能变
+        assert cfg.device("bike01").report_interval == 900
+
+        await svc._on_up("bike01", ct.UP_ACK,
+                         ct.dumps({"t": 1, "q": 1, "id": dn_id, "ok": 1}), 1)
+        assert cfg.device("bike01").report_interval == 3600
+        assert cfg.offline_after("bike01") == 3600 * 3 + 120
+
+        # 落库了 → 重启后能恢复
+        assert await svc.store.get_meta("interval:bike01") == "3600"
+    finally:
+        await svc.store.close()
+
+
+async def test_rejected_interval_does_not_apply(tmp_path):
+    """设备 ack 失败（ok=0）时不能改周期 —— 它用的还是旧值。"""
+    from ebike_server.config import MqttConfig
+    from ebike_server.service import Service
+
+    cfg = ServerConfig(db_path=str(tmp_path / "t.db"), api_token="x",
+                       mqtt=MqttConfig(plain_bind="", tls_bind=""),
+                       devices=[DeviceConfig(id="bike01", report_interval=900)])
+    svc = Service(cfg)
+    await svc.store.open()
+    try:
+        dn_id = await svc.enqueue_cmd("bike01", "interval", {"s": 60})
+        await svc._on_up("bike01", ct.UP_ACK,
+                         ct.dumps({"t": 1, "q": 1, "id": dn_id,
+                                   "ok": 0, "er": "notimpl"}), 1)
+        assert cfg.device("bike01").report_interval == 900
+        assert await svc.store.get_meta("interval:bike01") is None
+    finally:
+        await svc.store.close()
+
+
+async def test_interval_restored_on_start(tmp_path):
+    """重启后要用设备实际生效的周期，不是配置文件里的初始值。"""
+    from ebike_server.config import MqttConfig
+    from ebike_server.service import Service
+
+    db = str(tmp_path / "t.db")
+
+    def mk():
+        return ServerConfig(db_path=db, api_token="x",
+                            mqtt=MqttConfig(plain_bind="", tls_bind=""),
+                            devices=[DeviceConfig(id="bike01",
+                                                  report_interval=900)])
+
+    s1 = Service(mk())
+    await s1.store.open()
+    dn_id = await s1.enqueue_cmd("bike01", "interval", {"s": 1800})
+    await s1._on_up("bike01", ct.UP_ACK,
+                    ct.dumps({"t": 1, "q": 1, "id": dn_id, "ok": 1}), 1)
+    await s1.store.close()
+
+    cfg2 = mk()
+    s2 = Service(cfg2)
+    await s2.store.open()
+    await s2._restore_intervals()
+    assert cfg2.device("bike01").report_interval == 1800
+    await s2.store.close()
+
+
 # --- 在线判定（契约 §4.2） ---------------------------------------------------
 
 

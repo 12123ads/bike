@@ -48,6 +48,28 @@ def test_health_needs_no_auth(svc_and_client):
     assert r.status_code == 200 and r.json()["ok"] is True
 
 
+def test_health_does_not_leak_device_ids(svc_and_client):
+    """`/health` 免鉴权，所以它的返回体是对全世界公开的。
+
+    设备 id 同时是 MQTT 用户名和 topic 层级（契约 §3 §4），
+    不该在无鉴权接口里给出去。要看设备清单用带 Bearer 的 `/devices`。
+    """
+    _, _, c = svc_and_client
+    body = c.get("/health").json()
+    assert body == {"ok": True}
+    assert "bike01" not in c.get("/health").text
+
+
+def test_interactive_docs_are_disabled(svc_and_client):
+    """FastAPI 默认在 /docs /redoc /openapi.json 无鉴权公开完整 schema，
+    包括 `/cmd/{id}/{cmd}` 和 `/secret/{id}` 的存在与请求体形状。
+    单用户内网服务没有公开它的理由。
+    """
+    _, _, c = svc_and_client
+    for path in ("/docs", "/redoc", "/openapi.json"):
+        assert c.get(path).status_code == 404, path
+
+
 def test_everything_else_needs_auth(svc_and_client):
     _, _, c = svc_and_client
     for path in ("/devices", "/state/bike01", "/track?dev=bike01", "/events?dev=bike01"):

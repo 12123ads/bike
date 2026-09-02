@@ -93,6 +93,16 @@ CREATE TABLE IF NOT EXISTS dev_state (
     mode       TEXT,                    -- moving / parked
     state_json TEXT                     -- 最后一次发布的 state，用于重启后恢复 retain
 );
+
+-- 需要跨进程重启保持的小状态。目前两个键：
+--   dn_seq        下行 id 的高水位（见 max_dn_seq 的说明）
+--   interval:<dev> 设备实际生效的上报周期（`interval` 指令被 ack 后写这里）
+-- 用键值表而不是给 dev_state 加列：这个 schema 没有迁移机制
+-- （只有 CREATE TABLE IF NOT EXISTS），加列不会作用到已存在的库上。
+CREATE TABLE IF NOT EXISTS meta (
+    k TEXT PRIMARY KEY,
+    v TEXT NOT NULL
+);
 """
 
 
@@ -225,6 +235,13 @@ class Store:
             " ORDER BY created ASC, rowid ASC", (dev,))
         return [dict(r) for r in await cur.fetchall()]
 
+    async def downlink(self, dn_id: str) -> dict[str, Any] | None:
+        """按 id 取一条下行（不论是否已确认）。`up/ack` 到达时要看它发的是什么。"""
+        cur = await self.db.execute(
+            "SELECT * FROM pending_downlink WHERE id=?", (dn_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
     async def mark_sent(self, dn_id: str) -> None:
         await self.db.execute(
             "UPDATE pending_downlink SET sent_at=?, tries=tries+1 WHERE id=?",
@@ -241,6 +258,79 @@ class Store:
             (1 if ok else 0, err, dn_id))
         await self.db.commit()
         return cur.rowcount > 0
+
+    async def reserve_dn_seq(self, n: int = 1) -> int:
+        """预留 n 个下行序号，返回预留段的**起始值**（含）。
+
+        为什么要落库：`id` 是 `pending_downlink` 的主键，而 `mark_acked` 只置
+        `acked=1` 不删行。序号只存在进程内存里的话，**重启后第一条命令生成的
+        `c-1` 会撞上历史那一行**，IntegrityError 冒到 FastAPI 变成 500。
+
+        `INSERT ... ON CONFLICT DO UPDATE ... RETURNING` 一条语句完成读改写，
+        不给并发留窗口（SQLite 3.35+ 支持 RETURNING，本机 3.46）。
+        """
+        cur = await self.db.execute(
+            "INSERT INTO meta(k,v) VALUES('dn_seq',?)"
+            " ON CONFLICT(k) DO UPDATE SET v=CAST(v AS INTEGER)+?"
+            " RETURNING CAST(v AS INTEGER)", (str(n), n))
+        row = await cur.fetchone()
+        await self.db.commit()
+        high = int(row[0])
+        return high - n + 1
+
+    async def sync_dn_seq_to_existing(self) -> int:
+        """把高水位抬到已有队列行之上，返回抬到的值。
+
+        用于 `meta` 表刚建出来（旧库升级）而 `pending_downlink` 里已经有
+        `c-7` 这种行的情况 —— 只靠计数器从 0 起会立刻撞主键。
+        """
+        cur = await self.db.execute(
+            "SELECT id FROM pending_downlink WHERE id GLOB '[cs]-*'")
+        top = 0
+        for (dn_id,) in await cur.fetchall():
+            try:
+                top = max(top, int(dn_id.split("-", 1)[1]))
+            except (IndexError, ValueError):
+                continue
+        cur = await self.db.execute(
+            "SELECT CAST(v AS INTEGER) FROM meta WHERE k='dn_seq'")
+        row = await cur.fetchone()
+        cur_seq = int(row[0]) if row else 0
+        if top > cur_seq:
+            await self.db.execute(
+                "INSERT INTO meta(k,v) VALUES('dn_seq',?)"
+                " ON CONFLICT(k) DO UPDATE SET v=excluded.v", (str(top),))
+            await self.db.commit()
+            return top
+        return cur_seq
+
+    async def prune_downlinks(self, retention_days: int) -> int:
+        """删掉已确认且过了保留期的下行行。返回删掉的行数。0 天 = 永久保留。
+
+        只删 `acked=1` 的：未确认的那条可能是唯一还能开锁的密钥（契约 §4.1），
+        无论多老都不能删。保留一段时间而不是 ack 即删，是为了 `/pending`
+        与日志能回溯「那次密钥轮换到底送到没有」。
+        """
+        if retention_days <= 0:
+            return 0
+        cutoff = int(time.time()) - retention_days * 86400
+        cur = await self.db.execute(
+            "DELETE FROM pending_downlink WHERE acked=1 AND created<?", (cutoff,))
+        await self.db.commit()
+        return cur.rowcount
+
+    # --- meta（跨重启的小状态） -----------------------------------------------
+
+    async def get_meta(self, key: str) -> str | None:
+        cur = await self.db.execute("SELECT v FROM meta WHERE k=?", (key,))
+        row = await cur.fetchone()
+        return str(row[0]) if row else None
+
+    async def set_meta(self, key: str, value: str) -> None:
+        await self.db.execute(
+            "INSERT INTO meta(k,v) VALUES(?,?)"
+            " ON CONFLICT(k) DO UPDATE SET v=excluded.v", (key, value))
+        await self.db.commit()
 
     # --- 设备状态 -------------------------------------------------------------
 

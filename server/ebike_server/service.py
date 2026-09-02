@@ -34,7 +34,8 @@ class Service:
         self.cfg = cfg
         self.store = Store(cfg.db_path)
         self.broker: Broker | None = None
-        self._dn_seq = 0
+        #: 下行 id 的序号。**不在内存里递增** —— 见 Store.reserve_dn_seq：
+        #: 计数器只活在进程里的话，重启后第一条命令必然撞 pending_downlink 主键。
         self._tasks: list[asyncio.Task[Any]] = []
         #: 每设备一把锁：ingest 是并发的（broker 为每条消息起 task），
         #: 而「算 state → 比对 → 发布」不是原子的，两条报文同时到会发出乱序的 state。
@@ -47,6 +48,12 @@ class Service:
 
     async def start(self) -> None:
         await self.store.open()
+        # 旧库升级：meta 表刚建出来，但 pending_downlink 里可能已经有 c-7 这种行。
+        # 不抬高水位的话第一条命令就撞主键。
+        await self.store.sync_dn_seq_to_existing()
+        # 上报周期可能被 `interval` 指令改过（契约 §6.1），从库里恢复 ——
+        # 否则离线阈值会退回配置文件的值，而设备用的是被改过的周期（契约 §4.2）。
+        await self._restore_intervals()
         IngestPlugin.service = self
         self.broker = Broker(build_broker_config(self.cfg))
         await self.broker.start()
@@ -92,6 +99,8 @@ class Service:
                 if now - last_prune > 3600:
                     last_prune = now
                     n = await self.store.prune(self.cfg.track_retention_days)
+                    n += await self.store.prune_downlinks(
+                        self.cfg.downlink_retention_days)
                     if n:
                         log.info("清理过期数据 %d 行", n)
             except asyncio.CancelledError:
@@ -116,11 +125,20 @@ class Service:
         # ⚠ MESSAGE_RECEIVED 在 broker 的 ACL 检查**之前**触发
         # （amqtt/broker.py:753 的注释明说了），所以这里自己再判一次身份。
         # 没有这一层，一个能登录的客户端可以往别的设备 id 下灌报文。
-        if client_id is not None and self.cfg.device(dev) is not None:
-            expected = {dev, "svc"}
-            if client_id not in expected:
-                log.warning("丢弃：client %r 无权发 %s", client_id, topic)
-                return
+        #
+        # **顺序要紧**：这个判断不能挂在「dev 已配置」的条件里。
+        # parse_topic 接受任何符合 `[a-z0-9-]{1,32}` 的 id，所以先查配置再判身份
+        # 等于给未配置的 id 开了后门 —— bike01 的合法凭据能把行写进
+        # `ebike/v1/bike99/up/loc`，正是本注释声称要挡住的事。
+        if client_id is not None and client_id not in {dev, "svc"}:
+            log.warning("丢弃：client %r 无权发 %s", client_id, topic)
+            return
+
+        # 未配置的设备一律丢。允许它们落库会让 /devices、/state 和 HA 看不到的
+        # 数据堆在库里，且 build_state 拿不到 volt_curve/geofence。
+        if self.cfg.device(dev) is None:
+            log.warning("丢弃：%s 不是已配置的设备（topic=%s）", dev, topic)
+            return
 
         if suffix not in ct.UP_SUFFIXES and suffix != ct.LWT:
             # dn/* 是我们自己发的，state 也是；回到这里说明配置有问题
@@ -169,6 +187,7 @@ class Service:
             await self.flush_downlinks(dev)
         elif suffix == ct.UP_ACK:
             assert isinstance(data, dict)
+            row = await self.store.downlink(data["dn_id"])
             found = await self.store.mark_acked(
                 data["dn_id"], data["ok"], data.get("err"))
             if not found:
@@ -177,6 +196,51 @@ class Service:
             elif not data["ok"]:
                 log.warning("%s 拒绝了下行 %s: %s",
                             dev, data["dn_id"], data.get("err"))
+            elif row is not None:
+                await self._apply_acked_cmd(dev, row)
+
+    async def _apply_acked_cmd(self, dev: str, row: dict[str, Any]) -> None:
+        """设备确认了一条指令之后，把服务端这边的状态跟上。
+
+        目前只有 `interval` 需要：离线阈值 = 上报周期 × factor + grace（契约 §4.2），
+        而周期是设备侧的事实。不跟着改的话，把周期调大之后健康的车会被判离线；
+        调小则要等三倍新周期才发现真离线。**只在 ack 成功后写** —— 指令排在队列里
+        还没送到时，设备用的仍是旧周期。
+        """
+        if row["suffix"] != ct.DN_CMD:
+            return
+        try:
+            body = json.loads(row["payload"])
+        except (json.JSONDecodeError, TypeError):
+            return
+        if not isinstance(body, dict) or body.get("c") != "interval":
+            return
+        secs = (body.get("a") or {}).get("s")
+        if not isinstance(secs, int) or secs <= 0:
+            return
+        dcfg = self.cfg.device(dev)
+        if dcfg is None or dcfg.report_interval == secs:
+            return
+        old = dcfg.report_interval
+        dcfg.report_interval = secs
+        await self.store.set_meta(f"interval:{dev}", str(secs))
+        log.info("%s 上报周期 %d → %d s，离线阈值改为 %d s",
+                 dev, old, secs, self.cfg.offline_after(dev))
+
+    async def _restore_intervals(self) -> None:
+        """把 `interval` 指令改过的周期从库里读回来（见 _apply_acked_cmd）。"""
+        for d in self.cfg.devices:
+            raw = await self.store.get_meta(f"interval:{d.id}")
+            if raw is None:
+                continue
+            try:
+                secs = int(raw)
+            except ValueError:
+                continue
+            if secs > 0 and secs != d.report_interval:
+                log.info("%s 恢复上报周期 %d s（配置文件里是 %d）",
+                         d.id, secs, d.report_interval)
+                d.report_interval = secs
 
     async def _on_lwt(self, dev: str, payload: bytes) -> None:
         """契约 §4.2：LWT **不是**离线判据，只是「上次断连是否非优雅」的痕迹。
@@ -202,20 +266,21 @@ class Service:
 
     # --- 下行 ----------------------------------------------------------------
 
-    def next_dn_id(self, prefix: str) -> str:
-        self._dn_seq += 1
-        return f"{prefix}-{self._dn_seq}"
+    async def next_dn_id(self, prefix: str) -> str:
+        """取一个全局唯一的下行 id。序号存在库里，跨重启不回退。"""
+        seq = await self.store.reserve_dn_seq()
+        return f"{prefix}-{seq}"
 
     async def enqueue_cmd(self, dev: str, cmd: str,
                           args: dict[str, Any] | None = None) -> str:
-        dn_id = self.next_dn_id("c")
+        dn_id = await self.next_dn_id("c")
         payload = ct.build_cmd(dn_id, cmd, args)
         await self.store.enqueue_downlink(dn_id, dev, ct.DN_CMD, payload)
         await self.flush_downlinks(dev)
         return dn_id
 
     async def enqueue_secret(self, dev: str, op: str, **kw: Any) -> str:
-        dn_id = self.next_dn_id("s")
+        dn_id = await self.next_dn_id("s")
         payload = ct.build_secret(dn_id, op, **kw)
         await self.store.enqueue_downlink(dn_id, dev, ct.DN_SECRET, payload)
         await self.flush_downlinks(dev)

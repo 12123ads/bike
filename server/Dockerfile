@@ -52,11 +52,13 @@ WORKDIR /data
 # 8883 设备（TLS）／1883 明文（默认只绑 127.0.0.1，见 config.py）／8080 HTTP
 EXPOSE 8883 8080
 
-# 健康检查打 /health —— 它不鉴权，且不泄露任何东西。
+# 健康检查打 /health —— 它不鉴权，且只回 {"ok":true}（不含设备清单）。
 # 用 python 而不是 curl：镜像里没装 curl，为一个健康检查装它不值得。
+# 端口从 EBIKE_HTTP_BIND 里取（那是 config.load 认的变量名）；
+# 没设就用 8080，和 write_default(docker=True) 生成的配置一致。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["python", "-c", "import urllib.request,os,sys; \
-port=os.environ.get('EBIKE_HTTP_PORT','8080'); \
+port=os.environ.get('EBIKE_HTTP_BIND','8080').rpartition(':')[2] or '8080'; \
 sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{port}/health',timeout=4).status==200 else 1)"]
 
 ENTRYPOINT ["/usr/bin/tini", "--", "ebike-server"]

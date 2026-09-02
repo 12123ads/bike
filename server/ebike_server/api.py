@@ -22,8 +22,14 @@ log = logging.getLogger("ebike.api")
 
 
 def build_app(svc: Service, cfg: ServerConfig) -> FastAPI:
+    # ⚠ **交互式文档全部关掉。** FastAPI 默认在 /docs、/redoc、/openapi.json
+    # 三个地址无鉴权地公开完整 schema —— 包括 `/cmd/{id}/{cmd}` 和
+    # `/secret/{id}` 的存在与请求体形状。它们调不动受保护接口，但等于把
+    # 「这里能远程开锁、能下发密钥」直接告诉任何能连到这个端口的人。
+    # 这个服务只有一个人用，schema 看源码就有，没有公开的理由。
     app = FastAPI(title="ebike-tracker", version="0.1.0",
-                  description="电瓶车定位服务端。契约见 docs/MQTT-CONTRACT.md")
+                  description="电瓶车定位服务端。契约见 docs/MQTT-CONTRACT.md",
+                  docs_url=None, redoc_url=None, openapi_url=None)
 
     if cfg.web.enabled:
         # 网页挂在 /、/ui/*、/api/*，用会话 cookie 鉴权（见 web.py 的说明）。
@@ -49,8 +55,13 @@ def build_app(svc: Service, cfg: ServerConfig) -> FastAPI:
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
-        """不鉴权 —— 它不泄露任何东西，而且要能给监控用。"""
-        return {"ok": True, "devices": [d.id for d in cfg.devices]}
+        """存活检查，不鉴权 —— 要能给监控和容器 HEALTHCHECK 用。
+
+        **只回 `{"ok": true}`，不回设备清单。** 之前它带着
+        `devices: [...]`，那是无鉴权地泄露设备 id，而 id 就是 MQTT 用户名
+        和 topic 层级（契约 §3 §4）。设备清单要看就用 `/devices`（带 Bearer）。
+        """
+        return {"ok": True}
 
     @app.get("/devices", dependencies=[Depends(auth)])
     async def devices() -> list[dict[str, Any]]:
