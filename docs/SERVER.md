@@ -85,7 +85,7 @@ python3 -m venv .venv && .venv/bin/python -m pip install -e server[dev]
 
 | 方法 路径 | 干什么 |
 | --- | --- |
-| `GET /health` | 存活检查，不鉴权（不泄露任何东西） |
+| `GET /health` | 存活检查，不鉴权。**只回 `{"ok":true}`** —— 它原本还回设备清单，而设备 id 就是 MQTT 用户名和 topic 层级（契约 §3 §4），那是无鉴权泄露 |
 | `GET /devices` | 所有设备 + 当前 state |
 | `GET /state/{id}` | 单台的 state（契约 §7 的那个结构） |
 | `GET /track?dev=&since=&until=&limit=&offset=` | 轨迹，分页 |
@@ -93,6 +93,11 @@ python3 -m venv .venv && .venv/bin/python -m pip install -e server[dev]
 | `GET /pending?dev=` | 未确认的下行队列。**payload 已脱敏** |
 | `POST /cmd/{id}/{cmd}` | 下发指令（契约 §6.1 的闭集） |
 | `POST /secret/{id}` | 下发密钥。响应**不回显** `key_b64` |
+
+**`/docs`、`/redoc`、`/openapi.json` 全部关掉**（`docs_url=None` 等三项）。
+FastAPI 默认在这三个地址**无鉴权**公开完整 schema，包括 `/cmd/{id}/{cmd}` 和
+`/secret/{id}` 的存在与请求体形状 —— 等于把「这里能远程开锁、能下发密钥」
+告诉任何能连到这个端口的人。单用户内网服务没有公开它的理由。
 
 时间一律是服务端时钟（`t_srv`）——设备时钟在拿到 NITZ 之前是错的（契约 §5.6）。
 
@@ -117,12 +122,14 @@ python3 -m venv .venv && .venv/bin/python -m pip install -e server[dev]
 会拉起来）；`amqtt` 是纯 Python，不是 Mosquitto 的性能级别（单车每 5~30 分钟
 几条报文，差几个数量级，不构成问题）。
 
-## 5. amqtt 的三个坑（本机读源码 + 实测确认）
+## 5. amqtt 的四个坑（本机读源码 + 实测确认）
 
-这三条都写进代码注释了，改代码前先看：
+这四条都写进代码注释了，改代码前先看：
 
-1. **`publish-acl` 没配时发布一律放行**（`topic_checking.py:70`，为兼容 hbmqtt）。
-   漏配是静默放开而不是报错。`build_broker_config()` 里断言了非空。
+1. **`publish-acl` 没配时发布一律放行**（`topic_checking.py:69-71`，为兼容 hbmqtt）。
+   漏配是静默放开而不是报错。`build_broker_config()` 里断言的是
+   **每个已配置设备都有 publish 条目** —— 原来写的「断言非空」恒为真
+   （`build_acl` 里先塞了 `svc` 键），等于没有保险。
 
 2. **配置键名必须是下划线，订阅 ACL 必须叫 `acl`。**
    `BrokerConfig` 和插件 Config 都是 dacite **strict** 模式填充的：
@@ -135,7 +142,14 @@ python3 -m venv .venv && .venv/bin/python -m pip install -e server[dev]
    代码把第一个 listener 改名成 `default` 而不是额外插一个——额外插会真的开一个
    `0.0.0.0:1883` 明文口。
 
-第四条在 [`MQTT-CONTRACT.md` §4.3](MQTT-CONTRACT.md)：**retain 消息会漏给任何
+4. **`UserAuthCertPlugin` 认证通过但不设 `session.username`**
+   （`amqtt/contrib/cert.py:57-83`），而 ACL 按 username 查表，None 时退化成
+   `"anonymous"` → 空列表 → 一律拒。**本机实测：mTLS 模式下 CONNECT 通过但
+   SUBSCRIBE 返回 0x80**，设备永远收不到 `dn/cmd` 和 `dn/secret`。
+   所以 `mqtt.mode="cert"` 走的是自己的 `DeviceCertAuthPlugin` 子类，
+   它在认证通过后补上 username。两条端到端测试钉住这条路径。
+
+第五条在 [`MQTT-CONTRACT.md` §4.3](MQTT-CONTRACT.md)：**retain 消息会漏给任何
 连上来的客户端**，绕过订阅和接收 ACL。当前无害（只有 `state` 被 retain，
 下行一律不 retain），但**加第二辆车之前必须解决**。
 
@@ -145,19 +159,19 @@ python3 -m venv .venv && .venv/bin/python -m pip install -e server[dev]
 cd server && ../.venv/bin/python -m pytest -q
 ```
 
-**222 条全过、1 条跳过**（本机实测，22 秒）。分九层：
+**240 条全过、1 条跳过**（本机实测，约 23 秒）。分九层：
 
 | 文件 | 条数 | 测什么 |
 | --- | --- | --- |
 | `test_contract.py` | 39 | 契约编解码。重点在**拒绝路径**——畸形报文被放过去会一路污染到 HA |
-| `test_store_derive.py` | 23 | SQLite 去重、下行队列顺序、在线判定、移动判定、坐标转换 |
-| `test_api.py` | 21 | 鉴权、参数边界、远程开锁默认关、密钥不回显、配置文件生成 |
-| `test_certs.py` | 9 | 真的 TLS 握手、证书 CN、私钥权限 0600、换 CA 连不上 |
-| `test_e2e.py` | 14 | 真起 broker + 真 MQTT 客户端：ACL 拦得住吗、retain 发给后连上的吗、下行队列真的冲刷吗 |
-| `test_web.py` | 33+1skip | 网页鉴权边界、cookie 标记、登录限速、高德 key 读取失败要 warn |
-| `test_web_frontend.py` | 16 | **前端 JS**：`node --check`、坐标转换和服务端逐点比对、假 DOM 渲染。见 [`WEB.md`](WEB.md) §7 |
 | `test_firmware_contract.py` | 39 | **固件 C 源码和服务端的契约一致性**（文本层交叉检查，见 [`FIRMWARE.md`](FIRMWARE.md)） |
-| `test_ha_contract.py` | 28 | **HA 集成和服务端的契约一致性**，见 [`HA.md`](HA.md) §6 |
+| `test_web.py` | 33+1skip | 网页鉴权边界、cookie 标记、登录限速、高德 key 读取失败要 warn |
+| `test_ha_contract.py` | 32 | **HA 集成和服务端的契约一致性**，见 [`HA.md`](HA.md) §6 |
+| `test_store_derive.py` | 30 | SQLite 去重、下行队列顺序与 id 跨重启唯一、`interval` 回写、在线判定、移动判定、坐标转换 |
+| `test_api.py` | 23 | 鉴权、参数边界、远程开锁默认关、密钥不回显、`/health` 不泄露、交互式文档已关 |
+| `test_web_frontend.py` | 16 | **前端 JS**：`node --check`、坐标转换和服务端逐点比对、假 DOM 渲染。见 [`WEB.md`](WEB.md) §7 |
+| `test_e2e.py` | 15 | 真起 broker + 真 MQTT 客户端：ACL 拦得住吗、跨设备 id 灌数据挡不挡、retain 发给后连上的吗、下行队列真的冲刷吗 |
+| `test_certs.py` | 12 | 真的 TLS 握手、证书 CN、私钥权限 0600、换 CA 连不上、**mTLS 模式端到端** |
 
 几条值得单独提的：
 
@@ -169,6 +183,16 @@ cd server && ../.venv/bin/python -m pytest -q
   绑 127.0.0.1 在容器里等于谁都连不上，而开明文 MQTT 等于把凭据交给同网络的容器。
 - `test_retained_state_leaks_to_device_on_connect` **断言一个缺陷存在**
   （上面第 5 节那条）。amqtt 修好了它会红，那时候删掉它并更新契约文档。
+- `test_dn_seq_survives_restart` 钉住一个**已复现的缺陷**：下行 id 的序号原来
+  每进程从 0 起，而 `pending_downlink.id` 是主键且 `mark_acked` 只置 `acked=1`
+  从不删行 —— 重启后第一条命令必然 IntegrityError，`POST /cmd` 变 500。
+  它是唯一一条在同一个 db_path 上起停两次的测试（其余全用全新 tmp_path，
+  结构上测不到这个）。
+- `test_device_cannot_write_under_another_id` 钉住另一个**已复现的缺陷**：
+  ingest 的身份校验原来挂在「dev 已配置」的条件上，于是 bike01 的合法凭据
+  能把行写进 `ebike/v1/bike99/up/loc`。
+- `test_cert_mode_device_can_publish_and_subscribe` 是 mTLS 模式的第一条
+  端到端测试（见第 5 节第 4 条）。
 
 ## 7. Docker 里手动验过的
 
@@ -202,3 +226,7 @@ HTTP 侧 `/health` 免鉴权返回 200，无 token 访问 `/state` 返回 401。
 | **地理围栏的配置界面** | `state.gf` 字段和 `DeviceConfig.geofence` 都有了，但只能改配置文件 |
 | **离线首次配对**（§11 #13） | 当前假设第一把密钥随固件烧进去 |
 | **轨迹下采样** | `track_retention_days` 到期直接删，不下采样（§11 #9 的另一半） |
+
+已经补上的（原来列在这里）：**`pending_downlink` 的保留期清理** ——
+`downlink_retention_days`（默认 30 天）只清 `acked=1` 的行，
+未确认的**永不删**（契约 §4.1：那可能是唯一还能开锁的密钥）。

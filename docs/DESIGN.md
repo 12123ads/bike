@@ -7,7 +7,7 @@
 > - [`HARDWARE.md`](HARDWARE.md) — 给用户看的摘要：买什么、怎么接、要拍板什么
 > - [`MQTT-CONTRACT.md`](MQTT-CONTRACT.md) — **契约 v1**，本文 §9.3 那张空白表已由它填满
 > - [`SERVER.md`](SERVER.md) — 服务端怎么跑（含 docker）、amqtt 的坑、测试覆盖
-> - [`WEB.md`](WEB.md) — 网页界面：地图、登录、高德 key、坐标系
+> - [`WEB.md`](WEB.md) — 内置网页界面：地图、登录、高德 key、坐标系
 > - [`FIRMWARE.md`](FIRMWARE.md) — 固件怎么编、还缺什么
 > - [`HA.md`](HA.md) — Home Assistant 集成：装哪、9 个实体、怎么验的
 >
@@ -796,21 +796,30 @@ ADR-003 §8 断言 **「右半边（MQTT → 服务端 → HA）一个字没变�
 
 ### §9.2 传输安全
 
-- **设备 → broker：无条件双向 TLS**（§8.2）。设备侧证书写在模组 FS 里。
+> ⚠ **本节的历史陈述已被 [`MQTT-CONTRACT.md`](MQTT-CONTRACT.md) §1 §2 取代，
+> 逐条标注见下面的划线与括注。** 完整的更新说明在本节末尾那段引用里。
+
+- ~~**设备 → broker：无条件双向 TLS**（§8.2）。设备侧证书写在模组 FS 里。~~
+  **改为「TLS + 用户名口令」**（契约 §2）。理由：设备拆开就能读 flash（§5.4 #1），
+  客户端私钥和口令在同一块 flash 里，mTLS 买不到额外安全。
+  **mTLS 仍然支持**：`mqtt.mode = "cert"`，且已有端到端测试
+  （`tests/test_certs.py::test_cert_mode_device_can_publish_and_subscribe`）。
 - **HA ↔ broker（跨主机）**：PLAN.md §4 原文——
   > **跨主机 MQTT 如果过公网必须上 TLS(8883)。** 明文 1883 过公网等于把 MQTT 账号、
   > 全部车辆位置、以及开锁相关的遥测公开广播。内网/WireGuard 之间可以明文。
 
-  **[待解决]** HA 主机与本机的网络关系（同内网 / WireGuard / 公网）没定，TLS 与否就没定。
-- **`/opt/mqtt` broker 的现状与文档有落差**（已核实）：`allow_anonymous false` +
-  `password_file` 已配好，但**没有 `acl_file`，也没有 8883 listener**——
-  只有 `listener 1883` 和 `listener 9001 (websockets)`，docker-compose 也只映射这两个端口。
-  所以双向 TLS 在 broker 侧目前**缺 listener、缺证书挂载卷**，R5 要一起补。
-- **ACL 是必须的**。PLAN.md 文末原文：
-  > **MQTT ACL** 需要改 `/opt/mqtt/config/mosquitto.conf` 加 `acl_file` 并重启 mosquitto。
-  > 这动的是在跑的服务，实施前会先跟你确认。不加 ACL 的话任何一台设备被撬开就能读全部车辆位置。
-
-  **这条承诺继续有效：改 mosquitto 配置前先跟你确认。**
+  **[待解决]** HA 主机与本机的网络关系（同内网 / WireGuard / 公网）没定。
+  **但已经无害**：内置 broker 的 TLS listener 是无条件开的（默认 `0.0.0.0:8883`），
+  容器里明文口根本不映射，所以走公网也安全（§11 #3）。
+- ~~**`/opt/mqtt` broker 的现状与文档有落差**……双向 TLS 在 broker 侧目前缺 listener、
+  缺证书挂载卷，R5 要一起补。~~
+  **前提消失**：broker 改成服务端进程内置，listener 与证书都由服务端自己建
+  （`ebike_server/broker.py` 的 `build_broker_config`）。`/opt/mqtt` 与本项目
+  **已零代码关联**（全仓 grep `mosquitto` 只命中文档）。
+- ~~**ACL 是必须的**……需要改 `/opt/mqtt/config/mosquitto.conf` 加 `acl_file`
+  并重启 mosquitto，实施前会先跟你确认。~~
+  **那个需要你批准的操作不存在了**：ACL 写在服务端配置里（契约 §3），
+  不动任何在跑的服务。**ACL 本身仍然是必须的**，这一点没变。
 
 > **2026-09-01 更新：这一整节的前提变了。**
 > broker 改成**服务端进程内置**（`amqtt`），不再用 `/opt/mqtt` 的 Mosquitto，
@@ -871,11 +880,12 @@ P2 里那句「主题/schema 固化」至今仍是待办。
 
 | 组件 | 位置 / 实现 |
 | --- | --- |
-| Broker | Mosquitto，`/opt/mqtt` |
-| 服务端 | Python，`/opt/ebike-tracker/server`（**当前为空**） |
-| 数据库 | SQLite |
-| HA 集成 | `custom_component`，**在另一台机器上** |
-| 设备侧上行 | MQTT QoS1 over 4G，双向 TLS |
+| Broker | ~~Mosquitto，`/opt/mqtt`~~ → **`amqtt` 内置在服务端进程里**（契约 §1）。`/opt/mqtt` 已零代码关联 |
+| 服务端 | Python，`/opt/ebike-tracker/server` ~~（**当前为空**）~~ → **已实现**，14 个模块，见 [`SERVER.md`](SERVER.md) |
+| 网页界面 | **服务端内置**（`web.py` + `web_assets.py`），会话 cookie 鉴权，见 [`WEB.md`](WEB.md) |
+| 数据库 | SQLite，6 张表（`loc` / `tele` / `event` / `pending_downlink` / `dev_state` / `meta`） |
+| HA 集成 | `custom_component`，**在另一台机器上**，已实现 9 个实体，见 [`HA.md`](HA.md) |
+| 设备侧上行 | MQTT QoS1 over 4G，~~双向 TLS~~ → **TLS + 用户名口令**（契约 §2；mTLS 可选，`mqtt.mode="cert"`） |
 
 服务端处理链（PLAN.md P2 原文）：**`aiomqtt` → 校验 → 落库 → 坐标转换 → retain 重发布**，
 对外 HTTP 是 **FastAPI + Bearer**。
@@ -886,9 +896,7 @@ HA 侧要写四个部件：`manifest` / `config_flow` / `coordinator` / 实体�
 服务端 `state` retain 重发布与 HA 重启后立刻拿到位置是同一个设计的两端。
 「误差圈可见」要求 `accuracy` 一路透传到实体属性。
 
-**实体清单未列举 [待解决]**：验收提到 device_tracker 语义（地图上出现车、误差圈可见），
-§6 另外要求「电池快没了」能在 HA 里看到，所以至少还需要一个电池电压实体。
-`/opt/ebike-tracker/homeassistant/custom_components/ebike_tracker` 目录已建但为空。
+~~**实体清单未列举 [待解决]**~~ → 已列举并实现（见下面的更新段）。
 
 > **2026-09-01 更新：已实现，共 9 个实体，见 [`HA.md`](HA.md)。**
 > `device_tracker`（含误差圈）+ 电压/电量/精度/定位方式/最后上报 5 个 sensor
@@ -940,6 +948,9 @@ LBS 降级是 R9 的验收项之一：拔掉 GNSS 天线仍要出 `src=lbs` 的�
 > #24 因为「设备侧改用 TLS + 口令、不做 mTLS」而作废（契约 §2），
 > #8 #9 的服务端部分已实现。下表保留原编号并标注状态，别重排号——
 > 代码注释里引用的是这些编号。
+>
+> **2026-09-02 更新**：按审计结果修了服务端、HA 与固件的一批缺陷，
+> #8 的阈值联动补齐，#26 之后新增 #27~#30（都是审计发现的，不是新需求）。
 
 | # | 问题 | 阻塞谁 | 状态 |
 | --- | --- | --- | --- |
@@ -950,8 +961,8 @@ LBS 降级是 R9 的验收项之一：拔掉 GNSS 天线仍要出 `src=lbs` 的�
 | 5 | **ACL 规则形态、设备账号命名与配发方式**未定 | R5，与 #1 一起定 | ✅ 契约 §3；账号 = 设备 id，口令由 `ebike-server init` 生成 |
 | 6 | **per-user secret 下行契约**未定义（§5.3 §9.3） | R4/R5，且走的是密钥材料 | ✅ 契约 §6.2 |
 | 7 | ~~**HA 实体清单**未列举（§9.4）~~ | R5 | ✅ 9 个实体已实现并在真 HA（2026.8.3）里验过，见 [`HA.md`](HA.md) |
-| 8 | **状态派生参数**未定：地理围栏存哪、离线超时阈值多少（离线阈值还依赖 §8.3 的上报间隔） | R5/R9 | ✅ 服务端配置；离线阈值 = 上报周期 × 3 + 120 s（契约 §4.2） |
-| 9 | **轨迹保留策略**未定：存多久、是否下采样、`/track` 分页 | R5 | 部分：保留天数与分页已实现，**下采样没做** |
+| 8 | **状态派生参数**未定：地理围栏存哪、离线超时阈值多少 | R5/R9 | ✅ 服务端配置；离线阈值 = 上报周期 × 3 + 120 s（契约 §4.2）。**2026-09-02 补齐联动**：`interval` 指令 ack 成功后回写周期并落库，重启从 `meta` 表恢复 —— 原来改了周期阈值不跟，调大会让健康的车被判离线 |
+| 9 | **轨迹保留策略**未定：存多久、是否下采样、`/track` 分页 | R5 | 部分：保留天数与分页已实现，**下采样没做**。**2026-09-02 补上** `pending_downlink` 的保留期清理（只清已确认的行，未确认的永不删） |
 | 10 | **Q1 P-MOS 及其栅源齐纳、GNSS 电源门控管、锁执行机构与驱动**都没给型号（§7） | R8 / 采购 | 仍待你定 |
 | 11 | **I2C 上拉阻值、NFC 调谐电容容值**待实测（§7） | R2 / R3 | 仍待实测 |
 | 12 | **VDDH 5.5 V 上限 `[未核实-原厂]`**，5 V 注入只剩 0.5 V 余量（§3.2） | R8，示波器实测 | 仍未核实 |
@@ -969,6 +980,10 @@ LBS 降级是 R9 的验收项之一：拔掉 GNSS 天线仍要出 `src=lbs` 的�
 | 24 | ~~**客户端证书/私钥怎么进产线**（§8.8）~~ | R6 / 量产前 | ✅ **前提作废**：契约 §2 把设备侧降级成「TLS + 用户名口令」，理由是设备拆开就能读 flash（§5.4 #1），证书私钥和口令的安全等级本来就一样 |
 | 25 | **模组关机期间下行怎么排队**（§9.3 表） | R5/R6，决定 secret 轮换最坏时延 | ✅ 契约 §4.1：**服务端自己排队**（SQLite `pending_downlink`），不靠 broker retain——因为 retain 每 topic 只留一条，连续两次密钥轮换会丢掉第一把。最坏时延 = 一个上报周期 |
 | **26** | **`amqtt` 的 retain 会漏给任何连上来的客户端**（契约 §4.3，本机实测） | **加第二辆车之前** | 新增。当前无害（只有 `state` retain，下行一律不 retain），多车下 bike02 会看到 bike01 的位置 |
+| **27** | **1M+1M 分压配 58.8 V 会烧 ADC 脚**（§3.6 / overlay / HARDWARE.md §2.1 三处同错） | **布板前，物理不可逆** | 新增。2:1 分压 + 内部参考/gain 1/6（满量程 3.6 V）→ 58.8 V 灌 29.4 V 到 P0.31。需要 ≥16.33:1。**这一条你要自己定电池实际充满电压后再改** |
+| **28** | ~~**`at_cmd_expect` 的 resp 被终结码覆盖**~~ | R6 第一天 | ✅ **2026-09-02 已修**：数据行先写 `resp`、随后 `"OK"` 又覆盖一次 → `AT+CGREG?` 的 `strstr(resp,",1")` 恒不匹配 → `modem_connect` 必然 60 s 后 `-ENETUNREACH`；`AT+CSQ` 同理恒返回 -1。改为只写非终结码信息行 |
+| **29** | ~~**`AT+MQTTMODE=1` 与两条 `AT+SSLCFG` 静默失败**~~ | R6 | ✅ **2026-09-02 已修**：`MQTTMODE` 决定 payload 是 HEX 还是裸字节，静默失败 → 每条上行都畸形；`seclevel` 静默失败 → TLS 退化成加密但不认证。三条都改成失败即中止连接 |
+| **30** | ~~**mTLS 模式（`mqtt.mode="cert"`）从未跑通**~~ | 想用 mTLS 时 | ✅ **2026-09-02 已修**：上游 `UserAuthCertPlugin` 不设 `session.username`，ACL 查 `"anonymous"` → SUBSCRIBE 返回 0x80，设备收不到任何下行。新增 `DeviceCertAuthPlugin` 补上身份，两条端到端测试钉住 |
 
 ---
 

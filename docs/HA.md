@@ -41,19 +41,24 @@ docker compose run --rm --entrypoint sh ebike-server -c 'cat /data/certs/ca.crt'
 
 ## 2. 实体
 
-一个设备卡片下 9 个实体：
+一个设备卡片下 9 个实体。**实体 id 是英文的**——HA 的 `VALID_ENTITY_ID`
+不允许中文，而 zh-Hans 不在 core 的 `NATIVE_ENTITY_IDS` 里，所以 object_id
+由 `en.json` 的英文名派生。界面上显示的**名字**才是中文。
 
-| 实体 | 类型 | 说明 |
-| --- | --- | --- |
-| `device_tracker.电瓶车_bike01` | GPS | 地图上的车。`gps_accuracy` 就是**误差圈**，这是 DESIGN.md §9.4 那条验收 |
-| `sensor.…_电池电压` | voltage | V，1 位小数 |
-| `sensor.…_电量` | % | 由电压曲线插值。**只是个指示**——铅酸电压在负载下会塌，同一电压能差 20% 容量 |
-| `sensor.…_定位精度` | m | 和 `gps_accuracy` 同源，单独出一个是为了能画历史曲线 |
-| `sensor.…_定位方式` | 文本 | 「卫星定位」/「基站定位」 |
-| `sensor.…_最后上报` | timestamp | **服务端时钟**，不是设备时钟（契约 §5.6：设备拿到 NITZ 前 `t` 是 0） |
-| `binary_sensor.…_在线` | connectivity | **服务端超时算的，不是 LWT**（契约 §4.2） |
-| `binary_sensor.…_移动中` | moving | 加速度计事件 + 位移共同判 |
-| `binary_sensor.…_车锁` | lock | **可能是「未知」**，见下 |
+| 实体 id | 界面名 | 类型 | 说明 |
+| --- | --- | --- | --- |
+| `device_tracker.…_bike01` | 电瓶车 bike01 | GPS | 地图上的车。`gps_accuracy` 就是**误差圈**，这是 DESIGN.md §9.4 那条验收 |
+| `sensor.…_battery_voltage` | 电池电压 | voltage | V，1 位小数 |
+| `sensor.…_charge` | 电量 | % | 由电压曲线插值。**只是个指示**——铅酸电压在负载下会塌，同一电压能差 20% 容量 |
+| `sensor.…_location_accuracy` | 定位精度 | m | 和 `gps_accuracy` 同源，单独出一个是为了能画历史曲线 |
+| `sensor.…_fix_source` | 定位方式 | 文本 | 「卫星定位」/「基站定位」 |
+| `sensor.…_last_report` | 最后上报 | timestamp | **服务端时钟**，不是设备时钟（契约 §5.6：设备拿到 NITZ 前 `t` 是 0） |
+| `binary_sensor.…_online` | 在线 | connectivity | **服务端超时算的，不是 LWT**（契约 §4.2） |
+| `binary_sensor.…_moving` | 移动中 | moving | 加速度计事件 + 位移共同判 |
+| `binary_sensor.…_lock` | 车锁 | lock | **可能是「未知」**，见下 |
+
+设备卡片的「固件版本」来自 `state.fw`（契约 §7），它一路来自 `up/hello` 的
+`fw` 字段（§5.1）。**还没收到过 hello 时是空的**，那是正确的显示。
 
 ### 三个刻意的设计
 
@@ -67,11 +72,18 @@ docker compose run --rm --entrypoint sh ebike-server -c 'cat /data/certs/ca.crt'
 `lock_state` 事件，契约 §7 的 `lk` 就是 `null`。
 **显示「未知」而不是「没锁」**——后者会让人以为车没锁好而白跑一趟。
 
-**3. 车离线时实体仍然「可用」。**
+**3. 车离线时实体仍然「可用」，MQTT 断了才不可用。**
 车离线时服务端**照样发** state（算出 `on=false` 并 retain），所以实体是可用的，
-只是「在线」显示为 off。真正 unavailable 只有「HA 刚启动还没收到 retain」或
-「MQTT 断了」。混在一起的后果是车一离线所有实体变 unavailable、历史图断掉、
-**看不到最后一次在哪**——那恰恰是车被偷时最需要的信息。
+只是「在线」显示为 off。混在一起的后果是车一离线所有实体变 unavailable、
+历史图断掉、**看不到最后一次在哪**——那恰恰是车被偷时最需要的信息。
+
+真正 unavailable 有两种：「HA 刚启动还没收到 retain」和「**MQTT 断了**」。
+⚠ **后者是集成自己判的，不是 HA 自动的**：HA 的自动 unavailable 只作用于
+`MqttAvailabilityMixin` 的实体，本集成的三个平台都不继承它。
+所以 coordinator 订了 `mqtt.async_subscribe_connection_status`，
+`available` 是「MQTT 连着 **且** 收到过 state」。
+不这么做的话 broker 挂掉后 9 个实体会继续显示最后一次的值并标记为可用 ——
+使用者分不清那是真值还是过期值。
 
 ## 3. 坐标系
 
@@ -114,6 +126,14 @@ rest_command:
 
 ## 5. 怎么验的
 
+> ⚠ **2026-09-02 更新**：下面这次实测是**在修四个缺陷之前**跑的。
+> 之后改动了 `entity.py`（可用性 + `unique_id` + `sw_version`）、
+> `coordinator.py`（订阅 MQTT 连接状态）、`device_tracker.py`（精度类型 +
+> `entity_category`）、`sensor.py`（单位枚举）。
+> **这些改动只做了 `py_compile` 和 32 条契约测试，没有再跑一次真 HA。**
+> 上机前预期两处可见差异：设备卡片会显示固件版本；地图实体从「诊断」区
+> 回到主区。
+
 固件那份是「没编译过」，**这份不是** —— 在本机用真的 HA 跑起来验过：
 
 ```bash
@@ -137,7 +157,7 @@ DEBUG custom_components.ebike_tracker.coordinator:
 device_tracker.…_bike01        = not_home  latitude=31.228474 (GCJ-02) gps_accuracy=8 source=卫星定位
 sensor.…_battery_voltage       = 54.2
 sensor.…_charge                = 86
-sensor.…_location_accuracy     = 8.0
+sensor.…_location_accuracy     = 8.0        （修 location_accuracy 之后是 float，不再取整）
 sensor.…_fix_source            = 卫星定位
 sensor.…_last_report           = 2026-09-01T15:11:02+00:00
 binary_sensor.…_online         = on
@@ -162,7 +182,7 @@ device_tracker        gps_accuracy=1000  source=基站定位
 
 ## 6. 一致性测试
 
-服务端那边有 **28 条**测试盯着这份集成（`server/tests/test_ha_contract.py`）：
+服务端那边有 **32 条**测试盯着这份集成（`server/tests/test_ha_contract.py`）：
 
 ```bash
 cd server && ../.venv/bin/python -m pytest tests/test_ha_contract.py -q
@@ -171,11 +191,14 @@ cd server && ../.venv/bin/python -m pytest tests/test_ha_contract.py -q
 它们防的是「服务端改了 state 字段名，HA 侧还读旧名」——那种错误的表现是
 HA 里所有实体变 unknown 而日志一句话都没有。最关键的一条
 `test_every_ha_field_exists_in_real_state` 拿**服务端真算出来的 state**
-逐个检查 HA 要读的 15 个键。
+逐个检查 HA 要读的 16 个键（含 2026-09-02 新增的 `fw`）。
 
 另外几条钉住了上面那些设计决定：`test_no_lock_entity_platform`（不许加 lock 平台）、
 `test_ha_uses_exact_topic_not_wildcard`（不许用通配符订阅，理由是契约 §4.3 那个
-amqtt 缺陷）、`test_lk_is_none_without_lock_sensor`（没接反馈开关时必须是 None）。
+amqtt 缺陷）、`test_lk_is_none_without_lock_sensor`（没接反馈开关时必须是 None）、
+`test_ha_tracks_mqtt_connection_state`（必须自己订 MQTT 连接状态）、
+`test_ha_unique_id_is_stable_across_reinstall`（`unique_id` 不许绑 `entry_id`）、
+`test_fw_reaches_ha_from_hello`（设备卡片的固件版本必须真有值）。
 
 ## 7. 没做的
 

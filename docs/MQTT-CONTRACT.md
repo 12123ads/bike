@@ -1,9 +1,18 @@
 # MQTT 契约 v1（单车 / 服务端内置 broker）
 
-> 状态：2026-09-01 首次定义。解掉 [`DESIGN.md`](DESIGN.md) §11 的 **#1 #4 #5 #6 #21 #25**。
+> 状态：2026-09-01 首次定义，2026-09-02 按实现校订。
+> 解掉 [`DESIGN.md`](DESIGN.md) §11 的 **#1 #4 #5 #6 #21 #25**。
 > 固件 `firmware/nrf52840/src/proto.c` 与服务端 `server/ebike_server/contract.py`
 > 必须与本文逐字一致。**改本文就要同时改这两处，`tests/test_contract.py` 会挡住不一致。**
 > 带 **【定】** 的是本轮新做的决定，四份历史文档都没写过——你可以推翻。
+>
+> **2026-09-02 的校订（都是文档跟代码对齐，不是契约变更）**：
+> §3 ACL 表补上设备的 `lwt` 发布权并说明 `svc` 是保留名；
+> §3 更正「断言 publish-acl 非空」（那样写恒为真，已改成逐设备检查）；
+> §4 说明 `lwt` 的 retain 分 broker 遗嘱和固件主动发两种情况；
+> §4.3 更正 amqtt 行号（601 / 1134）。
+> **唯一的契约变更**：§7 的 `state` **新增 `fw` 字段**（固件版本），
+> 并写明键集是可变的（无定位点时六个坐标键整个缺席）。
 
 ## 1. 架构变更：broker 跑在服务端进程里
 
@@ -65,17 +74,30 @@ DESIGN.md §8.2/§9.2 写的是「设备 → broker 无条件双向 TLS」。单
 
 | 账号 | 可发布 | 可订阅 |
 | --- | --- | --- |
-| `bike01`（设备） | `ebike/v1/bike01/up/#` | `ebike/v1/bike01/dn/#` |
+| `bike01`（设备） | `ebike/v1/bike01/up/#` **和 `ebike/v1/bike01/lwt`** | `ebike/v1/bike01/dn/#` |
 | `ha`（Home Assistant） | 无 | `ebike/v1/+/state` |
-| `svc`（服务端自己） | 全部 | 全部 |
+| `svc`（保留名） | 全部 | 全部 |
 
 设备**不能**发布 `state`，也**不能**订阅自己的 `up/`——防的是设备被撬开后
 伪造「一切正常」的状态覆盖服务端判断。
 HA **只能**订阅 `state`，看不到原始报文，这就是 §9.4「跟 HA 解耦」的落地。
 
-⚠ `amqtt` 的 `TopicAccessControlListPlugin` 有个坑（`amqtt/plugins/topic_checking.py:70`）：
+`lwt` 的发布权是**必需**的，不是疏漏：§4.2 要求固件主动断开前发 `{"lwt":0}`，
+那条报文的 topic 是 `ebike/v1/<id>/lwt`，不在 `up/#` 下面。
+
+⚠ **`svc` 是保留名，当前并不存在**：ACL 里有它的条目，`Service.ingest` 也认它，
+但 `ebike-server init` **从不给它建口令**（`__main__.py` 只给设备和 `ha` 建）。
+服务端自己发布走的是 `broker.internal_message_broadcast()`，即以 broker 身份发，
+不占一个 MQTT 客户端连接，所以不需要账号。留着这个条目是为了将来真要开
+一个外部服务账号时不用改 ACL 形状。
+
+⚠ `amqtt` 的 `TopicAccessControlListPlugin` 有个坑（`amqtt/plugins/topic_checking.py:69-71`）：
 **`publish-acl` 没配的时候，发布一律放行**（为了兼容 hbmqtt）。
-所以 `publish-acl` 必须显式配，漏配是静默放开而不是报错。服务端启动时会断言它非空。
+所以 `publish-acl` 必须显式配，漏配是静默放开而不是报错。
+服务端启动时断言的是**每个已配置设备都有 publish 条目**——
+~~断言它非空~~ 那样写恒为真（`build_acl` 里已经先塞了 `svc` 键），
+等于没有保险。`tests/test_certs.py::test_publish_acl_assertion_covers_every_device`
+钉住了这一点。
 
 ---
 
@@ -91,12 +113,24 @@ HA **只能**订阅 `state`，看不到原始报文，这就是 §9.4「跟 HA �
 | `ebike/v1/<id>/up/tele` | 上行 | 1 | 否 | 设备，遥测 |
 | `ebike/v1/<id>/up/event` | 上行 | 1 | 否 | 设备，事件/告警 |
 | `ebike/v1/<id>/up/ack` | 上行 | 1 | 否 | 设备，确认一条下行 |
-| `ebike/v1/<id>/lwt` | 上行 | 1 | **是** | **broker 代发**（遗嘱） |
+| `ebike/v1/<id>/lwt` | 上行 | 1 | 见下 | **broker 代发**遗嘱；固件也会主动发一条覆盖 |
 | `ebike/v1/<id>/dn/cmd` | 下行 | 1 | **否** | 服务端，指令 |
 | `ebike/v1/<id>/dn/secret` | 下行 | 1 | **否** | 服务端，per-user 密钥 |
 | `ebike/v1/<id>/state` | 派生 | 1 | **是** | **服务端**（设备从不发这个） |
 
 最长 topic = `ebike/v1/` + 32 + `/up/hello` = **50 字节**，远在 256 以内（§8.2）。
+
+**`lwt` 的 retain 分两种情况**，这是实现事实，不是设计选择：
+
+- **broker 代发的遗嘱**：retain 位由设备 CONNECT 时的 `will_retain` 决定，
+  固件在 `AT+MCONFIG` 里配（`modem.c`）。
+- **固件主动发的 `{"lwt":0}`**：走普通 publish，`AT+MPUBEX` 的 retain 参数
+  **硬编码 0**（契约 §4.1 要求上行/下行都不 retain），所以它 **retain=false**，
+  覆盖不了 broker 侧那条 retain 的 `{"lwt":1}`。
+
+**端到端行为仍然正确**，因为服务端的 `_on_lwt` 是「收到消息就更新 DB 字段」，
+**不依赖 retain**（`service.py`）。所以 §4.2 那句「先发 `{"lwt":0}` 覆盖掉它」
+要理解成「让服务端知道这次是优雅下线」，而不是「覆盖 broker 的 retain 表」。
 
 ### 4.1 为什么下行 **不能** retain
 
@@ -119,7 +153,7 @@ retain 每个 topic **只留最后一条**。如果 `dn/secret` 用 retain，
 **全局**订阅过滤器表，把匹配的 retain 消息推给这个新会话——不管它自己订了什么：
 
 ```python
-for topic in self._subscriptions:                 # amqtt/broker.py:600
+for topic in self._subscriptions:                 # amqtt/broker.py:601（0.12.0 实测）
     await self._publish_retained_messages_for_subscription((topic, QOS_0), client_session)
 ```
 
@@ -149,10 +183,14 @@ LWT 的语义是「非优雅断连就发」，所以 LWT 会在**每个正常周
 **【定】判据：**
 
 - **`online` 由服务端超时算**：`now - last_seen > offline_after`，
-  `offline_after` 默认 `3 × report_interval + 120 s`，随上报周期配置联动。
-- **LWT 仍然保留**，payload 是 `{"lwt":1}`，retain。它的用途**不是**判离线，
-  而是给「设备是否是优雅下线」留一条痕迹：固件主动断开前会先发
-  `{"lwt":0}` 覆盖掉它。**`lwt=1` 且超时 = 可能真出事了**（掉电/剪线/信号丢失）。
+  `offline_after` 默认 `3 × report_interval + 120 s`，随上报周期联动。
+  **`interval` 指令改过周期后阈值会跟着走**：设备 ack 成功时服务端回写
+  `DeviceConfig.report_interval` 并落库（`service.py` 的 `_apply_acked_cmd`），
+  重启后从 `meta` 表恢复。不跟的话把周期调大会让健康的车被判离线。
+- **LWT 仍然保留**，payload 是 `{"lwt":1}`。它的用途**不是**判离线，
+  而是给「设备是否是优雅下线」留一条痕迹：固件主动断开前会先发一条
+  `{"lwt":0}`，服务端收到就把标记清掉（**靠收消息，不靠 retain 覆盖**，
+  见 §4 那段说明）。**`lwt=1` 且超时 = 可能真出事了**（掉电/剪线/信号丢失）。
 - 因为**没有备份电池**（§6），剪线的瞬间设备来不及说任何话，
   所以 `lwt=1` 也只是「非优雅」，**区分不了「正常关机档」和「被剪线」**。
   这不是契约的缺陷，是「不装备份电池」这个取舍的直接后果（§6 表格第一行）。
@@ -307,8 +345,16 @@ HEX 后 3.9 KB，**卡在 4100 B 上限内且留了 5% 余量**（§8.2）。
 ```json
 {"t":1788105895,"on":true,"mo":"parked","la":31.230416,"lo":121.473701,
  "gla":31.228405,"glo":121.478066,"a":8.0,"s":"g",
- "v":54.2,"pct":78,"gf":"in","ls":1788105895,"lwt":0,"lk":true}
+ "v":54.2,"pct":78,"gf":"in","ls":1788105895,"lwt":0,"lk":true,"fw":"0.1.0"}
 ```
+
+⚠ **键集是可变的，不是固定 16 个。** 服务端只在有数据时才放对应的键：
+
+- 还没收到任何位置点 → **`la` `lo` `gla` `glo` `a` `s` 六个键整个缺席**（不是 null）
+- 还没收到任何遥测 → **`v` `pct` 缺席**
+- 其余 8 个键（`t` `on` `mo` `ls` `lwt` `lk` `gf` `fw`）**总是在**
+
+HA 侧因此一律用 `.get()` 取值，不做 `KeyError` 假设。
 
 | 字段 | 含义 |
 | --- | --- |
@@ -322,6 +368,7 @@ HEX 后 3.9 KB，**卡在 4100 B 上限内且留了 5% 余量**（§8.2）。
 | `ls` | `last_seen`，服务端时钟 |
 | `lwt` | 最后一次断连是否非优雅（§4.2） |
 | `lk` | 锁是否锁着，来自 `lock_state` 事件。**`null` 是常态**——位置反馈微动开关是选配的，没接就永远拿不到。HA 侧必须能显示「未知」，**不能把 null 当成「没锁」** |
+| `fw` | 固件版本，来自 `up/hello` 的 `fw`（§5.1）。`null` = 还没收到过 hello。HA 用它填设备卡片的「固件版本」 |
 
 **`retain=true`** —— 这就是「重启 HA 立即有位置」那条验收成立的全部原因（§9.4）。
 
