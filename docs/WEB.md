@@ -93,7 +93,7 @@ echo "EBIKE_GAODE_KEY=$(cat /root/gaode.key)" >> /opt/ebike-tracker/.env
 服务端 `allow_remote_unlock` 是 false 时，按钮**直接是禁用的**，
 下面写明原因。让用户点一下再吃 403 是糟糕的体验。
 
-打开之后按钮可用，但点了会先弹确认框（「会绕过手机 NFC 的挑战应答」）。
+打开之后按钮可用，但点了会先弹确认框（「会绕过手机 BLE 的挑战应答」）。
 网页和 JSON API 走**同一套检查** —— 没有一条路能绕过去，
 `test_web_unlock_403_by_default` 钉住了这一点。
 

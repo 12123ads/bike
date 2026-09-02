@@ -1,32 +1,37 @@
-# 电瓶车定位 + 手机 NFC 开锁：技术方案（施工用）
+# 电瓶车定位 + 手机 BLE 开锁：技术方案（施工用）
 
 > 状态：2026-09-01 整合定稿，同日补入契约与代码。**这是唯一的施工依据**，
 > 面向写代码/焊板子的人：引脚映射、Kconfig、DTS、APDU 报文、AT 序列、分期验收标准。
 >
-> **同目录下的六份配套文档**：
+> **同目录下的七份配套文档**：
 > - [`HARDWARE.md`](HARDWARE.md) — 给用户看的摘要：买什么、怎么接、要拍板什么
 > - [`MQTT-CONTRACT.md`](MQTT-CONTRACT.md) — **契约 v1**，本文 §9.3 那张空白表已由它填满
 > - [`SERVER.md`](SERVER.md) — 服务端怎么跑（含 docker）、amqtt 的坑、测试覆盖
 > - [`WEB.md`](WEB.md) — 内置网页界面：地图、登录、高德 key、坐标系
 > - [`FIRMWARE.md`](FIRMWARE.md) — 固件怎么编、还缺什么
 > - [`HA.md`](HA.md) — Home Assistant 集成：装哪、9 个实体、怎么验的
+> - [`ADR-004-ble-unlock.md`](ADR-004-ble-unlock.md) — **开锁改 BLE 的决策记录**：AOSP/Zephyr 源码出处、功耗手算、中继攻击评估、留给你拍板的四件事
 >
 > ⚠ 契约相关的结论以 `MQTT-CONTRACT.md` 为准（它比本文 §9 新）；
 > 硬件与功耗结论以本文为准。§11 的状态列已更新。
 >
 > 此前的 `PLAN.md` / `ADR-001` / `ADR-002` / `ADR-003` 已移入 [`archive/`](archive/)，
 > 只作为原始论证的查证出处，见 [`archive/README.md`](archive/README.md)。
+> **开锁方式已于 2026-09-02 从手机 NFC 改为手机 BLE，见
+> [`ADR-004-ble-unlock.md`](ADR-004-ble-unlock.md)** —— 它取代 ADR-003 的
+> §2 / §3.4 / §4.3 / §7.1，以及本文 §2 全节、§3.3、§3.5、§5.1、§5.4。
+> 供电、GNSS、运动唤醒、4G 链路、MQTT 契约、服务端与 HA 一个字都没变。
 > 本文里 `[未核实]` / `[推断]` 标记保留自原文，含义不变：**没有第一手资料背书的结论，施工前要自己验。**
 
 ## §0 一句话方案
 
 nRF52840 做主控，Air780EP 降级成纯 4G AT modem，LIS2DW12 做运动唤醒，
 ATGM336H 做定位；48V 车电池经成品降压模块取电，不做备份电芯；
-开锁只走 **手机 NFC**（nRF52840 的 NFCT 当标签、手机当读卡器），不走蓝牙，只管安卓。
+开锁走 **手机 BLE**（nRF52840 当 GATT peripheral、手机当 central），只管安卓（iOS 可做，未做）。
 
 四个「放弃」都是主动取舍，不是遗漏：
-放弃读卡器/实体卡、放弃 BLE、放弃备份电芯与硬件欠压保护、放弃 iOS。
-每一条的理由分别在 §2.1、§2.1、§4.4、§2.2。
+放弃读卡器/实体卡、放弃 NFC、放弃备份电芯与硬件欠压保护、放弃「走近自动开锁」。
+每一条的理由分别在 §2.1、ADR-004 §0、§4.4、§5.5。
 
 ---
 
@@ -37,7 +42,7 @@ graph TB
   subgraph 车上
     ACC["LIS2DW12<br/>运动唤醒"] -->|INT1| MCU
     GNSS["ATGM336H-5N"] -->|UART| MCU
-    PHONE(("手机<br/>NFC 读卡器")) -.->|13.56 MHz<br/>ISO-DEP| MCU["nRF52840<br/>主控 / NFC 标签"]
+    PHONE(("手机<br/>BLE central")) -.->|2.4 GHz<br/>GATT| MCU["nRF52840<br/>主控 / BLE peripheral"]
     MCU -->|GPIO| LOCK["锁执行机构"]
     MCU -->|UART 9600<br/>AT| EP["Air780EP<br/>纯 4G modem"]
     BATT["48V 车电池"] --> PWR["LX-P160<br/>28~130V→5V"] --> MCU
@@ -53,7 +58,7 @@ graph TB
 
 | 器件 | 角色 | 为什么是它 |
 | --- | --- | --- |
-| nRF52840 | 主控 + NFC 标签 + 密码学 | NFCT 外设 + CryptoCell-310 硬件 HMAC，见 §2.1 §5 |
+| nRF52840 | 主控 + BLE peripheral + 密码学 | 片上 BLE（不占引脚）+ CryptoCell-310 硬件 HMAC，见 §2.1 §5 |
 | Air780EP | 纯 4G modem，跑 AT 固件 | 只负责把字节送上 MQTT，不再跑业务，见 §8 |
 | LIS2DW12 | 运动唤醒 | 低功耗且 Zephyr 驱动有 `.trigger_set`，见 §3.7 |
 | ATGM336H-5N | GNSS | 支持北斗；NEO-7M 在协议层没有北斗且已 EOL |
@@ -61,48 +66,54 @@ graph TB
 
 ---
 
-## §2 手机 NFC 开锁
+## §2 手机 BLE 开锁
 
-### §2.1 链路：谁是读卡器
+> 完整的取舍论证、AOSP/Zephyr 源码出处、中继攻击评估在
+> [`ADR-004-ble-unlock.md`](ADR-004-ble-unlock.md)。本节只保留施工要用的东西。
 
-**nRF52840 的 NFCT 只能当标签，不能当读卡器。** 这是硬约束，决定了整个开锁方案的形状。
-原厂产品规格书两句话（逐字）：
+### §2.1 链路：谁是 central
 
-> The NFCT peripheral is an implementation of an NFC Forum compliant listening device NFC-A
+设备是 **peripheral**（`CONFIG_BT_PERIPHERAL=y`），**只广播、只等连接，
+从不扫描、从不发起连接**；手机是 central，连上来写 APDU。
 
-> The NFCT peripheral contains a 13.56 MHz AM receiver and a 13.56 MHz load modulator
+保持这个方向不是技术限制（BLE 两个方向都行），而是**状态机不用改**：
+`unlock.c` 的 `selected` / `nonce_valid` / `cur_nonce` 三个状态原本就是
+「等手机发下一条命令」的形状，那是 NFC 时代手机当读卡器留下的。
 
-只有 AM 接收器和负载调制器，**没有载波发生器**——发不出场，就没法给无源卡供电。
-Nordic 工程师 Bendik Heiskel 在 DevZone（Case ID 299844）的回复把这条钉死：
+**报文一字未改** —— 同一套 ISO7816-4 APDU、同一个 HMAC-SHA256 挑战应答（§5.2）、
+同一份 `unlock.c` 三重校验。换的只是载体：
 
-> The NFC peripheral can only be used as a tag. To read NFC tags a separate IC is needed.
+| | NFC（旧） | BLE（现） |
+| --- | --- | --- |
+| 收命令 | `NFC_T4T_EVENT_DATA_IND` 回调 | CMD 特征的 GATT write 回调 |
+| 回应答 | `nfc_t4t_response_pdu_send()` | `bt_gatt_notify()` 到 RSP 特征 |
+| 会话开始/结束 | `FIELD_ON` / `FIELD_OFF` | `connected` / `disconnected` |
+| 门控 | `nfc_t4t_emulation_start/stop()` | `bt_le_adv_start/stop()` |
 
-所以只有一种可行分工：**手机当读卡器（发场、供电、发 APDU），车上的 nRF52840 当被动标签。**
-这同时解释了为什么放弃实体卡：读实体卡需要额外读卡器 IC（原方案的 FM17622），
-而手机 NFC 方案下这颗 IC 可以整个删掉。
+### §2.2 GATT 表与 Kconfig
 
-放弃 BLE 的理由不同：BLE 要配对、要维护连接、开锁时延和后台唤醒都受手机系统调度摆布，
-而 NFC 贴一下就是一次确定的物理动作，且复用的是已经在片上的 NFCT。
+| 特征 | UUID 低 16 位 | 属性 | 用途 |
+| --- | --- | --- | --- |
+| 服务 | `0001` | — | 只放在**扫描响应**里，不放广播包，见 §2.4 |
+| CMD | `0002` | `WRITE`（write request） | 手机写整条 C-APDU |
+| RSP | `0003` | `NOTIFY`，`BT_GATT_PERM_NONE` | 车回 R-APDU |
 
-### §2.2 raw ISO-DEP：nfc_t4t_lib 的正确用法
+UUID 基址 `2c1327ba-a717-4314-827e-92532d7a xxxx`（随机生成的 v4）。
 
-用 nrfxlib 的 `nfc_t4t_lib`，**raw ISO-DEP 是默认模式**——`nfc_t4t_setup()` 第二参数传 `NULL`
-就不做 NDEF 封装，直接收发 APDU：
-
-```c
-nfc_t4t_setup(t4t_callback, NULL);   /* 默认 = raw ISO-DEP */
-nfc_t4t_emulation_start();           /* 锁定模式并开始监听 */
-```
-
-回调里收 `NFC_T4T_EVENT_DATA_IND`，用 `nfc_t4t_response_pdu_send()` 回。
-单次 payload 上限 `NFC_T4T_MAX_PAYLOAD_SIZE = 0xFFF0`，对开锁报文来说绰绰有余。
-
-Kconfig（**两处符号名是本方案更正过的，原稿是错的**）：
+**没有独立的 nonce 读特征。** 直觉上 GET CHALLENGE 更像「客户端拉」，用 read
+还能省掉写 CCCD 那一个往返；但 read 回调里生成 nonce 意味着**任何人连上来读一下
+就能作废合法用户的 nonce** —— `nonce_valid` 会变成远程可 DoS 的状态位。
+所以三步命令全部走 CMD 写，nonce 只在收到合法 GET CHALLENGE 时生成。
 
 ```ini
-CONFIG_NFC_T4T_NRFXLIB=y      # ← 正确符号名。原稿的 CONFIG_NFC_T4T_LIB 不存在
-CONFIG_NFC_PLATFORM=y
-CONFIG_NFC_THREAD_CALLBACK=y
+CONFIG_BT=y
+CONFIG_BT_PERIPHERAL=y
+CONFIG_BT_MAX_CONN=1          # 不只是省资源：§2.5 的无锁论证依赖它
+CONFIG_BT_DEVICE_NAME="ebike"
+CONFIG_BT_SMP=n               # 见 §5.5：NoInputNoOutput 下 LESC 只能退化成 Just Works
+CONFIG_BT_SETTINGS=n          # 不开 SMP 就没有 LTK/IRK 要落盘，别让 BT 碰 counter 那块分区
+CONFIG_BT_L2CAP_TX_MTU=40     # 见下面的 MTU 算式
+CONFIG_BT_BUF_ACL_RX_SIZE=44
 CONFIG_PSA_CRYPTO=y
 CONFIG_PSA_WANT_GENERATE_RANDOM=y
 CONFIG_PSA_WANT_ALG_HMAC=y
@@ -113,56 +124,117 @@ CONFIG_SETTINGS=y
 CONFIG_SETTINGS_NVS=y
 ```
 
-### §2.3 安卓侧的两道门（这是方案最大的用户体验代价）
+### §2.3 MTU 必须调，默认值差得不止一点
 
-**门 1：屏幕必须亮且已解锁。** AOSP `NfcService` 里（逐字）：
+- ATT MTU 默认 **23**（`host/att_internal.h:23` 的 `BT_ATT_DEFAULT_LE_MTU`）；
+  写请求可写载荷 = ATT_MTU − 3（1 B opcode + 2 B handle）= **20 字节**。
+- 最长 C-APDU 是 UNLOCK：`80 10 00 00 Lc [uid(4)||counter(4)||mac(16)] 00` = **30 字节**。
+  即使剥掉 ISO7816 外壳只发 24 字节 body 也装不下 20。
+- 本地上限 = `MIN(BT_L2CAP_RX_MTU, BT_L2CAP_TX_MTU)`（`att_internal.h:38`），
+  其中 `BT_L2CAP_RX_MTU = CONFIG_BT_BUF_ACL_RX_SIZE − 4`（`l2cap.h:47` + `:41`）。
+  ⇒ `TX_MTU=40`（40−3=37 ≥ 30 ✓）+ `ACL_RX_SIZE=44`（44−4=40 ≥ 40 ✓）。
 
-```java
-// minimum screen state that enables NFC polling
-static final int NFC_POLLING_MODE = ScreenStateHelper.SCREEN_STATE_ON_UNLOCKED;
-```
+**保留整条 APDU 不剥壳**：`unlock_handle_apdu()` 一行都不用改。
+那 5 字节 ISO7816 头换来的是「传输层可替换」这个性质本身 ——
+这次换传输能只花一个模块的代价，正是因为上一轮把协议定在了 APDU 层。
 
-`ScreenStateHelper` 的档位是 `OFF_UNLOCKED=0x01 < OFF_LOCKED=0x02 < ON_LOCKED=0x04 < ON_UNLOCKED=0x08`，
-门槛取在最高档。**息屏或锁屏状态下手机根本不发 NFC 场**，贴上去什么都不会发生。
+⚠ 副作用：`ACL_RX_SIZE > 27` 会让 `BT_DATA_LEN_UPDATE` 变 default y，
+进而 `BT_CTLR_DATA_LENGTH=y`，SDC 的 per-link 缓冲跟着涨。这是划算的 ——
+换掉的是应用层分包逻辑，而分包会让「nonce 一次性」的安全论证被半条报文复杂化。
 
-**门 2：App 必须在前台。** `setReaderMode` 的调用方检查（逐字）：
+⚠ **手机侧仍要 `requestMtu()`**：MTU 交换由 central 发起，我们是 server；
+`CONFIG_BT_GATT_AUTO_UPDATE_MTU` 只对 GATT client 有效。
 
-```java
-if (!privilegedCaller
-        && !mForegroundUtils.registerUidToBackgroundCallback(NfcService.this, callingUid)) {
-    Log.e(TAG, "setReaderMode: Caller is not in foreground and is not system process.");
-    return;
-}
-```
+### §2.4 广播：只放 Flags，服务 UUID 放扫描响应
 
-`ForegroundUtils.isInForegroundLocked()` 判的是 `getUidImportance(uid) == IMPORTANCE_FOREGROUND`。
+广播包（AD）只放 `BT_DATA_FLAGS`，服务 UUID 放**扫描响应**（SD）。
+理由是防盗产品不该对着街上广播「我是一台可以被 BLE 开锁的车」；
+而安卓的 BLE 扫描是主动扫描（发 SCAN_REQ），`ScanRecord` 由广播包与扫描响应
+**合并**而成，所以 `ScanFilter.setServiceUuid()` 仍然匹配得到 ——
+被动嗅探只看到一个裸 Flags。
 
-两道门叠起来，**实际开锁动作是：亮屏 → 解锁 → 打开 App → 贴车。** 这就是代价，没有绕法。
-Android 15/16 的 NFC 新 API 查过了，对这两道门都没有松动。
+广播间隔取 **100~150 ms**（`BT_GAP_ADV_FAST_INT_MIN_2`/`MAX_2`），
+`BT_LE_ADV_OPT_CONN`（Zephyr < 4.0 是 `CONNECTABLE|ONE_TIME`）——
+连上就停广播、不自动恢复，恢复由 `recycled` 回调按状态机决定。
 
-### §2.4 Reader mode 的 flags 与三个运行时查询
+**静止 5 分钟后关广播的理由是防跟踪，不是省电。** 广播 100~150 ms 间隔约
+**130 µA**、1 s 间隔约 **16 µA**（ADR-004 §3.1 的手算，`[未核实]`），
+都远低于它取代的 NFCT ACTIVATED（**400 µA**），也完全淹没在 4G 模组
+500~1500 µA 的功耗地板下（§4.1b）。折到 48V 20Ah 车电池是 0.0013 %/天。
+改动机的时候别把这条推理丢掉 —— 否则会有人为了「省电」把间隔调到 2 s，
+白白牺牲发现时延。
 
-```java
-adapter.enableReaderMode(activity, callback,
-        NfcAdapter.FLAG_READER_NFC_A              // 0x01
-      | NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK    // 0x80，不做 NDEF 探测，省一轮往返
-      | NfcAdapter.FLAG_READER_NO_PLATFORM_SOUNDS // 0x100
-      , extras);   // EXTRA_READER_PRESENCE_CHECK_DELAY ("presence")，默认 125 ms
-```
+### §2.5 写回调不能跑密码学：必须 defer
 
-拿到 `IsoDep` 之后，**三个查询必须在运行时做，不要假设**：
+GATT 写回调**同步跑在协议栈自己的协作式工作队列线程 `"BT RX WQ"` 上**
+（`host/att.c:2145-2147` 直接调 `attr->write(...)`；队列在
+`host/hci_core.c:124-156`，`BT_RX_PRIO` 默认 8）。官方指导逐字：
+*"Keep callbacks short, and defer work that is long-running or blocks indefinitely
+to an application-owned thread or work queue."*
 
-| 查询 | 为什么 |
-| --- | --- |
-| `getMaxTransceiveLength()` | 决定单帧能放多少字节 |
-| `isExtendedLengthApduSupported()` | 决定能不能用扩展长度 APDU |
-| `isSecureNfcEnabled()` / `isSecureNfcSupported()`（API 29） | Secure NFC 打开时行为不同 |
+所以 `on_cmd_write()` **只 `memcpy` + `k_work_submit_to_queue()`**，
+`unlock_handle_apdu()` 跑在 `ble_unlock.c` 自有的 work queue 上。三条理由：
 
-### §2.5 运动唤醒代替场唤醒
+1. **DoS**：攻击者可以无限灌 UNLOCK 写请求，每条都要一次 CC310 HMAC；
+   不 defer 就会拖垮同队列上的所有 BT 处理（含连接维持）。
+   **这是 NFC 侧不存在的攻击面**（NFC 得贴上来），而且**未认证可达**（§5.5）。
+2. **不用 system workqueue**：nvstore 的 counter 延迟落盘挂在那上面，
+   而 flash 写被 `SOC_FLASH_NRF_RADIO_SYNC_MPSL` 排到 MPSL timeslot 之后。
+   别让开锁应答排在一次擦写后面。
+3. 分离之后写回调可以立刻 `return len`（Write Response 秒回），应答走 notify 天然异步。
 
-车上这一侧不能靠「有场就醒」来省电：NFC SENSE 只加 +0.10 µA 很便宜，
-但 NFCT ACTIVATED 是 **400 µA**，长期挂着不划算，而且 §2.3 的门 1 意味着大部分时间根本没有场。
-所以用 **LIS2DW12 的运动中断（§3.7）** 作为主唤醒源，NFC 只在设备已经因为运动而醒着时才有意义。
+**并发不变量（改代码前必读）**：`unlock.c` 的 `cur_nonce`/`nonce_valid`/`selected`
+是无锁静态状态。它们安全的**唯一**理由是「所有访问都只发生在 `unlock_workq`
+那一个线程里」。所以连 `unlock_session_reset()` 这种看着无害的调用**也走同一个队列**
+（`ble_unlock.c` 的 `session_reset()`）—— 连接/断开回调在 BT RX WQ 上、
+静止关广播在 uplink 线程上，直接调就是在第二、第三个线程上写同一批变量。
+延迟几毫秒作废 nonce 没有安全影响（nonce 本来就用过即废）。
+
+`CONFIG_BT_MAX_CONN` 一旦 > 1，这个论证失效（会有两条并发 APDU 流），必须补锁。
+
+`on_cmd_write()` 里的 `busy` 原子标志同理不是防御性代码：写回调立刻返回、应答异步，
+手机完全可以在上一条还在算的时候发下一条（ATT 只保证「一请求一响应」，
+不保证我们处理完了），没有它第二条写会踩掉正在处理的缓冲。
+
+### §2.6 安卓侧：两道门都没有，但有位置权限的账要算
+
+**NFC 时代的两道门（息屏/锁屏不发场、App 必须前台）在 BLE 上一条都没有** ——
+`GattService.java` 里 grep `Keyguard|isInteractive|isScreenOn|PowerManager` 零匹配，
+`ScanManager` 的屏幕状态只用于降频。⇒ **锁屏、息屏下 GATT 连接与读写都能做。**
+开锁步数从 4 步（亮屏 → 解锁 → 开 App → 贴车）降到 **2 步**（亮屏 → 点开锁）。
+
+代价在权限上，版本边界卡得很干净：
+
+| | Android 12+（API 31） | Android 11 及以下 |
+| --- | --- | --- |
+| 权限 | `BLUETOOTH_SCAN` + `BLUETOOTH_CONNECT` | + **`ACCESS_FINE_LOCATION`** |
+| 加 `neverForLocation` 后免位置 | ✅ | ❌ 源码层面没有这个分支 |
+| 系统定位开关必须开 | ❌ 不依赖 | ✅ **必须开** |
+
+**主连接路径按 MAC 直连，绕开上面全部**：`getRemoteDevice(String)` 标着
+`@RequiresNoPermission`，之后 `connectGatt()` 只要 `BLUETOOTH_CONNECT` ——
+不需要 `BLUETOOTH_SCAN`、不需要位置权限、不需要定位开关、不需要亮屏解锁。
+扫描只在**首次配对**用一次，且**必须带 `ScanFilter`**（无过滤扫描在息屏或
+定位关闭时会被静默挂起，App 收不到任何回调）。
+
+App 侧三个必须写对的地方（出处见 ADR-004 §2.5）：`onServicesDiscovered` 之前不能读写；
+同时只能有一个 GATT 操作在飞（`mDeviceBusy` 是框架硬锁，必须自己做串行队列）；
+每个 `BluetoothGatt` 用完 `close()`（32 client/app 上限，超限只有一条 `Log.w`）。
+
+### §2.7 运动唤醒是唯一的外部唤醒源
+
+**BLE 唤不醒设备**：radio 在 System OFF 下断电，手机连不上一台已关机的车。
+所以 **LIS2DW12 的运动中断（§3.7）是唯一的外部唤醒源**，
+BLE 广播只在设备已经因为运动或定时器而醒着时才存在。
+
+这一条和 NFC 时代的结论形状相同（那时是「NFC 场唤醒虽然存在但不划算」），
+但原因不同：NFC 是**不划算**（SENSE 只 +0.10 µA，但 ACTIVATED 要 400 µA），
+BLE 是**根本不可能**。
+
+进 System OFF 之前要 `ble_unlock_shutdown()`（停广播 + `bt_disable()`），
+且**必须在 `nvstore_flush()` 之前** —— radio 是 EasyDMA master，
+而 `SOC_FLASH_NRF_RADIO_SYNC_MPSL` 会让 flash 写等 MPSL timeslot，
+radio 开着时那次 flush 的最坏延迟不可控。见 `main.c` 的 `enter_system_off()` 第 1 步。
 
 ---
 
@@ -205,21 +277,26 @@ LDO 挂在 VDDH 下游当外设轨，joric 的 nRFMicro wiki 对这一类板子�
 **nRF52840 的 VDDH 绝对最大值 5.5 V `[未核实-原厂]`**。5 V 注入只剩 0.5 V 余量，
 LX-P160 的输出精度与瞬态过冲都吃在这 0.5 V 里。**这条建议在采购后用示波器实测确认。**
 
-### §3.3 NFC 天线
+### §3.3 2.4 GHz 天线：板载，什么都不用做
 
-nRF52840 的 NFC 需要一个 13.56 MHz 环形天线接到 NFC1/NFC2（P0.09/P0.10）。
-两条路：绕自己的环形天线 + 2 颗调谐电容，或者直接买 PN532 模块常配的成品天线板。
-**调谐电容值取决于最终天线的电感量，方案里给不出定值**，需要 VNA 或示波器实测收敛。
-Nordic 有专门的调谐文档（DevZone `NFC tag antenna tuning`）。
+**BLE 用板载天线，无需任何射频工作。** 这一节原本是「NFC 环形天线」，
+整节随 ADR-004 作废，因为它要求的东西全部消失了：
 
-**这两块板能这么接是因为芯片是裸片**：正品 nice!nano v2 与常见克隆用的都是
-**nRF52840 QIAA(aQFN73) 裸片，不是预认证模组**——模组会把 NFC1/NFC2 埋掉。
-两个焊盘物理相邻（J3 头两脚，见 §3.4），天线走线可以很短。
-⚠ 但 **2.54 mm 排针焊盘不是调过阻抗的差分对**，天线必须自己调谐，不能指望「插上就行」。
+| 原本要做的 | 现在 |
+| --- | --- |
+| 绕 13.56 MHz 环形天线或买成品天线板 | 不需要，板载 2.4 GHz 天线已调好 |
+| 用 VNA / 示波器收敛两颗调谐电容（**方案给不出定值**） | 不需要 |
+| 写 `UICR.NFCPINS.PROTECT`（**一次性写入**，只能靠 `--recover` 改回，
+  而 `--recover` 会连带擦掉 `REGOUT0`，见 §3.4） | **不需要，这个不可逆动作整个消失** |
+| 采购 NFC 天线 + 电容（§7.2） | 从 BOM 里删掉 |
+| 外壳上「NFC 天线贴在你希望手机去碰的那一面」 | 不再是约束 |
 
-用 NFC 引脚有一个不可逆动作：**UICR 的 `NFCPINS.PROTECT` 是一次性写入**，
-把 P0.09/P0.10 从 GPIO 切成 NFC 之后要靠 `--recover` 才能改回来，
-而 `--recover` 会连带擦掉 UICR 里的 `REGOUT0`（见 §3.4）。
+⇒ **P0.09/P0.10 回到通用 GPIO 池，引脚余量从 19 变成 21**（§3.5）。
+本工程不把 uart0 挪回那两个脚 —— 已核过的引脚分配没有理由再动一次，
+它们现在是余量（overlay 文件头有同样的说明）。
+
+仍然有效的一条外壳约束：**非金属外壳**。原因从「金属挡 13.56 MHz」变成
+「金属挡 2.4 GHz 和 GNSS」，结论不变。
 
 ### §3.4 开发板逐项核实（nRF52840 ProMicro 克隆板）
 
@@ -246,17 +323,21 @@ VDDH → ME6217C33 VIN；ME6217 CE ← POWER_PIN = P0.13；ME6217 VOUT → EXTVC
 
 **必须处理的三件事**：
 
-1. **UICR 解锁与 bootloader 重刷**。改过 NFCPINS 之后要恢复，序列是：
+1. **UICR 是否被前一任固件改过**。本方案**不用 NFC 引脚**（ADR-004），所以
+   `UICR.NFCPINS` 不需要写；但二手板或刷过其它固件的板子可能已经被改过，
+   那会让 P0.09/P0.10 不是普通 GPIO。开机前先读一眼，必要时恢复：
    ```
-   nrfjprog -f NRF52 --memrd 0x1000120C     # 先读 UICR.NFCPINS 确认现状
-   nrfjprog -f NRF52 --recover
+   nrfjprog -f NRF52 --memrd 0x1000120C     # 读 UICR.NFCPINS 确认现状
+   nrfjprog -f NRF52 --recover              # 只在确实被改过时才需要
    nrfjprog -f NRF52 --program nice_nano_bootloader-0.6.0_s140_6.1.1.hex --chiperase
    ```
-   **重刷 bootloader 不是可选步骤**：板子依赖 `UICR_REGOUT0_VALUE = UICR_REGOUT0_VOUT_3V3`，
-   `--recover` 擦掉 UICR 后 REGOUT0 回落到 1.8 V，不重刷就起不来。
+   **一旦做了 `--recover`，重刷 bootloader 不是可选步骤**：板子依赖
+   `UICR_REGOUT0_VALUE = UICR_REGOUT0_VOUT_3V3`，`--recover` 擦掉 UICR 后
+   REGOUT0 回落到 1.8 V，不重刷就起不来。
 2. **pinctrl 冲突**。ZMK 的 `spi1_default` 把 MOSI 放在 **P0.10**，
-   上游 `promicro_nrf52840-pinctrl.dtsi` 的 uart0 是 **TX=P0.09 / RX=P0.10**——
-   全部撞在 NFC 的两个引脚上。本方案必须在自己的 overlay 里把这两处挪开。
+   上游 `promicro_nrf52840-pinctrl.dtsi` 的 uart0 是 **TX=P0.09 / RX=P0.10**。
+   本方案的 overlay 已经把 uart0 挪到 P0.06/P0.08 并关掉 spi1，
+   那两个脚留作余量（见 §3.5）。
 3. **睡眠电流是个抽奖**。同款克隆板已知的几个坑：ME6211C33 静态 60 µA；
    `POWER_PIN` 的 R4 实测过 0.42 µA / 7~8 µA / ~750 µA 三种结果；
    D1 装成硅二极管而非肖特基 → +56 µA；R10-R11 未贴。
@@ -271,7 +352,7 @@ bootloader `0xF4000 + 0xC000`。**不要用 MCUboot**——会和板子自带的
 
 | 功能 | 引脚 | 备注 |
 | --- | --- | --- |
-| NFC1 / NFC2 | P0.09 / P0.10 | 需写 UICR.NFCPINS，与 §3.4 的 pinctrl 冲突 |
+| P0.09 / P0.10 | — | **余量**。原为 NFC1/NFC2；BLE 用片上无线不占引脚（§3.3） |
 | I2C（LIS2DW12） | TWIM0 SCL/SDA | 地址 0x19 |
 | LIS2DW12 INT1 | 任一 GPIOTE 引脚 | **必须用 PORT 事件，不能用 IN 事件**，见 §4.2 |
 | GNSS UART | UART TX/RX | ATGM336H |
@@ -281,24 +362,83 @@ bootloader `0xF4000 + 0xC000`。**不要用 MCUboot**——会和板子自带的
 | Air780EP RI（唤醒） | 1 GPIO 输入 | `AT+CFGRI` |
 | 锁执行机构 | 1 GPIO | 经驱动，**具体型号方案未给** |
 | 锁位置反馈开关 | 1 GPIO | 判断锁是否真的动了 |
-| 电池电压采样 | 1 ADC + 1 GPIO | 门控的 1M+1M 分压，见 §4.3 |
+| 电池电压采样 | 1 ADC + 1 GPIO | 门控的 **21:1** 分压（4.7M+4.7M / 470k），见 §3.6 |
 
-合计 17~19 个引脚。**ADR-001 里那个 `LM5164 PGOOD` 引脚已删除**——换成 LX-P160 成品模块后不存在。
+合计 17 个引脚。**ADR-001 里那个 `LM5164 PGOOD` 引脚已删除**——换成 LX-P160 成品模块后不存在。
 
 **总数余量**：板子一共 **21 个可用 GPIO**（正品左 10 + 右 8 + 背面 P1.01/P1.02/P1.07；
 克隆 J2 十个 + J4 三个 + J3 八个，两块板都是逐个数 netlist 数出来的），
-NFCT 吃掉 P0.09/P0.10 之后剩 **19 个**。所以锁只用 1~2 根线时有 2~4 个余量；
-**如果锁要 3 根线（驱动 + 反馈 + 使能），就是 19/19 零余量**，
-INT2 那根潜在的第二中断线（§3.7）也就没地方接了。
+**BLE 一个都不占**（片上无线 + 板载天线），所以 21 全部可用，用掉 17 剩 **4 个**。
+锁要 3 根线（驱动 + 反馈 + 使能）也装得下，INT2 那根潜在的第二中断线（§3.7）
+同样有地方接 —— 这两个余量在 NFC 方案下是没有的（那时是 19/19 零余量）。
 
 **ADC 只有 3 个真脚**：P0.02(AIN0)=D19、P0.29(AIN5)=D20、P0.31(AIN7)=D21。
 ⚠ ZMK 的 `arduino_pro_micro_pins.dtsi` 里那些 A6~A10 别名（P0.22/P1.00/P1.04/P1.06/P0.09）
 **只是 Pro Micro 的引脚命名，不是 SAADC 通道**，别当模拟脚用。
 
-### §3.6 电池电压采样必须门控
+### §3.6 电池电压采样：21:1 分压 + 门控
 
-1M+1M 分压对 58.8 V 也是 **29 µA 常流**，比整机静态电流大一个量级。
-所以分压器的低端串一个 MOSFET，只在要测的瞬间打开。这是 §4 功耗预算成立的前提之一。
+两件独立的事，别混：**比例**决定芯片会不会烧，**门控**决定功耗。
+
+#### 比例：21:1，由三个上限定死
+
+| 约束 | 数值 | 来源 |
+| --- | --- | --- |
+| 引脚电压上限 | **VDD = 3.3 V** | nRF52840 PS v1.1 Table 172（推荐工作条件 1.7/3.0/3.6 V）；本板 `REGOUT0 = 3V3` |
+| 引脚绝对最大 | VDD+0.3 = 3.6 V | 同上 Table 173。**这是「短时暴露不永久损坏」，不是可用范围** |
+| ADC 源阻抗 | **≤ 800 kΩ** 才够 40 µs 采集 | 同上 §6.23.10.1，tACQ 表：10k→3 µs / 40k→5 µs / 100k→10 µs / 200k→15 µs / 400k→20 µs / 800k→40 µs |
+| 单只电阻耐压 | 0603 厚膜 **75 V** / 0402 **50 V** | 厚膜片阻通用规格书的 Max. RCWV |
+
+按 3.3 V 算，58.8 V 需要 **≥ 17.82:1**。取 **21:1**：
+
+```
+PACK+ ──[4.7 MΩ]──[4.7 MΩ]──┬── P0.31 (AIN7)
+                            │
+                        [470 kΩ]
+                            │
+                       [门控 N-MOS] ── PACK-
+```
+
+| 项 | 值 |
+| --- | --- |
+| 58.8 V 时引脚电压 | 2800 mV（1% 电阻最坏偏差下 2856 mV，余 444 mV） |
+| 顶到 3.3 V 需要电池到 | **68 V** —— 到不了 |
+| 源阻抗 Rs = 9.4M ‖ 470k | **448 kΩ** ≤ 800 kΩ ✓ |
+| 常通电流（门控失效时） | 5.96 µA |
+| 单只上臂承受 | 28 V（拆两只的唯一理由） |
+| 分辨率 | 18.5 mV/LSB —— 远小于 ADC 自己 ±3% 的 gain 误差 |
+
+**为什么上臂拆成两只 4.7M 而不是一只 9.4M/10M**：单只要担 56 V，而 0603
+的 Max. RCWV 只有 75 V、0402 只有 50 V。拆两只之后每只 28 V，封装随便选。
+
+**为什么不用 20M/1M**（漏流更小）：Rs 会变成 952 kΩ，超过 800 kΩ，
+那个 40 µs 采集时间就不成立了 —— 读数会偏低，而且偏多少取决于引脚电容，
+是个查不出来的误差。
+
+**⚠ 上一版这里写的是 1M+1M（2:1），58.8 V 会往 P0.31 灌 29.4 V —— 焊上就烧。**
+现在这个错误由 `battery.c` 顶部的 `BUILD_ASSERT` 拦住：配错编不过，
+错误信息直接说「will destroy the SoC」。第二条断言拦源阻抗。两条都实测触发过。
+
+**换电池规格必须重算**：改 `battery.c` 的 `PACK_MAX_MV`，断言会告诉你比例够不够。
+
+#### 门控：省的是 6 µA，不是 29 µA
+
+21:1 分压常通是 **5.96 µA** —— 和 nRF52840 自己 GPIOTE PORT 的 2.36 µA（§4.2）
+同一量级，所以仍然值得门控，但它不再是「比整机静态电流大一个量级」的大头了。
+分压器低端串一个小信号 N-MOS，只在采样的那 ~1 ms 打开。
+
+`battery_read_mv()` 里那个「**无论采样成不成功都关门控**」的 `gate_rc` 分支
+是必需的：漏关一次就是永久多 6 µA，而这个错误在日志里看不见，
+只会在几个月后表现为电池掉得比预期快。
+
+⚠ **`CONFIG_VOLTAGE_DIVIDER=n` 必须显式写在 `prj.conf` 里。** overlay 的
+`vbatt` 节点 compatible 是 `voltage-divider`，而上游
+`drivers/sensor/voltage_divider/Kconfig` 是 `default y` +
+`depends on DT_HAS_VOLTAGE_DIVIDER_ENABLED` —— 只要节点存在就会被编进来，
+然后它的 `pm_device_driver_init()` 会在启动时跑 RESUME、**把门控打开并留着**。
+现在只是因为 `battery_init()` 跑得更晚又拉回低才没事，那是初始化顺序的巧合。
+`battery.c` 用的 `VOLTAGE_DIVIDER_DT_SPEC_GET` 和 `voltage_divider_scale_dt()`
+都是纯宏/static inline，不需要那个驱动。
 
 ### §3.7 LIS2DW12 运动检测
 
@@ -408,10 +548,18 @@ PRO 档还有一个容易被平均值掩盖的特征：**每次唤醒后有 3~15
 | System ON + 256K RAM 保持 + RTC | 3.16 µA |
 | **GPIOTE PORT 事件** | **2.36 µA** |
 | **GPIOTE IN 事件** | **17.37 µA ← 陷阱** |
-| NFC SENSE | +0.10 µA |
-| NFCT ACTIVATED | 400 µA |
+| BLE 可连接广播 @1 s 间隔 | `[未核实]` ~16 µA（手算，ADR-004 §3.1） |
+| BLE 可连接广播 @100~150 ms（本方案取值） | `[未核实]` ~130 µA（同上） |
+| ~~NFC SENSE~~ / ~~NFCT ACTIVATED~~ | ~~+0.10 µA~~ / ~~400 µA~~ —— 已不适用（ADR-004） |
 
 **GPIOTE 必须配 PORT 事件而不是 IN 事件**，差 15 µA。这是最容易踩的一脚。
+
+广播那两行的量级关系值得记住：**它取代的 NFCT ACTIVATED 是 400 µA，
+所以换 BLE 是省电而不是费电**；而两个广播档位都被 §4.1b 的模组地板
+（500~1500 µA）淹没，所以**广播间隔按时延选，不按功耗选**（§2.4）。
+⚠ 这两个数字是按产品规格书的 TX/RX 电流与包时长手算的，不是原厂给的整机值。
+真机要用 PPK2 实测。同一份规格书还有一条：**不开 DC/DC 的话 TX 电流从 4.8 mA
+变成 10.6 mA**，广播功耗直接翻倍以上。
 
 还有一条 CryptoCell 的坑，原厂原文：
 `The device will not enter the System ON IDLE mode until CRYPTOCELL has been disabled`。
@@ -426,7 +574,7 @@ PRO 档还有一个容易被平均值掩盖的特征：**每次唤醒后有 3~15
 - **LDO 替换的取舍**：可以换更低 Iq 的 LDO，但**不要照抄原稿提到的 TPS62840——它实际是 buck 不是 LDO**，
   原稿只是拿它当 Iq 量级的比喻。另一条更土的路是直接用一颗 0.3 V 压降的二极管代替，
   代价是电压精度和纹波。
-- **分压采样**：门控后可忽略；不门控是 29 µA（§3.6）。
+- **分压采样**：门控后可忽略；不门控是 5.96 µA（§3.6，21:1 分压）。
 - **铝电解漏流**：按 `0.01CV` 估（§3.1）。
 
 ### §4.4 为什么不做备份电芯、不做硬件欠压保护
@@ -453,20 +601,26 @@ PRO 档还有一个容易被平均值掩盖的特征：**每次唤醒后有 3~15
 
 ### §5.1 底线：不能被复制、不能被重放
 
-物理钥匙可以配，NFC 卡可以克隆，**本方案的底线是「嗅探到一次完整开锁交互也不能再开一次」**。
-这排除了任何「读一个固定 UID 就开锁」的设计。
+物理钥匙可以配，**本方案的底线是「嗅探到一次完整开锁交互也不能再开一次」**。
+这排除了任何「读一个固定 ID / 收一个固定报文就开锁」的设计。
 
-顺带记下为什么放弃 Mifare Classic：CRYPTO1 早就被完整破解。
-Radboud 论文的结论逐字：
+这条底线在 BLE 上和在 NFC 上一模一样，因为它是**报文层**的性质（§5.2 的
+三重校验），与载体无关。**但底线之外少了一层**：NFC 的 ~4 cm 作用距离
+原本免费提供「攻击者必须站在车前」这个物理约束，BLE 没有。
+代价的完整评估在 §5.5。
+
+顺带保留一条历史结论（现在只作为「为什么不用标签持有即可用的模型」的注脚）：
+Mifare Classic 的 CRYPTO1 早就被完整破解，Radboud 论文逐字
 
 > the (48 bit) cryptographic keys to be relatively easily retrieved… we can compute, off-line, the secret key within a second…
 
-Luat 的示例代码甚至直接用出厂扇区尾 `000000000000FF078069FFFFFFFFFFFF`。
-NTAG424 的 SUN 功能好一些，但它的 §9.3 自己就警告了适用边界，且仍是「标签持有即可用」模型。
+而 NTAG424 的 SUN 好一些但仍是「标签持有即可用」模型。
+**本方案两者都不用** —— 秘密在手机 App 里，开锁要一次现场挑战应答。
 
 ### §5.2 挑战应答协议
 
-手机是读卡器，所以是手机发命令、车回应答。三步：
+手机主动发命令、车回应答（§2.1 说明了为什么保留这个方向）。三步，
+载体是 BLE 的 GATT write / notify，**报文仍是 ISO7816-4 APDU**：
 
 ```
 1) SELECT AID          : 00 A4 04 00 07  F0 45 42 49 4B 45 01  00
@@ -497,6 +651,9 @@ mac = HMAC-SHA256(secret, nonce || counter || cmd)[0..15]
 - 存在 nRF52840 的 `SETTINGS_NVS` 里（§2.2 的 Kconfig 已开）。
 - **下发**：在线时（4G 可用）由服务端通过 MQTT 下发（§9）。
 - **counter 也要持久化**，掉电后不能回零，否则重放防护失效。
+- ⚠ **不要让 BLE 去分摊那块 flash**：`CONFIG_BT_SETTINGS=n` 的理由之一就是
+  counter 住在同一个 32 kB storage 分区里，而那块分区每页只有 10000 次擦写寿命。
+  counter 是「错了就有人偷走车」的那个字节，不该和蓝牙绑定信息抢寿命。
 
 ### §5.4 剩下的三个安全缺口
 
@@ -505,6 +662,59 @@ mac = HMAC-SHA256(secret, nonce || counter || cmd)[0..15]
 2. **离线首次配对**。设备从没上过 4G 时怎么拿到第一把 secret，方案未定。
 3. **锁死风险的逃生口**。手机没电 / 手机丢 / 4G 挂 / 设备挂，**必须保留机械钥匙**。
    这不是可选项，是安全需求（见 §7 BOM）。
+   ⚠ 改 BLE 之后这一条**更重要**：多了「蓝牙被用户关掉」和「权限被系统回收」
+   两种失效模式，而 Android 13 起 App 不能自己开蓝牙
+   （`BluetoothAdapter.enable()` 在 targetSdk ≥ 33 时一律返回 false），
+   只能弹系统框请求。Android 12 起还有 app hibernation：几个月不用会自动
+   撤销权限 —— 正好发生在你一冬天没骑车、最需要它工作的那天。
+
+### §5.5 中继攻击：换 BLE 付出的那笔代价
+
+**必须写在这里，不能只留在 ADR 里。**
+
+ADR-003 §3.4 曾把 NFC 的 ~4 cm 作用距离称为「最强的防御 —— 这是它相对蓝牙
+10~20 m 的核心优势」，并指出「蓝牙方案要专门做 Proximity Check 防中继，NFC 白送」。
+**改 BLE 之后这一层没有了。**
+
+**§5.2 的三重校验完全不受影响，但它也完全不防中继。** 三重校验保证的是
+「录到一次交互不能重放第二次」；**中继不是重放** —— 攻击者不解密、不理解报文，
+只是把链路层比特实时转发，让真手机在几百米外诚实地完成一次全新的挑战应答，
+于是三条校验全过、车回 `90 00`。
+
+NCC Group 2022-05 的 BLE link-layer relay 已在 Tesla Model 3/Y 与
+Kwikset/Weiser Kevo 智能锁上实证，逐字：
+
+> By forwarding data from the baseband at the link layer, the hack gets past known
+> relay attack protections, **including encrypted BLE communications**, because it
+> circumvents upper layers of the Bluetooth stack and the need to decrypt
+
+> even when the vendor has taken defensive mitigations like encryption and **latency bounding**
+
+**测距类缓解在 nRF52840 上不成立**：
+
+- **Channel Sounding（BT 6.0）这颗芯片没有。** `dts/arm/nordic/nrf52840.dtsi`
+  的 radio 节点没有 `ble-cs-supported`，因此 `HAS_HW_NRF_RADIO_CS` 为假，
+  NCS 不会 `select BT_CTLR_CHANNEL_SOUNDING_SUPPORT`，`CONFIG_BT_CHANNEL_SOUNDING`
+  的依赖不满足 —— **编不出来**，不是「性能不够」。
+- **RSSI 能读**（`BT_HCI_OP_READ_RSSI`，SDC 支持 `BT_CTLR_CONN_RSSI`），
+  **但放大型中继直接击穿它**：中继设备用大功率发射就能让 RSSI 看起来很近。
+  RSSI 只挡懒人中继，不能当安全边界。
+- **往返时延门限**：BLE 连接间隔是几十毫秒量级，NCC 明说他们绕过了 latency bounding。
+
+**所以本方案的对策是「不给中继可用的入口」：**
+
+> **不做「走近自动开锁」。开锁必须由手机上的显式动作触发。**
+
+这正是 NCC 自己给的第 2 条缓解，逐字：*"System makers should give customers the
+option of providing a second factor for authentication, or **user presence
+attestation (e.g., tap an unlock button in an app on the phone)**"*；
+第 3 条更直接：*"Users of affected products should disable passive unlock
+functionality that does not require explicit user approval"*。
+
+这不是「先不做」。**自动开锁是中继攻击唯一的实际入口**：没有它，
+攻击者中继出来的链路一端是车、另一端是一个不会自动应答的手机，
+攻击链断在人这一环。要做的话见 ADR-004 §6 决策 A —— 那是一次
+「便利换安全」的显式取舍，不能默默打开。
 
 ---
 
@@ -546,15 +756,14 @@ mac = HMAC-SHA256(secret, nonce || counter || cmd)[0..15]
 | GNSS 模块 | **ATGM336H-5N** | 1 | 支持北斗 |
 | GNSS 电源门控开关管 | **型号未定** | 1 | 见 §3.5 |
 | 4G 模组 | **Air780EP**，刷 AT 固件 | 1 | 见 §8 |
-| NFC 环形天线 | 自绕，或 PN532 成品天线板 | 1 | 见 §3.3 |
-| NFC 调谐电容 | **容值待实测**（依赖天线电感） | 2 | 见 §3.3 |
+| ~~NFC 环形天线 + 2 颗调谐电容~~ | — | 0 | **删除**：BLE 用板载天线（§3.3） |
 | 锁执行机构 | **型号未定**（电磁锁 / 电机锁） | 1 | |
 | 锁驱动电路 | **型号未定**（MOS 或半桥 + 续流） | 1 | |
 | 锁位置反馈开关 | 微动开关 | 1 | 确认锁真的动了 |
-| 电压采样分压 | 1 MΩ × 2 | 2 | 门控，见 §3.6 |
+| 电压采样分压 | **4.7 MΩ × 2 + 470 kΩ × 1**，1% | 3 | 21:1，门控，见 §3.6 |
 | 分压门控 MOSFET | 小信号 N-MOS | 1 | 见 §3.6 |
 | **机械钥匙逃生口** | — | 1 | **安全需求，不可省**，见 §5.4 |
-| 非金属外壳 | 塑料 / ABS | 1 | 金属壳会屏蔽 NFC 与 GNSS |
+| 非金属外壳 | 塑料 / ABS | 1 | 金属壳会屏蔽 2.4 GHz 与 GNSS |
 
 ### §7.3 ADR-003 全文没提但方案实际依赖的项
 
@@ -574,13 +783,13 @@ mac = HMAC-SHA256(secret, nonce || counter || cmd)[0..15]
 | J-Link（或 CMSIS-DAP） | SWD 烧录、`nrfjprog --recover`（§3.4 必需） |
 | 杜邦线 / 排针 | 接 J3 |
 | **示波器** | 测 VDDH 瞬态（§3.2）、静态电流（§3.4） |
-| **VNA**（可选） | NFC 天线调谐（§3.3），没有的话用示波器 + 已知负载凑 |
+| ~~VNA~~ | **不再需要** —— NFC 天线调谐工作随 ADR-004 消失（§3.3） |
 
 ### §7.5 已放弃、不要采购
 
 | 项 | 放弃原因 |
 | --- | --- |
-| FM17622 读卡器 IC + 实体卡 | 改手机 NFC，读卡器整个不需要了（§2.1） |
+| FM17622 读卡器 IC + 实体卡 | 开锁走手机 BLE，读卡器与实体卡都不需要（§2.1） |
 | 备份电芯 + 2× LM66100 + NTC 充电管理 | 用户决定不做主动备份（§4.4） |
 | 串联肖特基二极管 | 改 P-MOS 理想二极管，反向漏流（§3.1） |
 | LM5164 + 其全部外围 | 改 LX-P160 成品模块（§3.1） |
@@ -612,7 +821,7 @@ mac = HMAC-SHA256(secret, nonce || counter || cmd)[0..15]
 | MQTT over TLS | `AT+FSCREATE` + `AT+FSWRITE` 写证书进模组 FS → `AT+SSLCFG="cacert"/"seclevel"/"hostname",88,...` |
 | TCP/UDP | `AT+CSTT` → `AT+CIICR` → `AT+CIFSR` → `AT+CIPSTART` → `AT+CIPSEND`；`AT+CIPMODE=1` 是真透传 |
 | HTTP(S) | `AT+HTTPINIT` / `AT+HTTPSSL` / `AT+HTTPPARA` / `AT+HTTPACTION` / `AT+HTTPREAD`；`AT+HTTPGETTOFS` 直接下到模组 FS |
-| 时间 | `AT+CTZR=1` 拿运营商 NITZ 时间（**免费、无往返**），或 `AT+CNTP` + `AT+CCLK?` |
+| 时间 | `+NITZ:` URC 拿运营商时间（**免费、无往返**；`AT+CTZU`/`AT+CTZR` 缺省都已开，且 CTZR 只读不能设），或 `AT+CNTP` + `AT+CCLK?`。⚠ **±zz 单位是 1/4 小时、hh:mm:ss 是本地时间**，见 `modem.c` 的 `parse_modem_time()` |
 | 基站定位 | `AT+CIPGSMLOC=1,1`（免费）或 `AT+AIRLBS`（付费，含 WiFi 融合） |
 | 休眠 | `AT+CSCLK=0/1/2/3` + `AT+WAKETIM`，或 `AT+POWERMODE="PRO"/"PSM+"/"CLOSE"` |
 | 唤醒主控 | `AT+CFGRI=1` → MAIN_RI 出 120 ms 低脉冲；`AT^WAKEUPHEX` 过滤只对魔术串响应 |
@@ -662,13 +871,14 @@ PSM+ 下模组是离线的，服务器根本找不到它；而且 RAM 掉电，
 每次醒来要重新附着网络 + 重建 TLS + 重连 MQTT。
 
 **但这个理由在本方案下缩水了一半。** ADR-001 写这句话时，开锁是走 4G 下行的；
-本方案的开锁改成了**完全离线的手机 NFC 挑战应答（§5.2），不需要 4G**。
+本方案的开锁改成了**完全离线的手机 BLE 挑战应答（§5.2），不需要 4G**。
 所以 PRO 现在只为**远程定位查询**服务，不再为开锁服务。
 
 **本方案的决定：做成双档，默认 PSM+ / 模组关机，用户主动查询或布防时切 PRO。**
 
-- 日常停放：只有 nRF 醒着看**振动（§3.7）与 NFC**，定时开模组上报。
-  （ADR-001 原文这里还写了「看 BLE」——本方案已放弃 BLE，此项不存在。）
+- 日常停放：只有 nRF 醒着看**振动（§3.7）**、跑 BLE 广播、定时开模组上报。
+  （ADR-001 原文这里写的「看 BLE」现在成立了，但形状不同：BLE 不是唤醒源，
+  它只在 nRF 已经醒着时才有广播 —— 见 §2.7。）
 - 用户在 HA 里点「现在在哪」：需要一次下行触达 → 切 PRO。
   **如果接受「等下一次定时上报」的时延，可以连 PRO 都不要，功耗地板直接降到 µA 级。**
   这是 §11 里的一个待决项，取决于你能接受多长的查询时延。
@@ -923,9 +1133,9 @@ LBS 降级是 R9 的验收项之一：拔掉 GNSS 天线仍要出 `src=lbs` 的�
 | --- | --- | --- |
 | **R0 环境** | NCS 工具链；`promicro_nrf52840/nrf52840/uf2` 点灯；J-Link 接通。**顺带：一根 UART 线接模组，验 `AT^WAKEUPHEX` 和 `CSCLK=3` 在 V1011 上到底能不能用**（§8.7） | blinky 跑起来，SWD 能连；`AT^WAKEUPHEX` 返回 OK 而不是 ERROR |
 | **R1 板子体检** | **实测静态电流**；查 D1 是不是肖特基；测 POWER_PIN/R4；确认 J3 引脚顺序 | 拿到真实的 µA 数字，不是标称值 |
-| **R2 传感器** | LIS2DW12 上 I2C；`SENSOR_TRIG_MOTION` / `STATIONARY`；**读驱动源码定论 INT1/INT2**（§3.7） | 摇一下就有中断，静止一段时间有 STATIONARY |
-| **R3 NFC** | 写 UICR.NFCPINS；raw ISO-DEP 起来；安卓 App reader mode 打通 | 手机贴上去能收到 SELECT AID |
-| **R4 开锁协议** | §5.2 三步协议；PSA HMAC；counter/nonce 持久化 | 重放一次抓包必须被拒（回 `69 82`） |
+| **R2 传感器** | LIS2DW12 上 I2C；`SENSOR_TRIG_MOTION`（INT1，已确认可用）；~~读驱动源码定论 INT1/INT2~~（已定论，§11 #2）；**拍板 STATIONARY 要不要接第二根线** | 摇一下就有中断。静止判定当前走软件计时，不依赖 INT2 |
+| **R3 BLE** | GATT 服务起来（`ble_unlock.c`）；`requestMtu` 打通；安卓 App 按 MAC 直连 | 手机连上能收到 SELECT AID 的 `90 00`，且**锁屏状态下也能连**。**协议层已由 BabbleSim 提前验完**（8 条断言，见 [`FIRMWARE.md`](FIRMWARE.md) §5），R3 只剩「真手机 + 真射频」这一半 |
+| **R4 开锁协议** | ~~§5.2 三步协议；PSA HMAC；counter/nonce 持久化~~（**仿真已验**）；真机上复核 counter 掉电不回零 | 重放一次抓包必须被拒（回 `69 82`）—— 仿真里已过，真机再验一次 flash 持久化那一段 |
 | **R5 服务端 + HA** | ~~先定 schema~~（已定，见 [`MQTT-CONTRACT.md`](MQTT-CONTRACT.md)）；~~broker 加 8883 listener + acl_file~~（改内置 broker，不动 `/opt/mqtt`）；落库→坐标转换→retain；FastAPI + Bearer；**docker compose 封装**；HA 四件套 | 灌 20 条造的报文，`/track` 正确；`state` retain 生效；HA 地图上出现车，误差圈可见；重启 HA 立即有位置 |
 | **R6 4G 链路** | 刷 AT 固件；写证书进模组 FS；补完 AT 状态机（`[推断] 2000~4000 行 C`，缺口见 [`FIRMWARE.md`](FIRMWARE.md) §3）→ MQTT over TLS。**布板前查 `Air780EP硬件手册V1.1.pdf` 确认 DTR/RI 脚号**（§8.7） | 设备真的把点发上了 broker |
 | **R7 GNSS** | ATGM336H 上 UART；电源门控；AGPS | 室外能定位，室内门控省电有效 |
@@ -951,11 +1161,15 @@ LBS 降级是 R9 的验收项之一：拔掉 GNSS 天线仍要出 `src=lbs` 的�
 >
 > **2026-09-02 更新**：按审计结果修了服务端、HA 与固件的一批缺陷，
 > #8 的阈值联动补齐，#26 之后新增 #27~#30（都是审计发现的，不是新需求）。
+>
+> **2026-09-02 晚**：固件第一次真编译（NCS v3.4.0）+ BabbleSim 跑通开锁通道，
+> #2 由此定论（见下），另外暴露 6 个原来看不见的缺陷 ——
+> 全部已修，逐条在 [`FIRMWARE.md`](FIRMWARE.md) §3c。
 
 | # | 问题 | 阻塞谁 | 状态 |
 | --- | --- | --- | --- |
 | 1 | **MQTT topic 与报文 schema 从未定义**（§9.3） | R5 全部，且 topic 层级决定 ACL 粒度 | ✅ 契约 §4 §5 §6 §7 |
-| 2 | **LIS2DW12 INT1/INT2 路由矛盾**（§3.7） | R2，需读 Zephyr 驱动源码 | 仍待定；`motion.c` 里那条 `LOG_WRN` 会在实物上给出答案 |
+| 2 | **LIS2DW12 INT1/INT2 路由矛盾**（§3.7） | R2 | ✅ **2026-09-02 定论**（读 NCS v3.4.0 驱动源码）：MOTION 走 `ctrl4_int1_pad_ctrl.int1_wu` = **INT1**，STATIONARY 走 `ctrl5_int2_pad_ctrl.int2_sleep_chg` = **INT2**（`lis2dw12_trigger.c:77-98`）。ADR-002 §1.6 对、§1.4/§1.7 错。**本板只接 INT1，所以 STATIONARY 事件永不到达 —— 而 `sensor_trigger_set()` 仍返回 0**（驱动不检查引脚接没接）。当前不依赖它，静止判定用软件计时；三条出路记在 `motion.h` |
 | 3 | **HA 主机与本机的网络关系**未定 → 跨主机 TLS 与否未定（§9.2） | R5 | 仍待你定；服务端已经无条件开 TLS listener，所以走公网也安全 |
 | 4 | **broker 缺 8883 listener 和 acl_file**（§9.2） | R5；改配置前需确认 | ✅ 前提消失：broker 改成服务端内置，不再用 `/opt/mqtt`（契约 §1） |
 | 5 | **ACL 规则形态、设备账号命名与配发方式**未定 | R5，与 #1 一起定 | ✅ 契约 §3；账号 = 设备 id，口令由 `ebike-server init` 生成 |
@@ -964,8 +1178,7 @@ LBS 降级是 R9 的验收项之一：拔掉 GNSS 天线仍要出 `src=lbs` 的�
 | 8 | **状态派生参数**未定：地理围栏存哪、离线超时阈值多少 | R5/R9 | ✅ 服务端配置；离线阈值 = 上报周期 × 3 + 120 s（契约 §4.2）。**2026-09-02 补齐联动**：`interval` 指令 ack 成功后回写周期并落库，重启从 `meta` 表恢复 —— 原来改了周期阈值不跟，调大会让健康的车被判离线 |
 | 9 | **轨迹保留策略**未定：存多久、是否下采样、`/track` 分页 | R5 | 部分：保留天数与分页已实现，**下采样没做**。**2026-09-02 补上** `pending_downlink` 的保留期清理（只清已确认的行，未确认的永不删） |
 | 10 | **Q1 P-MOS 及其栅源齐纳、GNSS 电源门控管、锁执行机构与驱动**都没给型号（§7） | R8 / 采购 | 仍待你定 |
-| 11 | **I2C 上拉阻值、NFC 调谐电容容值**待实测（§7） | R2 / R3 | 仍待实测 |
-| 12 | **VDDH 5.5 V 上限 `[未核实-原厂]`**，5 V 注入只剩 0.5 V 余量（§3.2） | R8，示波器实测 | 仍未核实 |
+| 11 | **I2C 上拉阻值**待实测（§7）。~~NFC 调谐电容~~ 随 §3.3 删除 | R2 | 仍待实测 |
 | 13 | **离线首次配对**怎么拿第一把 secret（§5.4） | R4 | 仍待定；当前假设随固件烧录 |
 | 14 | **APPROTECT 在克隆板 bootloader 下是否有效 `[未核实]`**（§5.4） | R4 之后 | 仍未核实 |
 | 15 | **模组基站定位可用性**未实测，不可用则服务端调第三方 API（§9.5） | R9 | 仍待实测；`modem_lbs()` 已实现调用路径 |
@@ -980,7 +1193,7 @@ LBS 降级是 R9 的验收项之一：拔掉 GNSS 天线仍要出 `src=lbs` 的�
 | 24 | ~~**客户端证书/私钥怎么进产线**（§8.8）~~ | R6 / 量产前 | ✅ **前提作废**：契约 §2 把设备侧降级成「TLS + 用户名口令」，理由是设备拆开就能读 flash（§5.4 #1），证书私钥和口令的安全等级本来就一样 |
 | 25 | **模组关机期间下行怎么排队**（§9.3 表） | R5/R6，决定 secret 轮换最坏时延 | ✅ 契约 §4.1：**服务端自己排队**（SQLite `pending_downlink`），不靠 broker retain——因为 retain 每 topic 只留一条，连续两次密钥轮换会丢掉第一把。最坏时延 = 一个上报周期 |
 | **26** | **`amqtt` 的 retain 会漏给任何连上来的客户端**（契约 §4.3，本机实测） | **加第二辆车之前** | 新增。当前无害（只有 `state` retain，下行一律不 retain），多车下 bike02 会看到 bike01 的位置 |
-| **27** | **1M+1M 分压配 58.8 V 会烧 ADC 脚**（§3.6 / overlay / HARDWARE.md §2.1 三处同错） | **布板前，物理不可逆** | 新增。2:1 分压 + 内部参考/gain 1/6（满量程 3.6 V）→ 58.8 V 灌 29.4 V 到 P0.31。需要 ≥16.33:1。**这一条你要自己定电池实际充满电压后再改** |
+| **27** | ~~**1M+1M 分压配 58.8 V 会烧 ADC 脚**~~ | ~~布板前~~ | ✅ **2026-09-03 已修**：改成 **21:1**（4.7M+4.7M / 470k），58.8 V→2800 mV（1% 最坏 2856 mV，上限 VDD 3.3 V）。三处同错（§3.6 / overlay / HARDWARE.md §2.1）全部更新。`battery.c` 加两条 `BUILD_ASSERT`（比例、源阻抗 ≤800 kΩ）把配错变成编译错误，都实测触发过；换算改走 `voltage_divider_scale_dt()`（int64，不再整数除）。⚠ 基准是 **VDD 3.3 V** 而不是原稿的 3.6 V —— 3.6 V 是绝对最大值，按它算等于零余量。**电池不是 48 V/58.8 V 的话改 `battery.c` 的 `PACK_MAX_MV`** |
 | **28** | ~~**`at_cmd_expect` 的 resp 被终结码覆盖**~~ | R6 第一天 | ✅ **2026-09-02 已修**：数据行先写 `resp`、随后 `"OK"` 又覆盖一次 → `AT+CGREG?` 的 `strstr(resp,",1")` 恒不匹配 → `modem_connect` 必然 60 s 后 `-ENETUNREACH`；`AT+CSQ` 同理恒返回 -1。改为只写非终结码信息行 |
 | **29** | ~~**`AT+MQTTMODE=1` 与两条 `AT+SSLCFG` 静默失败**~~ | R6 | ✅ **2026-09-02 已修**：`MQTTMODE` 决定 payload 是 HEX 还是裸字节，静默失败 → 每条上行都畸形；`seclevel` 静默失败 → TLS 退化成加密但不认证。三条都改成失败即中止连接 |
 | **30** | ~~**mTLS 模式（`mqtt.mode="cert"`）从未跑通**~~ | 想用 mTLS 时 | ✅ **2026-09-02 已修**：上游 `UserAuthCertPlugin` 不设 `session.username`，ACL 查 `"anonymous"` → SUBSCRIBE 返回 0x80，设备收不到任何下行。新增 `DeviceCertAuthPlugin` 补上身份，两条端到端测试钉住 |
@@ -1007,12 +1220,23 @@ LBS 降级是 R9 的验收项之一：拔掉 GNSS 天线仍要出 `src=lbs` 的�
 - **把两个 4G 侧的 `[未核实]` 升级成硬门禁**：`AT^WAKEUPHEX` 提前到 R0 验，
   DTR/RI 脚号布板前必须查手册（§8.7、§10）。
 - 显式记住了 ADR-002 误删的低温充电安全要求（§4.4），以免将来加电芯时漏掉。
-- 把三处符号名/属性名的更正固定下来：`CONFIG_NFC_T4T_NRFXLIB`、
-  `CONFIG_PSA_WANT_KEY_TYPE_HMAC`、DTS 的 `irq-gpios`。
+- 把两处符号名/属性名的更正固定下来：`CONFIG_PSA_WANT_KEY_TYPE_HMAC`、DTS 的 `irq-gpios`。
+  （第三处 `CONFIG_NFC_T4T_NRFXLIB` 随 ADR-004 一起作废 —— 已不再用 NFC。）
 - 删掉了 ADR-001 §4 引脚预算里的 `LM5164 PGOOD`（换成品模块后不存在）。
 - 记下了两个全文都没写过的空白：nRF 自己的 OTA 路径、产线证书灌入流程（§8.8）。
 - 补回了几条整合初稿漏掉、但会直接影响布板和调试的细节：不能灌 VCC/EXTVCC 的理由（§3.2）、
-  NFC 焊盘不是阻抗差分对（§3.3）、21/19 个 GPIO 的余量账与「只有 3 个真 ADC 脚」（§3.5）、
+  GPIO 的余量账与「只有 3 个真 ADC 脚」（§3.5）、
   INT1 必须推挽（§3.7）、阈值只能运行时设与 100~200 mg 的起调值（§3.7）、
   INT1/INT2 矛盾的两处具体出处（§3.7）。
+
+相对本文上一版（2026-09-01），2026-09-02 的净变化只有一件事：
+**开锁从手机 NFC 改成手机 BLE**（[`ADR-004`](ADR-004-ble-unlock.md)）。
+
+- §2 全节重写；§3.3 从「NFC 环形天线」变成「板载天线，什么都不用做」；
+  §3.5 引脚余量 19 → 21；§4.2 电流表用广播替换 NFCT；
+  §5.1/§5.4 补上失效模式；**新增 §5.5 中继攻击** —— 这是本次改动的主要代价，
+  显式记账而不是悄悄丢掉；§7 删掉 NFC 天线/电容与 VNA；§10 的 R3 改成 BLE。
+- **报文契约一字未改**：topic、字段、指令闭集、§5.2 的三步 APDU 全部不动。
+  唯一变的是事件闭集里的一个名字（`nfc_err` → `ble_err`），那个事件从未被实际发出过。
+- 因此 §9 服务端、HA 集成、`MQTT-CONTRACT.md` 的实质内容都不受影响，只改了文案。
 

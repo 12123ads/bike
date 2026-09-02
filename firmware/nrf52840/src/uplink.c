@@ -36,9 +36,8 @@ LOG_MODULE_REGISTER(uplink, CONFIG_EBIKE_LOG_LEVEL);
  *
  * ⚠ `RESET_LOW_POWER_WAKE` 在 nRF52840 上是三合一的：System OFF 的
  * GPIO DETECT(bit16)、LPCOMP(bit17)、NFC 场唤醒(bit19) 都映到它。
- * 本工程开着 NFCT，如果将来启用 NFC 场唤醒，要区分「运动唤醒」和
- * 「手机贴上来唤醒」就得自己读原始 RESETREAS。当前只用 System OFF，
- * 所以统一报 `off` 是准确的。
+ * 本工程不用 NFCT（开锁改走 BLE），也不用 LPCOMP，所以这一位只可能来自
+ * 运动唤醒的 GPIO DETECT，统一报 `off` 是准确的。
  */
 static const char *reset_cause_str(void)
 {
@@ -113,7 +112,7 @@ int uplink_batt_level(void)
 
 bool uplink_should_report(void)
 {
-	/* 等级 2/3：停周期上报。手机 NFC 开锁完全离线（DESIGN.md §5.2），
+	/* 等级 2/3：停周期上报。手机 BLE 开锁完全离线（DESIGN.md §5.2），
 	 * 不受影响；运动事件仍然会经 uplink_request_now() 强行上报一轮 ——
 	 * 车在这个电量下被动了，比省那点电重要。 */
 	return uplink_batt_level() < 2;
@@ -138,6 +137,36 @@ static struct k_sem now_sem;
 
 /* 报文缓冲。静态区：4 KB 放栈上会爆掉线程栈。 */
 static char msg_buf[PROTO_MAX_PAYLOAD];
+
+/* 发一条，掉线了就走一次重连阶梯再发一次。
+ *
+ * 判据是 `modem_is_connected()` 而不是 `rc`：publish 失败有两类原因，
+ * 只有「会话没了」这一类重连才有意义。payload 太大（-E2BIG）、
+ * 缓冲不够（-ENOMEM）重连一百次也还是失败，而每次重连最坏 3 分钟全功率。
+ *
+ * **只重试一次。** 重连本身已经是三级阶梯（modem.h），它失败意味着
+ * 网络或模组真的不可用，继续试只是在抽车电池。
+ *
+ * ⚠ **不要在下行回调里用这个。** `ack_downlink()` 跑在 `modem_poll()` →
+ * `consume_urc()` 的调用栈里，此刻 `at_lock` 已经被持有（k_mutex 可重入，
+ * 所以 publish 本身没事），但在那里重连等于「一边遍历 URC 一边把会话拆掉」。
+ * ack 发不出去是可以接受的：服务端会在下次上线时重发，而下行指令都是幂等的
+ * （契约 §4.1）。
+ */
+static int publish_retry(const char *topic, const char *buf, size_t len)
+{
+	int rc = modem_publish(topic, (const uint8_t *)buf, len, 1);
+
+	if (rc == 0 || modem_is_connected()) {
+		return rc;
+	}
+
+	LOG_WRN("%s 发送失败 rc=%d 且会话已断，走重连阶梯", topic, rc);
+	if (modem_reconnect() != 0) {
+		return rc;   /* 保留原始失败码，重连失败本身已经打过日志 */
+	}
+	return modem_publish(topic, (const uint8_t *)buf, len, 1);
+}
 
 /* --- 下行处理 --------------------------------------------------------------- */
 
@@ -351,8 +380,7 @@ static void flush_events(void)
 			ev_queue[i].used = false;
 			continue;
 		}
-		if (modem_publish(TOPIC_UP_EVENT, (const uint8_t *)msg_buf,
-				  (size_t)n, 1) == 0) {
+		if (publish_retry(TOPIC_UP_EVENT, msg_buf, (size_t)n) == 0) {
 			ev_queue[i].used = false;
 		} else {
 			/* 发不出去就留着下一轮再试。q 已经分配了，
@@ -381,8 +409,9 @@ int uplink_cycle(bool want_gnss)
 				nvstore_next_q(), nvstore_boot_count(),
 				reset_cause_str(), unlock_current_kid());
 	if (n > 0) {
-		(void)modem_publish(TOPIC_UP_HELLO, (const uint8_t *)msg_buf,
-				    (size_t)n, 1);
+		/* hello 是本轮的第一条，也是最值得重试的一条：服务端靠它
+		 * 触发下行队列冲刷（契约 §4.1），丢了这条整轮的下行都收不到。 */
+		(void)publish_retry(TOPIC_UP_HELLO, msg_buf, (size_t)n);
 	}
 
 	/* 位置。GNSS 拿不到就退回基站定位（契约 §5.2 的 s="l"，DESIGN.md §9.5）。 */
@@ -422,9 +451,8 @@ int uplink_cycle(bool want_gnss)
 		if (have) {
 			n = proto_enc_loc(msg_buf, sizeof(msg_buf), &loc);
 			if (n > 0) {
-				(void)modem_publish(TOPIC_UP_LOC,
-						    (const uint8_t *)msg_buf,
-						    (size_t)n, 1);
+				(void)publish_retry(TOPIC_UP_LOC, msg_buf,
+						    (size_t)n);
 			}
 		} else {
 			LOG_WRN("GNSS 和基站定位都没结果，本轮不报位置");
@@ -453,8 +481,7 @@ int uplink_cycle(bool want_gnss)
 	};
 	n = proto_enc_tele(msg_buf, sizeof(msg_buf), &tele);
 	if (n > 0) {
-		(void)modem_publish(TOPIC_UP_TELE, (const uint8_t *)msg_buf,
-				    (size_t)n, 1);
+		(void)publish_retry(TOPIC_UP_TELE, msg_buf, (size_t)n);
 	}
 
 	/* 欠压兜底（DESIGN.md §6）。四级里这里做前两级的**上报**，
@@ -475,7 +502,12 @@ int uplink_cycle(bool want_gnss)
 	(void)modem_poll(5000);
 
 	/* 主动发 lwt=0 覆盖遗嘱（契约 §4.2）：告诉服务端这次是优雅下线，
-	 * 不是被剪线。 */
+	 * 不是被剪线。
+	 *
+	 * ⚠ 这一条**刻意不用 publish_retry**：如果会话已经断了，broker 会自己
+	 * 投递 LWT（lwt=1），那个结果是**正确的** —— 会话非正常结束确实不是
+	 * 优雅下线。为了盖掉一个真实的遗嘱而花最坏 3 分钟全功率重连，
+	 * 是拿电池换一个错误的状态位。 */
 	n = proto_enc_lwt(msg_buf, sizeof(msg_buf), false);
 	if (n > 0) {
 		(void)modem_publish(TOPIC_LWT, (const uint8_t *)msg_buf,

@@ -46,15 +46,18 @@ struct user_key {
 /* 处理一条来自手机的 APDU，把应答写进 rsp。
  * 返回应答长度；缓冲不够返回负数。
  *
- * 这个函数会被 NFC 回调直接调用，**必须不阻塞**：
- * 手机侧的 presence check 默认 125 ms，超了就断链。
- * 所以里面不做 flash 写入 —— counter 的持久化是异步交给 nvstore 的。
+ * 这个函数**传输无关**：报文格式是 ISO7816-4 APDU，但载体是 BLE 的
+ * GATT write（ble_unlock.c）。它跑在 ble_unlock.c 自有 work queue 的
+ * 单线程上，所以下面那些无锁静态状态是安全的 —— 前提是**只有那一个线程**
+ * 碰它们（CONFIG_BT_MAX_CONN=1 是这个前提的一部分）。
+ *
+ * 里面不做 flash 写入 —— counter 的持久化是异步交给 nvstore 的。
  */
 int unlock_handle_apdu(const uint8_t *apdu, size_t len,
 		       uint8_t *rsp, size_t rsp_len);
 
-/* 每次进入 NFC 会话时调 —— 作废上一次发出去但没用掉的 nonce。
- * 不调也不会不安全（nonce 用过即废），但会让「贴一下走开再贴」多一次往返。 */
+/* 每次建立/断开 BLE 连接时调 —— 作废上一次发出去但没用掉的 nonce。
+ * 不调也不会不安全（nonce 用过即废），但会让「连上走开再连」多一次往返。 */
 void unlock_session_reset(void);
 
 /* 密钥管理（契约 §6.2 的下行落到这里） */

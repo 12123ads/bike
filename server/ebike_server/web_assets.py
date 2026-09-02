@@ -331,7 +331,7 @@ function renderEvents(list) {
   const LABEL = {
     boot: '开机', motion: '检测到移动', still: '静止',
     unlock_ok: '开锁成功', unlock_deny: '开锁被拒',
-    lock_state: '锁状态变化', lowbatt: '电量低', nfc_err: 'NFC 异常',
+    lock_state: '锁状态变化', lowbatt: '电量低', ble_err: 'BLE 异常',
   };
   ul.innerHTML = list.map(e => {
     let extra = '';
@@ -495,7 +495,7 @@ async function refreshTrack() {
 // ---- 指令 ---------------------------------------------------------------
 async function sendCmd(cmd, btn) {
   if (cmd === 'unlock' &&
-      !confirm('远程开锁会绕过手机 NFC 的挑战应答。\\n\\n确定要开锁吗？')) return;
+      !confirm('远程开锁会绕过手机 BLE 的挑战应答。\\n\\n确定要开锁吗？')) return;
   btn.disabled = true;
   try {
     const r = await api('/api/cmd/' + DEV + '/' + cmd, {method: 'POST'});
@@ -529,7 +529,7 @@ async function main() {
 
   if (!CFG.allow_remote_unlock) {
     $('btn-unlock').disabled = true;
-    $('cmdnote').textContent = '远程开锁已禁用（它绕过 NFC 挑战应答）。'
+    $('cmdnote').textContent = '远程开锁已禁用（它绕过 BLE 挑战应答）。'
       + '要用需在服务端配置里设 allow_remote_unlock=true，固件侧也要打开。';
   }
 

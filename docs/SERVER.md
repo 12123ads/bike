@@ -101,7 +101,7 @@ FastAPI 默认在这三个地址**无鉴权**公开完整 schema，包括 `/cmd/
 
 时间一律是服务端时钟（`t_srv`）——设备时钟在拿到 NITZ 之前是错的（契约 §5.6）。
 
-**远程开锁默认 403。** 它绕过 NFC 挑战应答（契约 §6.1），要用得同时打开
+**远程开锁默认 403。** 它绕过 BLE 挑战应答（契约 §6.1），要用得同时打开
 服务端的 `allow_remote_unlock` 和固件的 `CONFIG_EBIKE_ALLOW_REMOTE_UNLOCK`。
 
 ## 4. 为什么 broker 内置

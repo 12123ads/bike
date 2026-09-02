@@ -63,7 +63,7 @@ LWT_RETAIN = True
 #: `up/event` 的 `e` 闭集。契约 §5.4
 EVENT_KINDS = frozenset({
     "boot", "motion", "still", "unlock_ok", "unlock_deny",
-    "lock_state", "lowbatt", "nfc_err",
+    "lock_state", "lowbatt", "ble_err",
 })
 
 #: `dn/cmd` 的 `c` 闭集。契约 §6.1

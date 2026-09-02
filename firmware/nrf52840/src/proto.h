@@ -43,7 +43,7 @@ enum proto_event {
 	EV_UNLOCK_DENY,
 	EV_LOCK_STATE,
 	EV_LOWBATT,
-	EV_NFC_ERR,
+	EV_BLE_ERR,
 };
 
 /* 契约 §6.1 的指令闭集 */

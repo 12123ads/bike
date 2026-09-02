@@ -3,13 +3,16 @@
  *
  * 状态机就三态，刻意保持简单 —— 复杂度全在 modem.c 和 unlock.c 里：
  *
- *   ACTIVE   刚被运动唤醒或刚开机。NFC 开着，定时上报。
- *   IDLE     静止一段时间了。NFC 关掉（NFCT ACTIVATED 是 400 µA，§2.5），
+ *   ACTIVE   刚被运动唤醒或刚开机。BLE 广播开着，定时上报。
+ *   IDLE     静止一段时间了。广播关掉（**为了不可被扫描发现，不是为了省电** ——
+ *            广播只有 16~130 µA，见 IDLE_AFTER_STILL_MS），
  *            只留运动中断和定时器。
  *   OFF      车电池跌破第三阈值（§6 第 4 级）。System OFF，只留运动唤醒；
  *            醒来等于一次复位。见文件末尾的说明。
  *
- * 唤醒源：LIS2DW12 INT1（运动）、定时器（周期上报）、NFC 场（只在 ACTIVE 有效）。
+ * 唤醒源：LIS2DW12 INT1（运动）、定时器（周期上报）。
+ * **BLE 不是唤醒源** —— radio 在 System OFF 下断电，手机连不上一台已关机的车；
+ * 这和 NFC 场唤醒不同（那条路存在但没用，见 ADR-004 §3）。
  */
 
 #include "battery.h"
@@ -18,7 +21,7 @@
 #include "lock.h"
 #include "modem.h"
 #include "motion.h"
-#include "nfc_tag.h"
+#include "ble_unlock.h"
 #include "nvstore.h"
 #include "proto.h"
 #include "unlock.h"
@@ -36,9 +39,20 @@
 
 LOG_MODULE_REGISTER(main, CONFIG_EBIKE_LOG_LEVEL);
 
-/* 静止多久之后关 NFC 进 IDLE。5 分钟：够用户走开又回来（忘了东西），
- * 也短到不会让 400 µA 白烧太久。 */
+/* 静止多久之后关广播进 IDLE。5 分钟：够用户走开又回来（忘了东西）。
+ *
+ * ⚠ **这不是省电措施。** 广播本身 100~150 ms 间隔约 130 µA，1 s 间隔约 16 µA，
+ * 都淹没在 4G 模组 500~1500 µA 的地板下面（ADR-004 §3）。关它的理由是
+ * **不可被发现**：一台常年广播的车可以被沿街扫描长期跟踪、被枚举、被挑中。 */
 #define IDLE_AFTER_STILL_MS (5 * 60 * 1000)
+
+/* 两个门槛的关系必须成立，否则关广播的条件永远等不到：
+ *   CONFIG_EBIKE_STILL_AFTER_S  判「不动了」        （motion.c 的软件计时）
+ *   IDLE_AFTER_STILL_MS         判「不动够久了」    （下面关广播用）
+ * 前者必须明显小于后者。这条在 motion.h 里也写了，这里是可执行的那一份。 */
+BUILD_ASSERT(CONFIG_EBIKE_STILL_AFTER_S * 1000 < IDLE_AFTER_STILL_MS,
+	     "EBIKE_STILL_AFTER_S must be well below IDLE_AFTER_STILL_MS, "
+	     "otherwise the advertising-off condition can never be reached.");
 
 /* 进 System OFF 前要武装的唤醒脚，以及要 suspend 的外设。
  * `motion_int` 与 LIS2DW12 的 `irq-gpios` 是同一根线（overlay 里两处都是
@@ -57,7 +71,11 @@ static const struct device *const dev_i2c        = DEVICE_DT_GET(DT_NODELABEL(i2
 K_THREAD_STACK_DEFINE(uplink_stack, UPLINK_STACK_SIZE);
 static struct k_thread uplink_thread;
 
-static volatile bool moving;
+/* 最后一次判定静止的时刻。**只有这一个本地状态** ——
+ * 运动状态本身由 motion.c 持有（`motion_current()`），
+ * 以前这里另存一份 `volatile bool moving`，那是因为硬件静止事件永不到达、
+ * 那份 bool 是唯一能翻的东西。现在 motion.c 的状态机是完整的，
+ * 留两份只会分叉。 */
 static int64_t last_still_ms;
 
 /* --- 回调 ------------------------------------------------------------------- */
@@ -65,18 +83,17 @@ static int64_t last_still_ms;
 static void on_motion(enum motion_state state, uint16_t mg)
 {
 	if (state == MOTION_MOVING) {
-		moving = true;
 		char detail[32];
+
 		(void)snprintf(detail, sizeof(detail), "{\"mg\":%u}", mg);
 		(void)uplink_queue_event(EV_MOTION, detail);
 
-		/* 动了就把 NFC 打开 —— 用户可能正要开锁 */
-		(void)nfc_tag_start();
+		/* 动了就把广播打开 —— 用户可能正要开锁 */
+		(void)ble_unlock_start();
 
 		/* 车被动了是防盗关心的事件，立刻上报（DESIGN.md §1「防盗感知」） */
 		uplink_request_now();
 	} else {
-		moving = false;
 		last_still_ms = k_uptime_get();
 		(void)uplink_queue_event(EV_STILL, NULL);
 	}
@@ -84,6 +101,11 @@ static void on_motion(enum motion_state state, uint16_t mg)
 
 static void on_unlock_result(bool ok, uint32_t uid)
 {
+	/* 有人正在动这辆车 —— 即使加速度计没到阈值（人站着按手机，
+	 * 车没晃），也不该在这时判静止把广播关掉。成功和被拒都算活动：
+	 * 被拒更可能是有人在试，广播反而不该关。 */
+	motion_note_activity();
+
 	char detail[32];
 	if (ok) {
 		(void)snprintf(detail, sizeof(detail), "{\"uid\":%u}", uid);
@@ -114,8 +136,14 @@ static void on_lock_state(bool open)
  *
  * 五个步骤的顺序都是必需的，逐条说明：
  *
- * 1. **输出脚拉到安全电平。** sleep pinctrl 只在 SUSPEND 时应用，而 GPIO
- *    输出脚不受 pinctrl 管 —— 不拉低的话 GNSS 门控管和分压门控管会一直导通。
+ * 1. **关 radio、输出脚拉到安全电平。** `ble_unlock_shutdown()` 停广播再
+ *    `bt_disable()`：radio 也是 EasyDMA master（和第 4 步同一条推理），
+ *    而 MPSL 还占着 RTC0/TIMER0/RADIO；`bt_disable()` 底下的 `sdc_disable()`
+ *    是同步的，返回即代表 controller 已停。**必须在第 4 步的
+ *    `nvstore_flush()` 之前做** —— `SOC_FLASH_NRF_RADIO_SYNC_MPSL` 会让
+ *    flash 写等 MPSL timeslot，radio 开着时那次 flush 的最坏延迟不可控。
+ *    sleep pinctrl 只在 SUSPEND 时应用，而 GPIO 输出脚不受 pinctrl 管 ——
+ *    不拉低的话 GNSS 门控管和分压门控管会一直导通。
  * 2. **确认唤醒脚已回低。** LIS2DW12 默认是 latched 中断（overlay 没设
  *    `drdy-pulsed`），不读清中断源引脚就一直是高。而 level sense 一武装就会
  *    立刻触发 DETECT → `sys_poweroff()` 之后**立即被唤醒 → 空转 → 再关机**
@@ -149,7 +177,7 @@ static void enter_system_off(void)
 	LOG_WRN("电压跌破第三阈值，进 System OFF，只留运动唤醒");
 
 	/* 1. 关掉所有耗电的输出 */
-	(void)nfc_tag_stop();
+	ble_unlock_shutdown();
 	(void)gnss_power_off();
 
 	/* 2. 等唤醒脚回低，避免 level sense 一武装就自触发 */
@@ -222,7 +250,7 @@ static void uplink_thread_fn(void *a, void *b, void *c)
 			LOG_INF("提前上报（被请求）");
 		} else if (!uplink_should_report()) {
 			/* 欠压第 2 级：停周期上报，只保留离线开锁和运动触发。
-			 * 手机 NFC 开锁完全离线（§5.2），不受这条影响。 */
+			 * BLE 开锁完全离线（§5.2），不受这条影响。 */
 			LOG_INF("欠压等级 %d，跳过这一轮周期上报",
 				uplink_batt_level());
 			continue;
@@ -241,13 +269,19 @@ static void uplink_thread_fn(void *a, void *b, void *c)
 			 * 里的说明）—— 醒不过来比多耗一点电严重得多。 */
 		}
 
-		/* 静止够久就关 NFC 省电。放在上报之后 ——
-		 * 上报期间保持 NFC 开着，因为用户可能正好在车边。 */
-		if (!moving && nfc_tag_is_active() &&
+		/* 静止够久就关广播（防跟踪，不是省电 —— 见 IDLE_AFTER_STILL_MS
+		 * 的注释）。放在上报之后：上报期间保持广播开着，
+		 * 因为用户可能正好在车边。
+		 *
+		 * 判 `== MOTION_STILL` 而不是 `!= MOTION_MOVING`：开机后还没
+		 * 收到任何事件时状态是 UNKNOWN，那时不该关广播 —— 刚上电大概率
+		 * 是有人正在装车或调试。UNKNOWN 会在 STILL_AFTER 秒后自己变成
+		 * STILL（motion_init 开机就排了一次超时）。 */
+		if (motion_current() == MOTION_STILL && ble_unlock_is_active() &&
 		    (k_uptime_get() - last_still_ms) > IDLE_AFTER_STILL_MS) {
-			LOG_INF("静止超过 %d 分钟，关 NFC 省电（400 µA）",
+			LOG_INF("静止超过 %d 分钟，关广播（不可被扫描发现）",
 				IDLE_AFTER_STILL_MS / 60000);
-			(void)nfc_tag_stop();
+			(void)ble_unlock_stop();
 		}
 
 		/* counter 的延迟写窗口是 5 秒，这里主动冲一次 ——
@@ -266,12 +300,12 @@ int main(void)
 	/* 顺序有讲究：
 	 * crypto 在 unlock 之前（unlock_init 要读密钥并可能用到 PSA）；
 	 * nvstore 在 unlock 之前（密钥从 flash 读）；
-	 * nfc 在 unlock 之后（NFC 回调会调 unlock_handle_apdu）。 */
+	 * ble 在 unlock 之后（GATT 写回调会调 unlock_handle_apdu）。 */
 	int rc = crypto_init();
 	if (rc != 0) {
 		/* 没有密码学就没有开锁。这是唯一 fatal 的初始化失败 ——
 		 * 其余部件坏了还能降级用，这个坏了核心功能就没了。 */
-		LOG_ERR("crypto 初始化失败 rc=%d —— NFC 开锁不可用", rc);
+		LOG_ERR("crypto 初始化失败 rc=%d —— 开锁不可用", rc);
 		return rc;
 	}
 
@@ -294,12 +328,12 @@ int main(void)
 	}
 	lock_set_callback(on_lock_state);
 
-	rc = nfc_tag_init();
+	rc = ble_unlock_init();
 	if (rc != 0) {
-		LOG_ERR("NFC 初始化失败 rc=%d —— 只能用机械钥匙", rc);
+		LOG_ERR("BLE 初始化失败 rc=%d —— 只能用机械钥匙", rc);
 	} else {
-		/* 开机就开着 NFC，静止 5 分钟后由上报线程关掉 */
-		(void)nfc_tag_start();
+		/* 开机就开着广播，静止 5 分钟后由上报线程关掉 */
+		(void)ble_unlock_start();
 		last_still_ms = k_uptime_get();
 	}
 

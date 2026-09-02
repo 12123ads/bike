@@ -304,3 +304,286 @@ def test_prj_conf_has_no_nonexistent_symbols():
     # 该有的两个
     assert "CONFIG_POWEROFF=y" in live
     assert "CONFIG_PM_DEVICE=y" in live
+
+
+# --- BLE 开锁通道（ADR-004） -------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def prj_conf() -> str:
+    return (FW / "prj.conf").read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def ble_c() -> str:
+    p = FW / "src" / "ble_unlock.c"
+    if not p.exists():
+        pytest.skip(f"没有 {p}")
+    return p.read_text(encoding="utf-8")
+
+
+def kconf_int(text: str, name: str) -> int | None:
+    m = re.search(rf"^CONFIG_{name}=(\d+)$", text, re.M)
+    return int(m.group(1)) if m else None
+
+
+def test_att_mtu_fits_longest_apdu(prj_conf):
+    """默认 ATT_MTU=23 只给 20 字节可写，装不下 UNLOCK 的 30 字节 C-APDU。
+
+    算式（DESIGN.md §2.3）：
+      写请求可写载荷 = ATT_MTU − 3（1 B opcode + 2 B handle）
+      本地 ATT_MTU  = MIN(BT_L2CAP_RX_MTU, BT_L2CAP_TX_MTU)
+      BT_L2CAP_RX_MTU = CONFIG_BT_BUF_ACL_RX_SIZE − 4（L2CAP 头）
+
+    这条钉的是「改小了会静默截断整条开锁报文」——手机侧只会看到一个
+    ATT 错误码，隔着蓝牙极难诊断。
+    """
+    tx_mtu = kconf_int(prj_conf, "BT_L2CAP_TX_MTU")
+    acl_rx = kconf_int(prj_conf, "BT_BUF_ACL_RX_SIZE")
+    assert tx_mtu is not None, "prj.conf 没设 CONFIG_BT_L2CAP_TX_MTU（默认 23 不够）"
+    assert acl_rx is not None, "prj.conf 没设 CONFIG_BT_BUF_ACL_RX_SIZE（默认 27 不够）"
+
+    # UNLOCK: 80 10 00 00 Lc [uid(4) || counter(4) || mac(16)] 00
+    apdu_len = 5 + 4 + 4 + 16 + 1
+    assert apdu_len == 30
+
+    local_mtu = min(acl_rx - 4, tx_mtu)
+    assert local_mtu - 3 >= apdu_len, (
+        f"MTU 不够：本地 ATT_MTU={local_mtu}，可写 {local_mtu - 3} < {apdu_len}")
+
+
+def test_ble_single_connection_for_lockfree_unlock_state(prj_conf):
+    """`unlock.c` 的 cur_nonce/nonce_valid/selected 是无锁静态状态。
+
+    它们安全的唯一理由是「所有访问都只发生在 ble_unlock.c 那一个 work
+    handler 线程里」（DESIGN.md §2.5）。BT_MAX_CONN > 1 会引入第二个并发源，
+    那时必须补锁 —— 所以这个值不是资源调优参数，是安全论证的一部分。
+    """
+    assert kconf_int(prj_conf, "BT_MAX_CONN") == 1, \
+        "BT_MAX_CONN != 1，unlock.c 的无锁状态论证不再成立（DESIGN.md §2.5）"
+
+
+def test_ble_no_smp_no_bt_settings(prj_conf):
+    """不开 SMP 是有意的（DESIGN.md §5.5 / ADR-004 §5）：
+
+    设备没有屏幕也没有键盘，IO capability 只能是 NoInputNoOutput，
+    那种配置下 LESC 只能退化成 Just Works（没有 MITM 防护）。
+    连带地不需要 BT_SETTINGS —— 没有 LTK/IRK 要落盘，
+    也就不该让 BT 去分摊 counter 所在那块 32 kB storage 分区的擦写寿命。
+
+    这条测试防的是「有人为了『更安全』顺手开了 SMP」，那会同时
+    引入 flash 争用和 settings_load 的时序要求。
+    """
+    live = [ln.strip() for ln in prj_conf.splitlines()
+            if ln.strip() and not ln.strip().startswith("#")]
+    assert "CONFIG_BT_SMP=n" in live, "SMP 没有显式关掉"
+    assert "CONFIG_BT_SETTINGS=n" in live, "BT_SETTINGS 没有显式关掉"
+
+
+def test_ble_is_peripheral_only(prj_conf):
+    """设备只广播、只等连接，从不扫描也从不发起连接（DESIGN.md §2.1）。"""
+    live = [ln.strip() for ln in prj_conf.splitlines()
+            if ln.strip() and not ln.strip().startswith("#")]
+    assert "CONFIG_BT=y" in live
+    assert "CONFIG_BT_PERIPHERAL=y" in live
+    assert not [ln for ln in live if ln.startswith("CONFIG_BT_CENTRAL=")], \
+        "开了 central 角色 —— 本设备不该主动连别人"
+    assert not [ln for ln in live if ln.startswith("CONFIG_BT_OBSERVER=")], \
+        "开了 observer 角色 —— 本设备不该扫描"
+
+
+def test_gatt_write_callback_defers_crypto(ble_c):
+    """写回调跑在协议栈自己的 "BT RX WQ" 上（att.c 同步调 attr->write）。
+
+    在那里跑 psa_mac_verify 会让未认证的攻击者用 UNLOCK 写请求拖垮
+    整条 BT 处理 —— 这是 NFC 侧不存在的 DoS（NFC 得贴上来）。
+    所以 on_cmd_write 只能 memcpy + submit，密码学必须在自有 work queue 里。
+    """
+    # ⚠ 文件里 on_cmd_write 出现两次：一处前向声明（服务表要定义在
+    # work handler 之前），一处定义。`[^;]*?\)\s*\n\{` 只匹配定义那一处。
+    m = re.search(r"static ssize_t on_cmd_write\([^;]*?\)\s*\n\{.*?\n\}", ble_c, re.S)
+    assert m, "找不到 on_cmd_write 定义"
+    body = m.group(0)
+    assert "unlock_handle_apdu" not in body, \
+        "on_cmd_write 里直接调了 unlock_handle_apdu —— 必须 defer（DESIGN.md §2.5）"
+    assert "k_work_submit_to_queue" in body, "on_cmd_write 没有把工作交给自有队列"
+
+    m = re.search(r"static void apdu_work_fn\(.*?\n\}", ble_c, re.S)
+    assert m, "找不到 apdu_work_fn 定义"
+    assert "unlock_handle_apdu" in m.group(0), "work handler 里没有处理 APDU"
+
+
+def test_unlock_state_touched_only_from_own_workqueue(ble_c):
+    """`unlock.c` 的 nonce/counter 状态是无锁的（DESIGN.md §2.5）。
+
+    安全前提是「所有访问都在 unlock_workq 那一个线程上」。连接/断开回调跑在
+    BT RX WQ 上、静止关广播跑在 uplink 线程上 —— 那两处**不能**直接调
+    `unlock_session_reset()`，必须经 `session_reset()` 交给队列。
+
+    这条防的是「看着无害就顺手直接调」——它不会崩，只会在极少数时序下
+    把一个正在被验证的 nonce 抹掉，现场表现为「偶尔第一次开锁失败」。
+    """
+    direct = [ln for ln in ble_c.splitlines()
+              if "unlock_session_reset()" in ln and not ln.lstrip().startswith("*")]
+    # 只允许 work handler 里那一处
+    assert len(direct) == 1, (
+        "unlock_session_reset() 被直接调了多处，应该只在 work handler 里：\n"
+        + "\n".join(direct))
+
+    m = re.search(r"static void session_reset_work_fn\(.*?\n\}", ble_c, re.S)
+    assert m and "unlock_session_reset()" in m.group(0), \
+        "唯一那处不在 session_reset_work_fn 里"
+
+
+def test_radio_stopped_before_flash_write_on_poweroff():
+    """进 System OFF 前必须先停 radio，再 nvstore_flush()。
+
+    两条独立的理由（DESIGN.md §2.7）：
+    1. radio 是 EasyDMA master，产品规格书要求进 System OFF 前 EasyDMA 已结束；
+    2. SOC_FLASH_NRF_RADIO_SYNC_MPSL 让 flash 写等 MPSL timeslot ——
+       radio 还开着时那次 flush 的最坏延迟不可控。
+    """
+    src = (FW / "src" / "main.c").read_text(encoding="utf-8")
+    m = re.search(r"static void enter_system_off\(void\).*?\n\}", src, re.S)
+    assert m, "找不到 enter_system_off"
+    body = m.group(0)
+    assert "ble_unlock_shutdown" in body, "关机前没停 BLE（radio 还开着）"
+    assert body.index("ble_unlock_shutdown") < body.index("nvstore_flush"), \
+        "nvstore_flush 排在停 radio 之前 —— flash 写会等 MPSL timeslot"
+
+
+def test_nfc_is_fully_removed():
+    """ADR-004 是一次干净切换：不留 nfc_tag 模块、不留 CONFIG_NFC_*。
+
+    留着的话下一个人会以为还有第二条开锁通道，而它既没有天线也没有
+    UICR.NFCPINS —— 那是一条编得过但永远不工作的路径。
+    """
+    src_dir = FW / "src"
+    assert not (src_dir / "nfc_tag.c").exists(), "nfc_tag.c 还在"
+    assert not (src_dir / "nfc_tag.h").exists(), "nfc_tag.h 还在"
+
+    cmake = (FW / "CMakeLists.txt").read_text(encoding="utf-8")
+    assert "nfc_tag.c" not in cmake, "CMakeLists 还在编 nfc_tag.c"
+    assert "ble_unlock.c" in cmake, "CMakeLists 没编 ble_unlock.c"
+
+    text = (FW / "prj.conf").read_text(encoding="utf-8")
+    live = [ln.strip() for ln in text.splitlines()
+            if ln.strip() and not ln.strip().startswith("#")]
+    assert not [ln for ln in live if ln.startswith("CONFIG_NFC")], \
+        "prj.conf 还有 CONFIG_NFC_*"
+
+    for name in ("main.c", "uplink.c", "proto.c", "proto.h"):
+        s = (src_dir / name).read_text(encoding="utf-8")
+        assert "nfc_tag_" not in s, f"{name} 还在调 nfc_tag_*"
+
+
+# --- 编译/仿真时才暴露出来的几条（2026-09-02 第一次 west build 之后补） ------
+
+
+def test_board_overlay_filename_matches_board_target():
+    """overlay 文件名必须带 `_uf2` 变体后缀，否则 **Zephyr 直接忽略它**。
+
+    board target 是 `promicro_nrf52840/nrf52840/uf2`，`zephyr_build_string()`
+    把 qualifiers 拼成 `promicro_nrf52840_nrf52840_uf2`。名字少了 `_uf2`
+    时 cmake 一声不响地不加载 —— 症状是编译期
+    `__device_dts_ord_DT_N_ALIAS_motion_int_... undeclared`（实测过），
+    因为整个 overlay 的节点都不存在。
+    """
+    boards = FW / "boards"
+    assert (boards / "promicro_nrf52840_nrf52840_uf2.overlay").exists(), \
+        "overlay 文件名不含 _uf2 变体后缀 —— 构建时会被静默忽略"
+
+
+def test_overlay_includes_lis2dw12_dt_bindings():
+    """overlay 里用了 `LIS2DW12_DT_*` 宏，就必须自己 include 那个头。
+
+    板级 DTS 不会带进 `dt-bindings/sensor/lis2dw12.h`，少了它是
+    `parse error: expected number or parenthesized expression`（实测过）。
+    """
+    ov = (FW / "boards" / "promicro_nrf52840_nrf52840_uf2.overlay").read_text(
+        encoding="utf-8")
+    if "LIS2DW12_DT_" in ov:
+        assert "dt-bindings/sensor/lis2dw12.h" in ov, \
+            "用了 LIS2DW12_DT_* 宏但没 include 对应的 dt-bindings 头"
+
+
+def test_kconfig_symbols_that_are_link_time_landmines(prj_conf):
+    """三个默认 n / 需要显式打开的符号，缺了都是**链接期**才报错。
+
+    - `CONFIG_BASE64`：proto.c 的 `base64_decode()`
+    - `CONFIG_HWINFO`：uplink.c 的 `hwinfo_get_reset_cause()`。
+      注意 `HWINFO_NRF` 的 `default y` 在 `if HWINFO` 里面，
+      所以只写注释「default y 不用显式写」是错的（实测过）。
+    - `CONFIG_LIS2DW12_WAKEUP`：`SENSOR_TRIG_MOTION` 整段在这个 ifdef 里，
+      缺了不是链接错误而是**运行期 -ENOTSUP**，唤醒源直接不存在。
+    """
+    live = [ln.strip() for ln in prj_conf.splitlines()
+            if ln.strip() and not ln.strip().startswith("#")]
+    for sym in ("CONFIG_BASE64=y", "CONFIG_HWINFO=y",
+                "CONFIG_LIS2DW12_WAKEUP=y"):
+        assert sym in live, f"prj.conf 缺 {sym}"
+
+
+def test_lis2dw12_sleep_stays_off(prj_conf):
+    """`CONFIG_LIS2DW12_SLEEP` 必须**保持关闭**。
+
+    这一条原来是反的（断言它 `=y`），因为那时代码注册了
+    `SENSOR_TRIG_STATIONARY`。但那个触发走 **INT2**，而本板只接了 INT1 ——
+    `sensor_trigger_set()` 返回 0、日志还打 INFO，事件却永远不到达。
+    后果不是「少一个事件」而是 `main.c` 的运动状态永远翻不回 still，
+    于是 BLE 广播永远关不掉，DESIGN.md §2.4 的防跟踪保证静默失效。
+
+    2026-09-03 改成软件计时（`CONFIG_EBIKE_STILL_AFTER_S`），
+    motion.c 不再注册 STATIONARY，这个符号成了纯负担。
+    钉住它别被人「顺手」加回来。
+    """
+    live = [ln.strip() for ln in prj_conf.splitlines()
+            if ln.strip() and not ln.strip().startswith("#")]
+    assert "CONFIG_LIS2DW12_SLEEP=y" not in live, (
+        "CONFIG_LIS2DW12_SLEEP 被打开了 —— 它只 gate STATIONARY，"
+        "而那个触发走 INT2、本板没接线。见 src/motion.h")
+
+
+def test_motion_does_not_register_stationary():
+    """motion.c 不能注册 `SENSOR_TRIG_STATIONARY`。
+
+    注册它会成功（返回 0），但事件永不到达 —— 「配置成功、功能静默失效」，
+    最难查的一类。静止判定必须走 `CONFIG_EBIKE_STILL_AFTER_S` 的软件计时。
+    """
+    motion_c = (FW / "src" / "motion.c").read_text(encoding="utf-8")
+    live = "\n".join(
+        ln for ln in motion_c.splitlines()
+        if not ln.lstrip().startswith(("*", "/*", "//")))
+    assert "SENSOR_TRIG_STATIONARY" not in live, (
+        "motion.c 又注册了 SENSOR_TRIG_STATIONARY —— 它走 INT2，本板没接线")
+    assert "CONFIG_EBIKE_STILL_AFTER_S" in live, (
+        "motion.c 没用 CONFIG_EBIKE_STILL_AFTER_S —— 软件静止计时没了")
+
+
+def test_motion_threshold_uses_ms2_conversion():
+    """`SENSOR_ATTR_UPPER_THRESH` 的单位是 m/s²，不是 mg。
+
+    驱动按 `sensor_ms2_to_mg()` 反算（lis2dw12.c:240），直接塞 mg 会
+    **小 9.8 倍**：150 mg 变 15 mg，低于一格 31.25 mg → 寄存器写 0 →
+    传感器持续触发。这条钉住那次换算没被人改回去。
+    """
+    src = (FW / "src" / "motion.c").read_text(encoding="utf-8")
+    assert "sensor_ug_to_ms2" in src, \
+        "motion.c 没用 sensor_ug_to_ms2 做单位换算（阈值会小 9.8 倍）"
+    assert not re.search(r"\.val1\s*=\s*mg\s*/\s*1000", src), \
+        "motion.c 又在直接把 mg 塞进 sensor_value"
+
+
+def test_bsim_test_mtu_matches_firmware(prj_conf):
+    """bsim 测试的 MTU 配置必须和固件一致。
+
+    测试里断言 1 在**运行时**验 `MTU-3 >= 30`；如果测试的 prj.conf
+    配得比固件宽松，那条断言就失去了保护固件配置的意义。
+    """
+    bsim = FW.parent / "tests" / "ble_unlock_bsim" / "prj.conf"
+    if not bsim.exists():
+        pytest.skip("没有 bsim 测试")
+    btext = bsim.read_text(encoding="utf-8")
+    for sym in ("BT_L2CAP_TX_MTU", "BT_BUF_ACL_RX_SIZE"):
+        assert kconf_int(btext, sym) == kconf_int(prj_conf, sym), \
+            f"bsim 测试与固件的 {sym} 不一致"

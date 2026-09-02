@@ -1,0 +1,17 @@
+config EBIKE_LOG_LEVEL
+	int "本项目模块的日志等级"
+	default 3
+	range 0 4
+	help
+	  被测模块（ble_unlock.c / unlock.c / crypto.c / nvstore.c）用它做
+	  LOG_MODULE_REGISTER 的等级。真固件的同名符号在
+	  firmware/nrf52840/Kconfig 里，这里只是把它补齐让那几个 .c 能编。
+
+config EBIKE_REPORT_INTERVAL
+	int "默认上报周期（秒）"
+	default 900
+	help
+	  nvstore.c 用它当 report_interval 的出厂默认值。开锁测试不关心这个值，
+	  但少了它 nvstore.c 编不过。
+
+source "Kconfig.zephyr"

@@ -144,7 +144,7 @@ def test_unknown_cmd_rejected(svc_and_client):
 
 
 def test_remote_unlock_disabled_by_default(svc_and_client):
-    """契约 §6.1：远程开锁绕过 NFC 挑战应答，默认必须关着。"""
+    """契约 §6.1：远程开锁绕过 BLE 挑战应答，默认必须关着。"""
     _, cfg, c = svc_and_client
     assert cfg.allow_remote_unlock is False
     r = c.post("/cmd/bike01/unlock", headers=AUTH)

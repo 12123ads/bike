@@ -47,6 +47,22 @@ config EBIKE_MOTION_THRESHOLD_MG
 	  电瓶车从 100~200 mg 起调（DESIGN.md §3.7）。
 	  阈值只能运行时设，不是 DTS 属性。
 
+config EBIKE_STILL_AFTER_S
+	int "多久没有运动事件就判静止（秒）"
+	default 30
+	range 5 600
+	help
+	  软件静止判定的超时。**硬件的 STATIONARY 事件在本板上用不了**
+	  （走 INT2，只接了 INT1），所以静止完全靠这个计时器 ——
+	  详见 src/motion.h 的长注释。
+
+	  必须明显小于 main.c 的 IDLE_AFTER_STILL_MS（5 分钟，关广播的门槛）：
+	  前者判「不动了」，后者判「不动够久了」。设得比它大的话关广播的条件
+	  永远等不到。motion.c 里有 BUILD_ASSERT 钉这一条。
+
+	  30 秒的取值：等红灯、推车挪位这类停顿不该立刻判成静止，
+	  但也不能久到让「车被搬走后又静止了」这个事件迟迟不上报。
+
 config EBIKE_LOW_VOLT_1
 	int "第一欠压阈值（毫伏）"
 	default 46000
@@ -58,7 +74,7 @@ config EBIKE_LOW_VOLT_2
 	int "第二欠压阈值（毫伏）"
 	default 44000
 	help
-	  跨过就停止周期上报，只保留手机 NFC 开锁（那条路完全离线，不吃车电池
+	  跨过就停止周期上报，只保留手机 BLE 开锁（那条路完全离线，不吃车电池
 	  的通信开销）。运动事件仍然会触发一次上报 —— 车在这个电量下被动了，
 	  比省那点电重要。
 

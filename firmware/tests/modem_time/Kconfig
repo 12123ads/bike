@@ -1,0 +1,32 @@
+# modem.c 需要的项目 Kconfig 符号。
+#
+# 真固件的定义在 firmware/nrf52840/Kconfig；这里只补齐让 modem.c + proto.c
+# 能编。值随便填，测试不依赖它们 —— 但 MQTT_HOST 会被拼进一条 AT 命令的
+# 字符串字面量里，所以不能为空。
+
+config EBIKE_DEVICE_ID
+	string "设备 id"
+	default "bike01"
+
+config EBIKE_FW_VERSION
+	string "固件版本"
+	default "0.0.0-test"
+
+config EBIKE_MQTT_HOST
+	string "MQTT 主机"
+	default "test.invalid"
+
+config EBIKE_MQTT_PORT
+	int "MQTT 端口"
+	default 8883
+
+config EBIKE_MQTT_PASSWORD
+	string "MQTT 口令"
+	default "not-a-real-password"
+
+config EBIKE_LOG_LEVEL
+	int "本项目模块的日志等级"
+	default 4
+	range 0 4
+
+source "Kconfig.zephyr"

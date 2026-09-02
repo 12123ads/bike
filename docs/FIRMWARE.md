@@ -1,28 +1,37 @@
 # 固件（nRF52840 / NCS-Zephyr）
 
-> ⚠ **这份固件在本机没有被编译过一次。** 这台机器上没有 NCS/Zephyr SDK，
-> 也没有任何 C 编译器（`gcc: command not found`）。所以：
+> ✅ **2026-09-02：这份固件现在编得过了，而且开锁通道跑过了射频仿真。**
 >
-> - 符号名、Kconfig 名、DTS 属性名都是按 [`DESIGN.md`](DESIGN.md) 里**已核实**的写的；
->   2026-09-02 又对着上游源码逐个核了一遍 PSA/hwinfo/poweroff/GPIO 这几组
->   （结论写在各文件的注释里，包括三处**更正**，见 §3b）；
-> - 但**第一次 `west build` 一定会有编译错误**（拼写、头文件、API 签名细节）；
-> - 逻辑层面的交叉检查由 `server/tests/test_firmware_contract.py` 覆盖——
->   它把 topic 宏、字段名、事件/指令闭集、Kconfig 默认值和服务端的 `contract.py`
->   逐项对照，**45 条测试全过**。**那测的是「两边一致」，不是「能编译」。**
+> | | 结果 |
+> | --- | --- |
+> | `west build` | **通过**，零警告（`-DCONFIG_COMPILER_WARNINGS_AS_ERRORS=y` 也过） |
+> | FLASH | 218 688 B / 792 KB = **26.96 %** |
+> | RAM | 62 192 B / 256 KB = **23.72 %** |
+> | 产物 | `zephyr.uf2` 437 760 B，family `0xADA52840`，start `0x26000` ✓ |
+> | BabbleSim 运行时测试 | **两侧都 Passed**，8 条断言（见 §5） |
+> | 文本层契约测试 | `server/tests/test_firmware_contract.py` **58 条全过** |
+>
+> 工具链：NCS **v3.4.0**（Zephyr 4.4.0）+ Zephyr SDK 1.0.1，
+> board target `promicro_nrf52840/nrf52840/uf2`。装在 `/opt/ncs`。
+>
+> ⚠ 仍然**没有在真硬件上跑过**。仿真验的是协议与逻辑，验不了
+> 引脚接线、静态电流、GNSS/4G 的 UART 时序 —— 那些是 R0~R1 的事（§4）。
+>
+> 第一次构建暴露了 6 个真问题，全部已修，逐条记在 §3c ——
+> **其中两个是「编得过但功能静默失效」，比编译错误危险得多。**
 
 ## 1. 文件
 
 | 文件 | 干什么 | 依赖的 DESIGN.md 条目 |
 | --- | --- | --- |
-| `src/main.c` | 三态状态机 + 初始化顺序 + System OFF 路径 | §2.5 运动唤醒替代场唤醒 / §6 第 4 级 |
+| `src/main.c` | 三态状态机 + 初始化顺序 + System OFF 路径 | §2.7 运动唤醒是唯一外部唤醒源 / §6 第 4 级 |
 | `src/proto.c/.h` | 契约 v1 编解码 | [`MQTT-CONTRACT.md`](MQTT-CONTRACT.md) 全文 |
 | `src/unlock.c/.h` | 挑战应答三重校验 | §5.2 协议 / §5.3 密钥管理 |
 | `src/crypto.c/.h` | PSA HMAC + TRNG | §4.2（**注意**：CryptoCell 的开关由 cc3xx 库自己引用计数管，应用层不做，见 `crypto.h` 的长注释） |
-| `src/nfc_tag.c/.h` | raw ISO-DEP 标签 | §2.1 NFCT 只能当标签 / §2.2 |
+| `src/ble_unlock.c/.h` | BLE GATT 开锁通道（CMD write / RSP notify） | §2.1 链路 / §2.2 GATT 表 / §2.5 必须 defer 密码学 |
 | `src/nvstore.c/.h` | 密钥、counter、序号 q 的持久化 | §5.2 counter 掉电不回零 |
 | `src/motion.c/.h` | LIS2DW12 运动/静止触发 | §3.7 阈值只能运行时设 |
-| `src/battery.c/.h` | 门控分压采样 + 四级欠压判定 | §3.6 不门控就是 29 µA 常流 / §6 |
+| `src/battery.c/.h` | 门控分压采样（21:1）+ 四级欠压判定 + 两条布板护栏 `BUILD_ASSERT` | §3.6 比例由 VDD 3.3 V 和源阻抗 800 kΩ 定死 / §6 |
 | `src/lock.c/.h` | 锁驱动 + 位置反馈 | §7 第 1 条（型号未定） |
 | `src/gnss.c/.h` | NMEA 解析 + 电源门控 | §1 选 ATGM336H 的理由 |
 | `src/modem.c/.h` | Air780EP AT 状态机 | §8 全节 |
@@ -30,14 +39,56 @@
 
 ## 2. 怎么编译
 
-本机不行，需要一台装了 NCS 的机器：
+本机 `/opt/ncs` 已经装好了（NCS v3.4.0 + Zephyr SDK 1.0.1）。三行：
 
 ```bash
-# NCS v2.x，board target 见 DESIGN.md §3.4（已核实）
-west build -b promicro_nrf52840/nrf52840/uf2 firmware/nrf52840
+export ZEPHYR_BASE=/opt/ncs/zephyr
+export ZEPHYR_SDK_INSTALL_DIR=/opt/zephyr-sdk/zephyr-sdk-1.0.1
+/opt/zephyrtool/bin/west build -p always \
+    -b promicro_nrf52840/nrf52840/uf2 \
+    -d /tmp/bbuild firmware/nrf52840
+```
 
-# 配置：设备 id、MQTT 主机、口令都要填
-west build -t menuconfig      # 或直接改 prj.conf / 加 -DCONFIG_...
+产物在 `/tmp/bbuild/nrf52840/zephyr/`：`zephyr.uf2`（拖进 UF2 盘）、
+`zephyr.hex`（J-Link 烧）、`zephyr.elf`（gdb 用）。
+
+想连警告一起当错误（CI 应该这么跑）：
+
+```bash
+... west build ... -- -DCONFIG_COMPILER_WARNINGS_AS_ERRORS=y
+```
+
+**从零装工具链**（换机器时）：
+
+```bash
+apt-get install -y git cmake ninja-build gperf ccache dfu-util \
+    device-tree-compiler wget python3-dev python3-venv xz-utils file \
+    make gcc gcc-multilib g++-multilib libsdl2-dev libmagic1
+python3 -m venv /opt/zephyrtool && /opt/zephyrtool/bin/pip install west
+mkdir -p /opt/ncs && cd /opt/ncs
+/opt/zephyrtool/bin/west init -m https://github.com/nrfconnect/sdk-nrf --mr v3.4.0 .
+/opt/zephyrtool/bin/west update -o=--depth=1 -n --narrow
+/opt/zephyrtool/bin/pip install -r zephyr/scripts/requirements-base.txt \
+    -r zephyr/scripts/requirements-build-test.txt \
+    -r nrf/scripts/requirements-base.txt
+# Zephyr SDK：只要 minimal + ARM 工具链，不用下全套 3 GB
+mkdir -p /opt/zephyr-sdk && cd /opt/zephyr-sdk
+B=https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v1.0.1
+curl -L -o min.tar.xz $B/zephyr-sdk-1.0.1_linux-x86_64_minimal.tar.xz
+curl -L -o arm.tar.xz $B/toolchain_gnu_linux-x86_64_arm-zephyr-eabi.tar.xz
+tar xf min.tar.xz && tar xf arm.tar.xz -C zephyr-sdk-1.0.1
+cd zephyr-sdk-1.0.1 && ./setup.sh -t arm-zephyr-eabi -h -c
+```
+
+⚠ **NCS 版本不能随便降。** 这块板子的 board 定义
+（`boards/others/promicro_nrf52840/`）是 **Zephyr 4.1 才进上游的**，
+对应 NCS ≥ v3.1.0；v2.x 上 `-b promicro_nrf52840` 直接找不到板子。
+（实测：upstream v3.7.0/v4.0.0 都是 404，v4.1.0 起才有。）
+
+配置项（设备 id、MQTT 主机、口令）要填：
+
+```bash
+/opt/zephyrtool/bin/west build -t menuconfig -d /tmp/bbuild   # 或直接改 prj.conf
 ```
 
 必填的四项（`Kconfig` 里都有说明）：
@@ -49,16 +100,20 @@ west build -t menuconfig      # 或直接改 prj.conf / 加 -DCONFIG_...
 | `EBIKE_MQTT_PORT` | 默认 8883 |
 | `EBIKE_MQTT_PASSWORD` | `ebike-server init` 打印的那一串，只显示一次 |
 
-⚠ **烧录前先读 UICR**（§3.3 / §3.4）：用 NFC 引脚要写 `UICR.NFCPINS`，那是**一次性**的。
+⚠ **本方案不用 NFC 引脚**（开锁改走 BLE，见 [`ADR-004`](ADR-004-ble-unlock.md)），
+所以 `UICR.NFCPINS` **不需要写**，那个一次性动作整个消失。
+
+但二手板或刷过其它固件的板子可能已经被改过，那会让 P0.09/P0.10 不是普通 GPIO
+（本工程把它们留作余量，见 DESIGN.md §3.5）。先读一眼，只在确实被改过时才恢复：
 
 ```bash
-nrfjprog -f NRF52 --memrd 0x1000120C     # 先看现状
-# 要改回 GPIO 只能 --recover，而它会连带擦掉 REGOUT0（3.3V 设置）
+nrfjprog -f NRF52 --memrd 0x1000120C     # 读 UICR.NFCPINS 看现状
+# 只有需要改回 GPIO 时才做下面两步：--recover 会连带擦掉 REGOUT0（3.3V 设置）
 nrfjprog -f NRF52 --recover
 nrfjprog -f NRF52 --program nice_nano_bootloader-0.6.0_s140_6.1.1.hex --chiperase
 ```
 
-不重刷 bootloader 板子起不来——`--recover` 之后 REGOUT0 回落到 1.8 V。
+**做了 `--recover` 就必须重刷 bootloader**，否则 REGOUT0 回落到 1.8 V，板子起不来。
 
 ## 3. 已知没做完的
 
@@ -66,9 +121,9 @@ nrfjprog -f NRF52 --program nice_nano_bootloader-0.6.0_s140_6.1.1.hex --chiperas
 
 | # | 缺什么 | 后果 | 在哪 |
 | --- | --- | --- | --- |
-| 1 | **断线重连阶梯** | 现在只有「重跑整个开机流程」一档。真正需要的是 MQTT 重连 → CIPSHUT 重拨 → 模组重启三级 | `modem.c` 末尾第 1 条 |
+| ~~1~~ | ~~**断线重连阶梯**~~ | ✅ **2026-09-03 已修**：`modem_reconnect()` 三级 —— **1 级** 只重建 MQTT 会话（`MDISCONNECT` → `stage_session`，~5~10 s）；**2 级** 加 `CIPSHUT` + 重新附着（~15~70 s）；**3 级** `CPOWD` + PWRKEY 硬关机 + 完整重跑（~30~90 s）。`modem_connect()` 拆成 `stage_boot`/`stage_attach`/`stage_session` 三段供阶梯复用。**不做无限重试** —— 三级全败就返回错误让上层放弃本轮（§4.4：死循环会抽干车电池）。`connected` 从裸 `bool` 改成 `atomic_t`。`uplink.c` 的 `publish_retry()` 按 `modem_is_connected()` 而非 `rc` 决定要不要重连（-E2BIG/-ENOMEM 重连一百次也没用）。5 条 ztest（假模组 + AT 命令 trace）钉住「只重跑坏掉的那一层」，3 个变异体全被抓 | `firmware/tests/modem_reconnect` |
 | 2 | **睡眠仲裁器 + RI 监听** | 省电档下第一条 AT 命令可能丢。**依赖 MAIN_DTR/MAIN_RI 脚号，而那个至今无来源**（§8.7 硬门禁 / §11 #18）。而且 overlay 里的 `modem_ri` 节点**没有任何 C 代码取用** —— `AT+CFGRI=1` 发了但主控侧没人监听那根线，「模组主动唤醒主控」目前是半条链 | 同上第 2 条 / overlay |
-| 3 | **NITZ → Unix 秒换算** | 所有上行的 `t` 都是 0。功能不坏（服务端用 `t_srv` 落库，契约 §5.6），但设备日志里没有绝对时间 | 同上第 3 条 |
+| ~~3~~ | ~~**NITZ → Unix 秒换算**~~ | ✅ **2026-09-03 已修**：`parse_modem_time()` 走 `timeutil_timegm64()`。两条要命的规则来自合宙 AT 手册 V1.6.8：**±zz 单位是 1/4 小时**（东八区 `+32` 不是 `+08`，当小时读差 24 h）、**hh:mm:ss 是本地时间必须减偏移**（不减差 8 h，⚠ 与 nRF91 相反，别照抄 NCS `date_time_modem.c`）。顺带修掉两个静默 bug：URC 前缀是 `+NITZ:` 不是 `+CTZV:`（这家族没有 CTZV，旧代码永远匹配不上）、`AT+CTZR=1` 是只读命令发过去只会回 ERROR。11 条 ztest 钉住，4 个变异体全部被抓 | `firmware/tests/modem_time` |
 | 4 | **证书灌入**（`AT+FSCREATE`/`AT+FSWRITE`） | **这是 R6 的阻塞项**：`AT+SSLCFG="cacert",0,"ca.crt"` 引用的文件必须先在模组 FS 里，而现在没有任何代码灌它。**注意这条命令现在失败即中止连接**（以前是静默忽略），所以证书没灌就连不上，症状很明确 | 同上第 4 条 / §8.8 / §11 #24 |
 | 5 | **PSM+ / PRO 双档** | 只有「连上」和「关机」两态。`dn/cmd` 的 `tier` 指令会明确 ack 失败而不是假装成功 | 同上第 5 条 / §11 #20 |
 | 6 | **QoS1 超时重发队列** | 靠 `SEND OK` 一次确认，没有重发。这就是 §11 #22「设备侧要不要做补发队列」落地的位置 | 同上第 6 条 |
@@ -89,6 +144,49 @@ nrfjprog -f NRF52 --program nice_nano_bootloader-0.6.0_s140_6.1.1.hex --chiperas
 | **console 会抢 uart0 或起 USB** | 板级默认把 console 挂到 **USB CDC ACM** 并开机就初始化 USB 栈（毫安级，而本设计 USB 口根本不引出）。改成 RTT —— J-Link 本来就是必备工具 |
 | **死代码** | `motion_prepare_for_sleep()`（空壳，注释还声称"驱动已经配好了不用额外动作"，那是错的）、overlay 里 6 个无人使用的 alias（7 个里只留 `motion-int`，因为 `enter_system_off()` 真的用 `DT_ALIAS` 取它）、`NVSTORE_USERS_VERSION`（定义了但不参与校验，现在真的写进落盘块并校验）、`firmware/luatos/` 空目录、`contract.py` 的 `sub_all_up()`、`web_assets.py` 的遗留占位标记 |
 
+### 3c. 第一次真编译暴露的 6 个（2026-09-02，全部已修）
+
+按危险程度排。**前两个最值得记住 —— 它们编得过、跑得起来，只是功能不工作。**
+
+| # | 问题 | 症状 | 为什么之前查不出来 |
+| --- | --- | --- | --- |
+| 1 | **`CONFIG_LIS2DW12_WAKEUP` 没开** | `SENSOR_TRIG_MOTION` 整段裹在 `#ifdef CONFIG_LIS2DW12_WAKEUP` 里（`lis2dw12_trigger.c:172-180`），`sensor_trigger_set()` 返回 **-ENOTSUP** → `motion_init()` 直接失败 → **唤醒源根本不存在**，整机只能靠定时器醒，省电模式全废 | 只开了 `SLEEP`。两个 Kconfig 名字太像，而 `SLEEP` 又确实是 STATIONARY 要的 |
+| 2 | **运动阈值单位错了 9.8 倍** | `SENSOR_ATTR_UPPER_THRESH` 的单位是 **m/s²**，驱动按 `sensor_ms2_to_mg()` 反算（`lis2dw12.c:240`）。原代码把 mg 直接塞进 `val1/val2` → 150 mg 传进去变成 **15 mg** → 低于一格 31.25 mg → 寄存器写 0 → **传感器持续触发**，等于常开上报 | 纯语义错误，类型对、编译过、`sensor_attr_set()` 还返回 0 |
+| 3 | **overlay 文件名少了 `_uf2`** | board target 是 `promicro_nrf52840/nrf52840/uf2`，Zephyr 按 `zephyr_build_string()` 找 `promicro_nrf52840_nrf52840_uf2.overlay`。名字不对时**静默忽略整个 overlay**，编译期报 `__device_dts_ord_DT_N_ALIAS_motion_int_... undeclared` | 文件名规则依赖 board variant，没编译过就看不出来 |
+| 4 | **overlay 少 include `dt-bindings/sensor/lis2dw12.h`** | `power-mode = <LIS2DW12_DT_LP_M1>` 里那个宏没定义 → `parse error: expected number or parenthesized expression` | 板级 DTS 不会带这个头进来 |
+| 5 | **`CONFIG_HWINFO` 没写** | 只写了注释「`HWINFO_NRF` 是 default y，不用显式写」—— **错的**：`Kconfig.nrf` 是 rsource 在 `if HWINFO` 里面的，父开关不开子默认值不生效。链接期 `undefined reference to z_impl_hwinfo_get_reset_cause` | 那条注释是照着 Kconfig 文件读出来的，漏看了 `if HWINFO` 这一层 |
+| 6 | **`CONFIG_BASE64` 没开** | 默认 n。链接期 `undefined reference to base64_decode`（proto.c 解 `dn/secret` 的密钥要用） | 同上，是「以为默认开着」 |
+
+第 1、2 条现在各有一条测试钉着
+（`test_kconfig_symbols_that_are_link_time_landmines` /
+`test_motion_threshold_uses_ms2_conversion`），第 3、4 条也有
+（`test_board_overlay_filename_matches_board_target` /
+`test_overlay_includes_lis2dw12_dt_bindings`）。
+
+### 3d. 顺带定掉的一个历史悬案：INT1/INT2 路由（§11 #2）
+
+读 NCS v3.4.0 的驱动源码定论，**ADR-002 §1.6 是对的**：
+
+| 触发 | 驱动写哪个寄存器 | 走哪根线 |
+| --- | --- | --- |
+| `SENSOR_TRIG_MOTION` | `ctrl4_int1_pad_ctrl.int1_wu` | **INT1** |
+| `SENSOR_TRIG_STATIONARY` | `ctrl5_int2_pad_ctrl.int2_sleep_chg` | **INT2** |
+
+出处 `lis2dw12_trigger.c:77-98`（两处 `route_set` 是不同寄存器）。
+
+**而本板只接了 INT1**，所以 STATIONARY 的中断线物理上不存在。
+更麻烦的是：`sensor_trigger_set(STATIONARY)` 会**返回 0** ——
+驱动只写寄存器，从不检查那根引脚接没接。这是「配置成功、事件永不到达」。
+
+当前处理：**不依赖它**。`main.c` 的 IDLE 判定用 `last_still_ms` 时间戳，
+STATIONARY 只是挂上去（多写一个寄存器位，无害），日志里明确说了它不会来。
+三条出路（接第二根线 / 写 `CTRL_REG7.int2_on_int1` 越过驱动 / 纯软件计时）
+记在 `motion.h` 的头注释里，R2 拍板。
+
+⚠ 附带发现：芯片支持把 INT2 事件并到 INT1（HAL 有
+`lis2dw12_all_on_int1_set()`），**但 Zephyr 驱动从不调它，也没有对应的
+DTS 属性** —— 走这条路必须自己越过驱动直接写 I2C 寄存器。
+
 ## 4. R0 阶段必须先验的两件事
 
 这两条来自 §8.7，都是**硬门禁**，不验就往下做会白干：
@@ -105,17 +203,54 @@ nrfjprog -f NRF52 --program nice_nano_bootloader-0.6.0_s140_6.1.1.hex --chiperas
 顺带 R1 的那条也别忘：**板子到手第一件事是测静态电流**（§3.4 第 3 条）。
 同款克隆板实测过 0.42 µA / 7~8 µA / 750 µA 三种结果。
 
-## 5. 还没定的硬件会影响哪些代码
+## 5. BabbleSim 运行时测试：开锁通道
+
+`firmware/tests/ble_unlock_bsim/` —— 把**真固件的开锁模块**放进 2.4 GHz 射频
+仿真里跑一遍。两个仿真设备：`d=0` 跑 `ble_unlock.c` + `unlock.c`（peripheral），
+`d=1` 假装手机（central）。被测代码是 `firmware/nrf52840/src` 下的原件，
+一行都没为测试改过。
+
+```bash
+export ZEPHYR_BASE=/opt/ncs/zephyr
+export BSIM_OUT_PATH=/opt/ncs/tools/bsim
+export BSIM_COMPONENTS_PATH=$BSIM_OUT_PATH/components
+/opt/zephyrtool/bin/west build -p always -b nrf52_bsim/native \
+    -d /tmp/btest firmware/tests/ble_unlock_bsim
+firmware/tests/ble_unlock_bsim/run.sh /tmp/btest
+```
+
+**当前结果：两侧都 Passed。** 8 条断言，逐条说明它防什么：
+
+| # | 断言 | 防什么 |
+| --- | --- | --- |
+| 1 | MTU 协商后可写 ≥ 30 字节 | prj.conf 那两行 MTU 被人改小 → UNLOCK APDU 装不下（实测 MTU=40，可写 37） |
+| 2 | 服务与两个特征可发现，属性正确 | CMD 必须有 WRITE、RSP 必须有 NOTIFY 且**不可读**（可读会泄露上一次应答） |
+| 3 | **不订阅 CCCD 就收不到应答** | 钉住 `BT_GATT_ENFORCE_SUBSCRIPTION` 的行为，也是「每次连接多一个往返」那个代价的来源 |
+| 4 | 坏 MAC → `69 82` | 三重校验的第一条 |
+| 5 | 合法 UNLOCK → `90 00` + 开锁回调 | 主路径真的通（前 4 条全是拒绝路径，不验这条就可能「一律拒绝」也全绿） |
+| 6 | **原样重放 → `69 82`** | §5.1 的底线「嗅探到一次完整交互也不能再开一次」的唯一可执行证明 |
+| 7 | 新 nonce + 旧 counter → `69 82` | 证明拒绝来自 **counter 严格递增**，不只是 nonce 一次性 |
+| 8 | counter 递增后 → `90 00` | 证明 6、7 不是「坏了所以全拒」 |
+
+仿真验不了的：引脚接线、静态电流、CC310 硬件路径（bsim 上 PSA 落到 Oberon
+软件驱动）、GNSS/4G 的 UART 时序。那些是 R0~R1 的事。
+
+**写这个测试本身抓到一个 bug**（不在固件里，在测试的 central 侧，但手机 App
+会犯同一个错）：GATT 表里 **RSP 排在 CMD 前面**（服务定义顺序是 RSP、CCC、CMD），
+所以「先按 UUID 找 CMD、再从它后面找 RSP」永远找不到 —— 症状是
+`cmd=21 rsp=0`。正确做法是一次性枚举服务里的所有特征。**这条要写进 App 文档。**
+
+## 6. 还没定的硬件会影响哪些代码
 
 | 待决项 | 影响的文件 | 现在按什么假设写的 |
 | --- | --- | --- |
 | 锁用电磁锁还是电机锁（§7 第 1 条） | `lock.c` | 一根线、高有效、500 ms 脉冲。电机锁要改成半桥两根线 |
-| LIS2DW12 INT1/INT2 路由矛盾（§3.7 / §11 #2） | `motion.c`、overlay | 都挂 INT1。如果 `SENSOR_TRIG_STATIONARY` 返回 `-ENOTSUP`，就是这个矛盾的实证——`motion.c` 里那条 `LOG_WRN` 会指出来 |
-| GPIO 分配（§3.5 只有 19 个可用） | overlay | 用了 17 个。锁要 3 根线的话是 19/19 零余量，INT2 就没地方接了 |
+| LIS2DW12 STATIONARY 走 INT2 而本板只接 INT1（§3d） | `motion.c`、overlay | **已定论**：MOTION 在 INT1（可用），STATIONARY 在 INT2（线没接，事件不会来）。当前不依赖它，静止判定用 `last_still_ms` 软件计时。要真用得接第二根线或越过驱动写 `CTRL_REG7.int2_on_int1` |
+| GPIO 分配（§3.5 现在有 21 个可用） | overlay | 用了 17 个，余 4 个（BLE 不占引脚，P0.09/P0.10 释放）。锁要 3 根线也装得下 |
 | ADC 脚 | overlay | P0.31(AIN7)。只有 3 个真 ADC 脚，ZMK 的 A6~A10 别名不是 SAADC 通道 |
-| **电池采样分压比**（§3.6 / §11 #27） | `battery.c`、overlay | **现在是错的：2:1 分压配 58.8 V 会灌 29.4 V 到 P0.31，烧芯片。** overlay 写的 `output-ohms=1M / full-ohms=2M`，而 ADC 满量程只有 3.6 V（内部参考 0.6 V + gain 1/6）→ 需要 ≥16.33:1。**焊上现在这个就烧，布板前必须改。** 代码侧不用动：`DIVIDER_RATIO` 是从 DTS 属性算出来的 |
+| ~~电池采样分压比~~（§3.6 / §11 #27） | `battery.c`、overlay | ✅ **已定并已改**：**21:1**（`output-ohms=470000` / `full-ohms=4.7M+4.7M+470k`）。基准是引脚上限 **VDD 3.3 V**（不是 ADC 满量程 3.6 V —— 那是绝对最大值，按它算零余量）。`battery.c` 两条 `BUILD_ASSERT` 把比例和源阻抗（≤800 kΩ）钉成编译错误，都实测触发过。换算走 `voltage_divider_scale_dt()`。**电池不是 48 V 的话改 `PACK_MAX_MV`** |
 
-## 6. 两个「决定不做」的，理由记在这里
+## 7. 两个「决定不做」的，理由记在这里
 
 **1. 不报芯片温度**（`tmp` 字段整个缺席，契约 §5.3 允许省）。
 

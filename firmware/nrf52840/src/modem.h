@@ -34,6 +34,19 @@ int modem_init(modem_dn_cb cb);
 /* 开机 + 附着网络 + 连 MQTT（含 TLS）。整个过程可能几十秒。**阻塞**。 */
 int modem_connect(void);
 
+/* 掉线后恢复。三级阶梯，从最便宜的开始，只有失败才往下走：
+ *
+ *   1 级 MQTT 会话     ~5~10 s   服务端重启、keepalive 超时、TLS 会话过期
+ *   2 级 PDP 重拨      ~15~70 s  承载被运营商拆了（`+PDP DEACT`）
+ *   3 级 模组重启      ~30~90 s  模组卡死，AT 都不应答
+ *
+ * **不做无限重试**：三级都失败就返回错误，由调用方放弃本轮、关掉模组
+ * 等下一个上报周期。在这里死循环会把车电池抽干（§4.4：设备没有独立电源）。
+ *
+ * 只在 `modem_is_connected()` 变 false 之后调用；模组从没连过就用
+ * `modem_connect()`。**阻塞**，最坏约 3 分钟。 */
+int modem_reconnect(void);
+
 /* 断开 MQTT 并关机。省电档的默认状态。 */
 int modem_disconnect(void);
 

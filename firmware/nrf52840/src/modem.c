@@ -7,13 +7,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <time.h>
 
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/spinlock.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/sys/ring_buffer.h>
+#include <zephyr/sys/timeutil.h>
 
 LOG_MODULE_REGISTER(modem, CONFIG_EBIKE_LOG_LEVEL);
 
@@ -35,9 +39,19 @@ static struct k_sem rx_sem;
 static struct k_mutex at_lock;
 
 static modem_dn_cb dn_cb;
-static bool connected;
+/* MQTT 会话是否可用。**必须是 atomic**：掉线 URC 在 poll 线程里清它，
+ * modem_publish / uplink 在上报线程里读它。原来是裸 `bool`，
+ * 那是「一个线程写、另一个线程读」的非同步共享 —— 在 Cortex-M 上
+ * 单字节读写不会撕裂，所以实际不会出错，但编译器有权把它缓存在寄存器里，
+ * 于是「URC 说掉线了而循环里的 connected 还是 true」是合法优化结果。 */
+static atomic_t connected;
+/* 模组时间。两个字段必须成对读写 —— 拆开读会拿到「新 utc 配旧 uptime」，
+ * 算出来的时间比真值差一整个上报周期。URC 在 poll 线程里写，
+ * modem_utc() 在上报线程里读，所以要一把锁；用 spinlock 而不是 at_lock，
+ * 因为 at_lock 会被一条 AT 命令占住几秒。 */
+static struct k_spinlock time_lock;
 static uint32_t nitz_utc;
-static int64_t nitz_uptime;   /* 拿到 NITZ 时的 uptime，用来推算当前时间 */
+static int64_t nitz_uptime;   /* 拿到时间时的 uptime，用来推算当前时间 */
 
 /* 下行 URC 的解析缓冲。放静态区而不是栈上：LINE_MAX + payload 可能上 KB。 */
 static char dn_topic[288];
@@ -205,27 +219,120 @@ static bool handle_disconnect_urc(const char *line)
 	for (size_t i = 0; i < ARRAY_SIZE(patterns); i++) {
 		if (strstr(line, patterns[i]) != NULL) {
 			LOG_WRN("模组报掉线：%s", line);
-			connected = false;
+			atomic_set(&connected, 0);
 			return true;
 		}
 	}
 	return false;
 }
 
+/* --- 模组时间 → Unix 秒 ------------------------------------------------------ */
+
+/* 早于这个时刻的一概丢掉。模组没跟网络同步时会给出一个格式合法但年份很早的
+ * 日期，而上报一个 2018 年的时间戳比上报 0 更糟 —— 契约 §5.6 的语义是
+ * 「不知道就填 0」，不是「填一个看起来像时间的数」。
+ *
+ * 门槛取 2024-01-01 的理由：手册自己的例子用的是 2018 年
+ * （`+CCLK: "18/08/07,13:28:31+32"`），这大概就是未同步时的量级；
+ * 而厂商 2024-11 的实机抓图必须被接受 —— 它是本文件那两条换算规则的
+ * 唯一实证来源，测试直接拿它当基准值。
+ * ⚠ 门槛定得比实测数据还晚会把真数据判成脏数据。第一版写 2025-01-01，
+ * 测试当场红了，就是这个错。 */
+#define MIN_PLAUSIBLE_UTC 1704067200LL   /* 2024-01-01T00:00:00Z */
+
+/* 解析模组的时间串 → Unix 秒。两个来源同一个格式：
+ *   AT+CCLK?  → `+CCLK: "yy/MM/dd,hh:mm:ss±zz"`      ← 带引号
+ *   URC       → `+NITZ:yy/MM/dd,hh:mm:ss±zz,<ds>`    ← 不带引号，尾部多个 ds
+ *
+ * 两个**不知道就一定算错**的点，都出自合宙 Cat.1 AT 命令手册 V1.6.8：
+ *
+ * 1. **±zz 的单位是 1/4 小时，不是小时。** 东八区是 `+32`，不是 `+08`。
+ *    §3.12 原文：「时区(用当地时间和GMT 时间之间的差别来表示，
+ *    以1/4 小时格式来表示；范围-47...+48)」。另有两处互证：厂商 NTP 教程
+ *    「实际上时区范围（-12~12）……所以将整个时区范围扩展 4 倍」；
+ *    `+NITZ` 的 `<ds>` 表写「+1 小时(等于 4 个 quarter in <tz>)」。
+ *    当成小时读 → 差 24 小时。
+ *
+ * 2. **hh:mm:ss 是本地时间，偏移已经加进去了**，所以要**减**回去。
+ *    证据是厂商 NTP 教程里两张 LLCOM 抓图：主机 Beijing 时钟
+ *    `[2024/11/06 09:47:14]` 发 `AT+CCLK?`，模组答 `"24/11/06,09:47:13+32"`
+ *    —— 两边一致；若模组给的是 UTC，应该答 01:47。
+ *    ⚠ **这一条和 nRF91 相反**：NCS 的 `date_time_modem.c` 把它的 CCLK
+ *    当 UTC，不做偏移。照抄那份代码到这块模组上就是 8 小时误差。
+ *
+ * `<ds>`（夏令时）刻意不看：按 `<ds>` 表的说明，夏令时调整已经折进 zz 了。
+ */
+static int parse_modem_time(const char *s, uint32_t *out)
+{
+	/* 跳到第一个数字。CCLK 带引号、NITZ 不带，跳过去就统一了。 */
+	while (*s != '\0' && (*s < '0' || *s > '9')) {
+		s++;
+	}
+
+	unsigned int yy, mm, dd, hh, mi, ss;
+	int zz = 0;
+	int n = sscanf(s, "%2u/%2u/%2u,%2u:%2u:%2u%3d",
+		       &yy, &mm, &dd, &hh, &mi, &ss, &zz);
+	/* 6 个也收：手册没写上电默认值，而 27.007 允许省掉末尾三个字符，
+	 * 所以时区缺失按偏移 0 处理，而不是把整条丢掉。 */
+	if (n != 6 && n != 7) {
+		return -EINVAL;
+	}
+
+	/* timeutil_timegm64() **不做任何范围检查**（读过 lib/utils/timeutil.c：
+	 * 就是一个多项式，没有校验、没有 errno），所以校验必须在这里做完。 */
+	if (mm < 1 || mm > 12 || dd < 1 || dd > 31 ||
+	    hh > 23 || mi > 59 || ss > 59 || zz < -48 || zz > 48) {
+		return -EINVAL;
+	}
+
+	struct tm tm = {
+		.tm_year = (int)yy + 2000 - 1900,   /* tm_year 从 1900 起算 */
+		.tm_mon  = (int)mm - 1,             /* tm_mon 是 0~11 */
+		.tm_mday = (int)dd,
+		.tm_hour = (int)hh,
+		.tm_min  = (int)mi,
+		.tm_sec  = (int)ss,
+	};
+	/* tm_wday / tm_yday / tm_isdst 不用填：timeutil_timegm64() 只读上面六个。 */
+
+	int64_t epoch = timeutil_timegm64(&tm) - (int64_t)zz * 900;
+	if (epoch < MIN_PLAUSIBLE_UTC) {
+		return -EINVAL;
+	}
+
+	*out = (uint32_t)epoch;
+	return 0;
+}
+
+/* 解析成功就采纳；失败只 warn —— 时间拿不到不影响任何功能（契约 §5.6：t 填 0）。 */
+static void note_modem_time(const char *src, const char *s)
+{
+	uint32_t utc = 0;
+	if (parse_modem_time(s, &utc) != 0) {
+		LOG_WRN("%s 的时间串没解出来（模组多半还没跟网络同步）：%s", src, s);
+		return;
+	}
+
+	K_SPINLOCK(&time_lock) {
+		nitz_utc = utc;
+		nitz_uptime = k_uptime_get();
+	}
+	LOG_INF("%s 时间已采纳：Unix %u", src, utc);
+}
+
 static bool handle_time_urc(const char *line)
 {
-	/* +CTZV / *PSUTTZ 之类的时间 URC。格式随固件版本变，
-	 * 这里只认最常见的 +CCLK 风格 "yy/MM/dd,hh:mm:ss±zz"。 */
-	const char *p = strchr(line, '"');
-	if (strncmp(line, "+CTZV:", 6) != 0 && strstr(line, "PSUTTZ") == NULL) {
+	/* ⚠ 这个模组家族**没有 `+CTZV`**（274 页手册全文 grep 零命中），
+	 * 时间 URC 叫 `+NITZ:`。上一版认的 `+CTZV:` 和 `*PSUTTZ` 都是别家模组的，
+	 * 在这里永远匹配不上 —— 也就是说「靠 URC 更新时间」这条路当时是断的。
+	 *
+	 * `AT+CTZR`（NITZ URC 上报）**缺省就是打开的**，而且手册明写
+	 * 「该命令不支持设置，仅支持查询」，所以不需要也不能去配它。 */
+	if (strncmp(line, "+NITZ:", 6) != 0) {
 		return false;
 	}
-	if (p == NULL) {
-		return true;
-	}
-	/* 完整的 NITZ → Unix 秒换算要处理时区和闰年，留给 modem_utc 用
-	 * AT+CCLK? 主动查一次，比在 URC 里解析可靠。 */
-	LOG_DBG("收到时间 URC，稍后用 AT+CCLK? 取准确值");
+	note_modem_time("NITZ URC", line + 6);
 	return true;
 }
 
@@ -317,7 +424,7 @@ static int at_query(const char *cmd, char *resp, size_t resp_len)
 	return at_cmd_expect(cmd, "OK", AT_TIMEOUT_MS, resp, resp_len);
 }
 
-/* --- 开机 ------------------------------------------------------------------- */
+/* --- 开机 / 关机 ------------------------------------------------------------- */
 
 static int power_on(void)
 {
@@ -344,6 +451,20 @@ static int power_on(void)
 	}
 	LOG_ERR("模组开机后 15 s 内无响应");
 	return -ETIMEDOUT;
+}
+
+/* 硬关机：PWRKEY 拉低。用在两处 ——
+ *   modem_disconnect() 的 AT+CPOWD=1 失败时；
+ *   modem_reconnect() 的 3 级（模组卡死到 AT 都不应答，软关机没意义）。
+ *
+ * 手册对 PWRKEY 关机脉宽没给单独的数（只写了开机 >1 s），
+ * 这里沿用开机的 1.5 s。返回值刻意不看：走到这里已经是兜底路径，
+ * 连 GPIO 都失败的话也没有下一招。 */
+static void power_off_hard(void)
+{
+	(void)gpio_pin_set_dt(&pwrkey, 1);   /* ACTIVE_LOW，1 = 拉低 */
+	k_sleep(K_MSEC(1500));
+	(void)gpio_pin_set_dt(&pwrkey, 0);
 }
 
 /* --- 公开接口 --------------------------------------------------------------- */
@@ -376,7 +497,20 @@ int modem_init(modem_dn_cb cb)
 	return 0;
 }
 
-int modem_connect(void)
+/* --- 连接的三个阶段 ---------------------------------------------------------
+ *
+ * 拆成三段不是为了好看，是因为**重连时该从哪一段重来，取决于坏在哪**：
+ *
+ *   stage_boot     开机 + 串口/唤醒配置      —— 只有模组本身死了才需要重跑
+ *   stage_attach   等 CGREG + 取时间          —— PDP/承载出问题才需要重跑
+ *   stage_session  TLS + MQTT + 订阅          —— 单纯 MQTT 掉线只需要这一段
+ *
+ * 9600 baud 下这个区别是实打实的时间：stage_boot 里的开机等待最坏 15 s、
+ * stage_attach 里的附着轮询最坏 60 s，而 stage_session 大约 5~10 s。
+ * 每次掉线都从 stage_boot 重来，等于把一次 5 秒的恢复做成 80 秒。
+ */
+
+static int stage_boot(void)
 {
 	int rc = power_on();
 	if (rc != 0) {
@@ -401,7 +535,11 @@ int modem_connect(void)
 		LOG_ERR("AT^WAKEUPHEX 不可用 —— 每条 URC 都会唤醒主控，"
 			"功耗预算会崩（DESIGN.md §8.7），且没有替代手段");
 	}
+	return 0;
+}
 
+static int stage_attach(void)
+{
 	/* 等网络附着。CREG/CGREG 到 1 或 5（本地/漫游注册）。
 	 * 冷启动附着可能几十秒，所以单独给 60 秒。 */
 	bool attached = false;
@@ -421,15 +559,27 @@ int modem_connect(void)
 	}
 	LOG_INF("网络已附着");
 
-	/* 拿运营商时间（免费、无往返，§8.1）。契约 §5.6：拿不到就上报 t=0。 */
-	(void)at_cmd("AT+CTZR=1");
-	char clk[64] = { 0 };
-	if (at_query("AT+CCLK?", clk, sizeof(clk)) == 0) {
-		LOG_INF("模组时间：%s", clk);
-		/* NITZ → Unix 秒的换算见 modem_utc() 的注释：本版未实现，
-		 * 所以 nitz_utc 保持 0，上行的 t 就是 0。 */
+	/* 拿运营商时间（免费、无往返，§8.1）。契约 §5.6：拿不到就上报 t=0。
+	 *
+	 * ⚠ 上一版这里发 `AT+CTZR=1`，那是错的：手册写「该命令不支持设置，
+	 * 仅支持查询。缺省为打开」—— 发过去只会换回一个 ERROR。
+	 * `AT+CTZU`（NITZ 自动更新）缺省也是使能。两条都不用配，已删除；
+	 * 9600 baud 下每条无用命令都是实打实的往返时间。
+	 *
+	 * 已经有时间了就跳过 —— 重连时没必要再花一个往返（NITZ URC 也会推）。 */
+	if (modem_utc() == 0) {
+		char clk[64] = { 0 };
+		if (at_query("AT+CCLK?", clk, sizeof(clk)) == 0) {
+			note_modem_time("AT+CCLK?", clk);
+		} else {
+			LOG_WRN("AT+CCLK? 失败 —— 上行的 t 会是 0（契约 §5.6）");
+		}
 	}
+	return 0;
+}
 
+static int stage_session(void)
+{
 	/* TLS 配置。证书用 AT+FSWRITE 预先写进模组 FS（§8.2），
 	 * 本函数假设已经写好 —— 灌证书是产线动作，不是每次连接都做。
 	 * ⚠ 契约 §2 把设备侧从双向 TLS 降级成「TLS + 口令」，
@@ -439,7 +589,7 @@ int modem_connect(void)
 	 * cacert 静默失败 → 没有可信根；seclevel 静默失败而模组默认 0
 	 * → **TLS 退化成「加密但不认证」，中间人可以冒充服务端收走位置、
 	 * 下发伪造的开锁指令**。宁可连不上也不要连上一个不认证的通道。 */
-	rc = at_cmd("AT+SSLCFG=\"cacert\",0,\"ca.crt\"");
+	int rc = at_cmd("AT+SSLCFG=\"cacert\",0,\"ca.crt\"");
 	if (rc != 0) {
 		LOG_ERR("配 CA 失败 —— ca.crt 是否已用 AT+FSWRITE 写进模组 FS？"
 			"（DESIGN.md §8.8 的产线动作）");
@@ -522,39 +672,121 @@ int modem_connect(void)
 		return rc;
 	}
 
-	connected = true;
+	atomic_set(&connected, 1);
 	LOG_INF("MQTT 已连接");
 	return 0;
 }
 
+int modem_connect(void)
+{
+	int rc = stage_boot();
+	if (rc != 0) {
+		return rc;
+	}
+	rc = stage_attach();
+	if (rc != 0) {
+		return rc;
+	}
+	return stage_session();
+}
+
+/* --- 断线重连阶梯 ------------------------------------------------------------
+ *
+ * 三级，从最便宜的开始，只有失败才往下走。设计依据是「哪一层坏了」：
+ *
+ *   1 级 MQTT 会话     ~5~10 s   服务端重启、keepalive 超时、TLS 会话过期
+ *   2 级 PDP 重拨      ~15~70 s  承载被运营商拆了（`+PDP DEACT`）
+ *   3 级 模组重启      ~30~90 s  模组自己卡死，AT 都不应答
+ *
+ * 为什么不无脑走 3 级：9600 baud 下 3 级最坏 90 秒，而 1 级能解决的情况
+ * （服务端重启、keepalive 超时）在实际运行里是最常见的那一类。
+ * 把 5 秒的活干成 90 秒，代价不只是时间 —— 那 90 秒里模组是全功率的
+ * （§4.1b 唤醒尾巴约 22 mA），直接吃车电池。
+ *
+ * 为什么每级之前都要先拆干净：AT 版 MQTT 的会话状态在模组里，
+ * 不先 `AT+MDISCONNECT` / `AT+CIPSHUT` 就重连，模组会用「已经有连接」
+ * 拒掉新的 `AT+SSLMIPSTART`。拆的命令一律 `(void)` —— 本来就可能因为
+ * 「没连接可拆」而返回 ERROR，那不是失败。
+ *
+ * ⚠ 不做无限重试。三级都失败就返回错误，让上层（uplink_cycle）放弃本轮、
+ * 关掉模组等下一个周期 —— 那才是省电的行为。**在这里死循环重试会把
+ * 车电池抽干**，而设备没有独立电源（§4.4）。
+ */
+
+/* 每级之间的等待。运营商侧的问题（拆承载、限速）往往几秒后自己就好了，
+ * 立刻重试只是把同一个失败再撞一次。 */
+#define RECONNECT_BACKOFF_MS 3000
+
+int modem_reconnect(void)
+{
+	LOG_WRN("开始断线重连阶梯");
+
+	/* --- 1 级：只重建 MQTT 会话 --------------------------------------- */
+	atomic_set(&connected, 0);
+	(void)at_cmd("AT+MDISCONNECT");
+	if (stage_session() == 0) {
+		LOG_INF("重连成功（1 级：MQTT 会话）");
+		return 0;
+	}
+	LOG_WRN("1 级重连失败，升级到 PDP 重拨");
+	k_sleep(K_MSEC(RECONNECT_BACKOFF_MS));
+
+	/* --- 2 级：拆掉承载重新附着 --------------------------------------- */
+	atomic_set(&connected, 0);
+	(void)at_cmd("AT+MDISCONNECT");
+	(void)at_cmd("AT+CIPSHUT");
+	if (stage_attach() == 0 && stage_session() == 0) {
+		LOG_INF("重连成功（2 级：PDP 重拨）");
+		return 0;
+	}
+	LOG_WRN("2 级重连失败，升级到模组重启");
+	k_sleep(K_MSEC(RECONNECT_BACKOFF_MS));
+
+	/* --- 3 级：整个模组断电重启 --------------------------------------- */
+	atomic_set(&connected, 0);
+	/* 软关机可能因为模组已经卡死而不应答，所以不看返回值，
+	 * 后面 power_off_hard() 无条件走一遍 PWRKEY。 */
+	(void)at_cmd("AT+CPOWD=1");
+	power_off_hard();
+	/* 关机后要等内部电源真的塌下去，否则下一次 PWRKEY 会被当成
+	 * 「已经开机」而不触发开机。手册没给这个时间，取 2 s 是保守值。 */
+	k_sleep(K_SECONDS(2));
+
+	int rc = modem_connect();
+	if (rc == 0) {
+		LOG_INF("重连成功（3 级：模组重启）");
+		return 0;
+	}
+	LOG_ERR("三级重连全部失败 rc=%d —— 放弃本轮，等下个上报周期", rc);
+	return rc;
+}
+
 int modem_disconnect(void)
 {
-	if (connected) {
+	if (atomic_get(&connected) != 0) {
 		(void)at_cmd("AT+MDISCONNECT");
 		(void)at_cmd("AT+CIPSHUT");
-		connected = false;
+		atomic_set(&connected, 0);
 	}
 	/* 关机而不是进 PSM+：契约 §4.1 说了默认档是模组关机，
 	 * 下行靠服务端排队等设备下次上线（不靠 broker retain）。 */
 	int rc = at_cmd("AT+CPOWD=1");
 	if (rc != 0) {
 		LOG_WRN("软关机失败 rc=%d，改用 PWRKEY", rc);
-		(void)gpio_pin_set_dt(&pwrkey, 1);
-		k_sleep(K_MSEC(1500));
-		(void)gpio_pin_set_dt(&pwrkey, 0);
+		power_off_hard();
 	}
 	return 0;
 }
 
 bool modem_is_connected(void)
 {
-	return connected;
+	return atomic_get(&connected) != 0;
 }
 
 int modem_publish(const char *topic, const uint8_t *payload, size_t len,
 		  int qos)
 {
-	if (!connected) {
+	if (atomic_get(&connected) == 0) {
 		return -ENOTCONN;
 	}
 	if (len > PROTO_MAX_PAYLOAD) {
@@ -662,12 +894,22 @@ int modem_csq(void)
 
 uint32_t modem_utc(void)
 {
-	if (nitz_utc == 0) {
+	uint32_t base;
+	int64_t taken_at;
+
+	K_SPINLOCK(&time_lock) {
+		base = nitz_utc;
+		taken_at = nitz_uptime;
+	}
+
+	if (base == 0) {
 		return 0;   /* 契约 §5.6：不知道就填 0，别猜 */
 	}
-	/* 用 uptime 差补上从拿到 NITZ 到现在的时间 */
-	int64_t elapsed_ms = k_uptime_get() - nitz_uptime;
-	return nitz_utc + (uint32_t)(elapsed_ms / 1000);
+	/* 用 uptime 差补上从拿到时间到现在的这段。
+	 * 模组关机档下这段可能很长，误差随之累积 —— 这正是契约要求服务端
+	 * 用 t_srv 落库、t_dev 只作诊断的原因（§5.6）。 */
+	int64_t elapsed_ms = k_uptime_get() - taken_at;
+	return base + (uint32_t)(elapsed_ms / 1000);
 }
 
 int modem_lbs(double *lat, double *lon, float *acc_m)
@@ -716,21 +958,19 @@ int modem_lbs(double *lat, double *lon, float *acc_m)
  * 按 payload 长度算的发送超时、开机波特率训练。
  *
  * **还缺的，按重要性排**：
- *
- * 1. **断线重连阶梯**。现在 connected=false 之后靠上层重新调 modem_connect()，
- *    那会走完整的开机流程。真正需要的是分级恢复：
- *    MQTT 重连 → CIPSHUT + 重拨 PDP → 整个模组重启。
- * 2. **睡眠仲裁器**。每次写 AT 之前要判断模组醒没醒（§8.5），
+ * 1. **睡眠仲裁器**。每次写 AT 之前要判断模组醒没醒（§8.5），
  *    没醒要先用 UART 字节或 DTR 唤醒。当前实现假设模组一直是醒的，
  *    所以省电档下第一条命令可能丢。
  *    ⚠ 这一条依赖 MAIN_DTR 的脚号，而那个**至今无来源**（§8.7 硬门禁 / §11 #18）。
- * 3. **NITZ → Unix 秒的换算**。现在 nitz_utc 永远是 0，所以所有上行的 t 都是 0。
- *    服务端用 t_srv 落库（契约 §5.6），所以功能上没坏，但设备侧日志里没有绝对时间。
- * 4. **证书灌入**（AT+FSCREATE / AT+FSWRITE）。本文件假设证书已在模组 FS 里。
+ * 2. **证书灌入**（AT+FSCREATE / AT+FSWRITE）。本文件假设证书已在模组 FS 里。
  *    谁在产线上做这一步、私钥以什么形式存在，四份历史文档都没写（§8.8 / §11 #24）。
- * 5. **PSM+ / PRO 双档切换**（§8.4 / §11 #20）。现在只有「连上」和「关机」两态。
- * 6. **QoS1 的重发与 packet id 跟踪**。现在靠 "SEND OK" 一次确认，
+ * 3. **PSM+ / PRO 双档切换**（§8.4 / §11 #20）。现在只有「连上」和「关机」两态。
+ * 4. **QoS1 的重发与 packet id 跟踪**。现在靠 "SEND OK" 一次确认，
  *    没有超时重发队列 —— 契约 §9.1 那个「设备侧要不要做补发队列」的待决项（§11 #22）
  *    就落在这里。
+ *
+ * **已补上的**：
+ *   - NITZ/CCLK → Unix 秒换算（`parse_modem_time()`）
+ *   - 断线重连三级阶梯（`modem_reconnect()`，测试见 firmware/tests/modem_reconnect）
  */
 

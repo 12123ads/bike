@@ -1,0 +1,37 @@
+/*
+ * native_sim 上顶掉 modem.c 的两个硬件依赖。
+ *
+ * modem.c 要 `DT_NODELABEL(uart1)` 和 `DT_NODELABEL(modem_pwrkey)`。
+ * 真板子上前者是 nRF52840 的 UARTE1、后者是一根 GPIO；这里换成
+ * uart-emul 和 gpio-emul，两者都能在主机上跑。
+ *
+ * ⚠ 必须**改写** native_sim 自带的 uart1，不能新建一个同名 label 的节点 ——
+ * native_sim.dts 里已经有 `uart1: uart_1`（zephyr,native-pty-uart，默认
+ * disabled），再声明一个会得到
+ * `devicetree error: Label 'uart1' appears on /uart-emul and on /uart_1`。
+ *
+ * ⚠ 波特率写 0（uart-emul 自己的测试也是这么写的）—— 仿真不模拟时序，
+ * 9600 那个数字在这里没有意义。测试也不依赖时序：它直接把字节塞进
+ * emul 的 RX FIFO。
+ */
+
+&uart1 {
+	compatible = "zephyr,uart-emul";
+	status = "okay";
+	current-speed = <0>;
+	rx-fifo-size = <256>;
+	tx-fifo-size = <256>;
+};
+
+/ {
+	ebike_outputs {
+		compatible = "gpio-leds";
+
+		/* PWRKEY。真板子上是 ACTIVE_LOW（开集拉低开机），
+		 * 这里极性无关紧要 —— 测试不碰 power_on()。 */
+		modem_pwrkey: modem_pwrkey {
+			gpios = <&gpio0 12 GPIO_ACTIVE_LOW>;
+			label = "Air780EP PWRKEY";
+		};
+	};
+};

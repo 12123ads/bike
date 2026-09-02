@@ -130,7 +130,7 @@ def build_app(svc: Service, cfg: ServerConfig) -> FastAPI:
             # 契约 §6.1：远程开锁绕过 §5.2 的挑战应答，默认关闭
             raise HTTPException(
                 status_code=403,
-                detail="远程开锁已禁用。它绕过 NFC 挑战应答，"
+                detail="远程开锁已禁用。它绕过 BLE 挑战应答，"
                        "打开需要在配置里设 allow_remote_unlock=true")
         dn_id = await svc.enqueue_cmd(dev, cmd, args)
         return {"queued": dn_id, "dev": dev, "cmd": cmd}

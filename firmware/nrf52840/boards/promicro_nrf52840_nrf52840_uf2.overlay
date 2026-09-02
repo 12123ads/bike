@@ -4,13 +4,23 @@
  * ⚠ 两处必须自己确认的（DESIGN.md §3.4 / §3.5）：
  *
  * 1. **pinctrl 冲突**：上游 promicro_nrf52840-pinctrl.dtsi 的 uart0 是
- *    TX=P0.09 / RX=P0.10，而这两个脚是 NFC1/NFC2。下面把 uart0 挪到
- *    P0.06/P0.08，并新开 uart1 给 Air780EP。**引脚号是按 J2/J4 的可用脚挑的，
- *    实物到手要对着板子核一遍。**
+ *    TX=P0.09 / RX=P0.10。下面把 uart0 挪到 P0.06/P0.08，并新开 uart1
+ *    给 Air780EP。**引脚号是按 J2/J4 的可用脚挑的，实物到手要对着板子核一遍。**
+ *    （挪开的原始理由是 P0.09/P0.10 要给 NFCT；开锁改走 BLE 之后那两个脚
+ *    自由了，但这里不挪回去 —— 已核过的引脚分配没有理由再动一次。
+ *    它们现在是**余量**，见下。）
  *
- * 2. **GPIO 余量是 19 个**（21 可用 − NFCT 占 2）。下面用掉 17 个。
- *    如果锁要 3 根线，就是 19/19 零余量，INT2 那根潜在的第二中断线没地方接。
+ * 2. **GPIO 余量是 21 个**（NFCT 不再占用 P0.09/P0.10 —— BLE 用片上无线，
+ *    不吃引脚）。下面用掉 17 个，余 4 个：锁要 3 根线也装得下，
+ *    INT2 那根潜在的第二中断线也有地方接。
  */
+
+/* `power-mode` / `wakeup-duration` 用的是 LIS2DW12 的 dt-bindings 宏，
+ * 而板级 DTS 不会带进这个头 —— 不显式 include 就是一个
+ * 「expected number or parenthesized expression」的 devicetree parse error。
+ * 其余宏（GPIO_ACTIVE_*、NRF_PSEL、NRF_SAADC_*、I2C_BITRATE_*）由
+ * 板级 DTS / SoC dtsi 一路带进来，不用再 include。 */
+#include <zephyr/dt-bindings/sensor/lis2dw12.h>
 
 / {
 	aliases {
@@ -66,8 +76,10 @@
 			label = "lock actuator";
 		};
 
-		/* 电池采样分压的门控 MOSFET。1M+1M 分压对 58.8V 是 29 µA 常流，
-		 * 比整机静态电流大一个量级，所以只在测的瞬间开（DESIGN.md §3.6）。 */
+		/* 电池采样分压的门控 MOSFET。分压器常通是 5.96 µA @58.8 V
+		 * （4.7M+4.7M/470k，见下面 vbatt 节点），和 nRF52840 自己
+		 * GPIOTE PORT 的 2.36 µA 同一量级，所以只在测的瞬间开
+		 * （DESIGN.md §3.6）。 */
 		batt_gate: batt_gate {
 			gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
 			label = "battery divider gate";
@@ -113,12 +125,32 @@
 
 	/* 电池电压采样。ADC 只有 3 个真脚（DESIGN.md §3.5）：
 	 * P0.02(AIN0) / P0.29(AIN5) / P0.31(AIN7)。用 P0.31。
-	 * ZMK 的 A6~A10 别名不是 SAADC 通道，别当模拟脚用。 */
+	 * ZMK 的 A6~A10 别名不是 SAADC 通道，别当模拟脚用。
+	 *
+	 * 分压比 **21:1** —— 上臂 4.7M + 4.7M 串联，下臂 470k。三个约束定的：
+	 *
+	 * 1. **引脚不能烧**。本板 REGOUT0=3V3 → VDD = 3.3 V 是工作上限
+	 *    （nRF52840 PS v1.1 Table 172）；Table 173 的绝对最大是
+	 *    VDD+0.3 = 3.6 V，但那是「短时暴露不永久损坏」，不是可用范围。
+	 *    58.8 V / 21 = 2800 mV，1% 电阻最坏偏差下 2856 mV，余 444 mV。
+	 *    要顶到 3.3 V 得电池到 68 V。
+	 *    ⚠ 上一版是 1M/1M（2:1），58.8 V 会往 P0.31 灌 29.4 V —— **焊上就烧**。
+	 * 2. **源阻抗 ≤ 800 kΩ**，否则下面那个 40 µs 采集时间不成立
+	 *    （PS v1.1 §6.23.10.1 的 tACQ 表：10k→3 µs … 800k→40 µs）。
+	 *    Rs = 9.4M ‖ 470k = 448 kΩ ✓。这条否掉了 20M/1M（Rs 952 kΩ 超标）。
+	 * 3. **单只电阻的耐压**。上臂拆两只，每只只担 28 V。单只 15M 要担 56 V，
+	 *    而 0603 厚膜的 Max. RCWV 是 75 V、0402 只有 50 V —— 余量太薄。
+	 *    拆成两只之后封装随便选。
+	 *
+	 * 21:1 恰好整除（9.87M / 470k = 21），但代码不依赖这一点：
+	 * battery.c 走 voltage_divider_scale_dt()（int64），非整数比例同样准。
+	 *
+	 * ⚠ 换电池规格必须重算 —— BUILD_ASSERT 的输入 `PACK_MAX_MV` 在 battery.c。 */
 	vbatt: vbatt {
 		compatible = "voltage-divider";
 		io-channels = <&adc 7>;
-		output-ohms = <1000000>;
-		full-ohms = <2000000>;
+		output-ohms = <470000>;
+		full-ohms = <(4700000 + 4700000 + 470000)>;
 		power-gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
 	};
 };
@@ -128,6 +160,14 @@
 	#address-cells = <1>;
 	#size-cells = <0>;
 
+	/* gain 1/6 + 内部参考 600 mV → ADC 满量程 3600 mV
+	 * （nrfx `ANALOG_REF_INTERNAL_VAL = 600`，非 nRF54 分支）。
+	 * 注意满量程 3600 mV 只是**转换器**的上限，引脚的上限是 VDD = 3300 mV，
+	 * 两者不是一回事 —— 分压比按 3300 mV 算，见 vbatt 节点第 1 条。
+	 *
+	 * 40 µs 采集时间对应源阻抗 ≤ 800 kΩ（PS v1.1 §6.23.10.1）。
+	 * 本分压的 Rs = 448 kΩ，也满足 20 µs（≤400 kΩ）—— 但采样是几分钟
+	 * 一次的事，多花 20 µs 换余量，不优化。 */
 	channel@7 {
 		reg = <7>;
 		zephyr,gain = "ADC_GAIN_1_6";
@@ -184,8 +224,9 @@
 };
 
 &pinctrl {
-	/* ⚠ 把 uart0 从 P0.09/P0.10 挪开 —— 那两个脚给 NFCT 了。
-	 * 上游 promicro_nrf52840-pinctrl.dtsi 的默认值会和 NFC 撞（DESIGN.md §3.4）。 */
+	/* ⚠ uart0 不能用上游默认的 P0.09/P0.10：那是本工程留出来的余量脚
+	 * （原本给 NFCT，见文件头 §1），而且 SPI1 的默认 MOSI 也在 P0.10。
+	 * 挪到 P0.06/P0.08（DESIGN.md §3.4）。 */
 	uart0_default: uart0_default {
 		group1 {
 			psels = <NRF_PSEL(UART_TX, 0, 6)>;
@@ -238,7 +279,8 @@
 	};
 };
 
-/* SPI1 在 ZMK 的默认 pinctrl 里把 MOSI 放在 P0.10 —— 和 NFC2 撞，关掉。 */
+/* SPI1 在 ZMK 的默认 pinctrl 里把 MOSI 放在 P0.10 —— 本工程不用 SPI，关掉，
+ * 顺带把 P0.10 留作余量脚（文件头 §2）。 */
 &spi1 {
 	status = "disabled";
 };

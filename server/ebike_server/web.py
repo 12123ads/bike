@@ -171,7 +171,7 @@ def build_web_router(svc: Service, cfg: ServerConfig) -> APIRouter:
         if cmd == "unlock" and not cfg.allow_remote_unlock:
             raise HTTPException(
                 status_code=403,
-                detail="远程开锁已禁用（它绕过 NFC 挑战应答）。"
+                detail="远程开锁已禁用（它绕过 BLE 挑战应答）。"
                        "要用请在配置里设 allow_remote_unlock=true")
         dn_id = await svc.enqueue_cmd(device_id, cmd)
         return {"queued": dn_id, "cmd": cmd}

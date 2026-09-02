@@ -291,7 +291,7 @@ int unlock_init(void)
 	if (n == 0) {
 		/* DESIGN.md §5.4 第 2 条：离线首次配对没有方案。
 		 * 当前假设第一把密钥随固件烧进去，没有就只能等 4G 下发。 */
-		LOG_WRN("一把密钥都没有 —— NFC 开锁不可用，只能用机械钥匙");
+		LOG_WRN("一把密钥都没有 —— BLE 开锁不可用，只能用机械钥匙");
 	}
 	unlock_session_reset();
 	return 0;

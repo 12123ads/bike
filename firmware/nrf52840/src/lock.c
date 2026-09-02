@@ -30,8 +30,8 @@ void lock_set_callback(lock_state_cb cb)
 }
 
 /* 脉冲结束，撤掉驱动信号。
- * 用延迟工作而不是在 lock_unlock 里 k_sleep：开锁是从 NFC 回调链上来的，
- * 那条路径上阻塞 500 ms 会让手机的 presence check 超时断链。 */
+ * 用延迟工作而不是在 lock_unlock 里 k_sleep：开锁是从 GATT 回调派生的
+ * work handler 链上来的，那条路径上阻塞 500 ms 会拖住整条开锁应答。 */
 static void release_work_fn(struct k_work *work)
 {
 	ARG_UNUSED(work);

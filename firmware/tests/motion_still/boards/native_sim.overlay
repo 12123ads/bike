@@ -1,0 +1,39 @@
+/*
+ * native_sim 上顶掉 motion.c 的硬件依赖。
+ *
+ * motion.c 只要 `DT_NODELABEL(lis2dw12)`。这里把它挂到 i2c_emul 上，
+ * 中断线接 gpio_emul —— 两者都能在主机上跑。
+ *
+ * ⚠ 属性名是 `irq-gpios`，**不是** `int1-gpios`（真 overlay 里有同样的注释）。
+ * ⚠ `int-pin = <1>` 必须和真 overlay 一致：驱动用它决定把 wu 路由到
+ *    INT1 还是 INT2，而本方案只接 INT1。
+ * ⚠ `power-mode` / `odr` / `range` / `wakeup-duration` 都照抄真 overlay ——
+ *    阈值换算依赖 `range`（一格 = FS/64），改了测试的边界断言就失真。
+ */
+
+#include <zephyr/dt-bindings/gpio/gpio.h>
+#include <zephyr/dt-bindings/i2c/i2c.h>
+#include <zephyr/dt-bindings/sensor/lis2dw12.h>
+
+/ {
+	i2c_emul: i2c@400 {
+		compatible = "zephyr,i2c-emul-controller";
+		status = "okay";
+		reg = <0x400 4>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		clock-frequency = <I2C_BITRATE_STANDARD>;
+
+		lis2dw12: lis2dw12@19 {
+			compatible = "st,lis2dw12";
+			status = "okay";
+			reg = <0x19>;
+			irq-gpios = <&gpio0 11 GPIO_ACTIVE_HIGH>;
+			int-pin = <1>;
+			odr = <12>;
+			range = <2>;
+			power-mode = <LIS2DW12_DT_LP_M1>;
+			wakeup-duration = <LIS2DW12_DT_WAKEUP_2_ODR>;
+		};
+	};
+};

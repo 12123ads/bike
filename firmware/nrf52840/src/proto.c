@@ -19,13 +19,13 @@ static const char *const event_names[] = {
 	[EV_UNLOCK_DENY] = "unlock_deny",
 	[EV_LOCK_STATE]  = "lock_state",
 	[EV_LOWBATT]     = "lowbatt",
-	[EV_NFC_ERR]     = "nfc_err",
+	[EV_BLE_ERR]     = "ble_err",
 };
 
 const char *proto_event_name(enum proto_event ev)
 {
 	if ((size_t)ev >= ARRAY_SIZE(event_names) || event_names[ev] == NULL) {
-		return "nfc_err";   /* 不该发生；退化成一个合法值而不是发出非法报文 */
+		return "ble_err";   /* 不该发生；退化成一个合法值而不是发出非法报文 */
 	}
 	return event_names[ev];
 }

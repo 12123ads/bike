@@ -16,7 +16,7 @@ target_sources(app PRIVATE
     src/nvstore.c
     src/crypto.c
     src/unlock.c
-    src/nfc_tag.c
+    src/ble_unlock.c
     src/motion.c
     src/battery.c
     src/lock.c
