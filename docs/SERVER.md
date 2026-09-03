@@ -172,19 +172,19 @@ FastAPI 默认在这三个地址**无鉴权**公开完整 schema，包括 `/cmd/
 cd server && ../.venv/bin/python -m pytest -q
 ```
 
-**301 条全过、1 条跳过**（本机实测，约 30 秒）。分九层：
+**313 条全过、1 条跳过**（本机实测，约 31 秒）。分九层：
 
 | 文件 | 条数 | 测什么 |
 | --- | --- | --- |
-| `test_firmware_contract.py` | 68 | **固件 C 源码和服务端的契约一致性**（文本层交叉检查，见 [`FIRMWARE.md`](FIRMWARE.md)）。含下行大小上限三处数字自洽（`LINE_MAX` / `PROTO_MAX_DN_PAYLOAD` / `MAX_DOWNLINK_BYTES`） |
-| `test_contract.py` | 55 | 契约编解码。重点在**拒绝路径**——畸形报文被放过去会一路污染到 HA。含 `dn/secret` 的 `k` 必须是 base64 的恰好 32 字节、下行大小上限 |
-| `test_web.py` | 34 | 网页鉴权边界、cookie 标记、登录限速、高德 key 读取失败要 warn |
+| `test_firmware_contract.py` | 70 | **固件 C 源码和服务端的契约一致性**（文本层交叉检查，见 [`FIRMWARE.md`](FIRMWARE.md)）。含下行大小上限三处数字自洽、下行只入队不就地投递 |
+| `test_contract.py` | 57 | 契约编解码。重点在**拒绝路径**——畸形报文被放过去会一路污染到 HA。含 `dn/secret` 的 `k` 必须是 base64 的恰好 32 字节、下行大小上限、`dn/cmd` 的 `a` 逐指令闭集 |
+| `test_web.py` | 36 | 网页鉴权边界、cookie 标记、登录限速（含伪造 XFF 绕不过、逐出不清封禁）、高德 key 读取失败要 warn |
+| `test_store_derive.py` | 32 | SQLite 去重、下行队列顺序与 id 跨重启唯一、`interval` 回写、在线判定、移动判定、坐标转换、prune 后文件真的缩小 |
 | `test_ha_contract.py` | 32 | **HA 集成和服务端的契约一致性**，见 [`HA.md`](HA.md) §6 |
-| `test_store_derive.py` | 30 | SQLite 去重、下行队列顺序与 id 跨重启唯一、`interval` 回写、在线判定、移动判定、坐标转换 |
-| `test_api.py` | 29 | 鉴权、参数边界、远程开锁默认关、密钥不回显、`/health` 不泄露、交互式文档已关、超限下行是 400 而非 500、`init` 必须写全每个配置字段 |
+| `test_api.py` | 29 | 鉴权、参数边界、远程开锁默认关、密钥不回显、`/health` 不泄露、交互式文档已关、坏 args 是 400 而非 500、`init` 必须写全每个配置字段 |
 | `test_e2e.py` | 23 | 真起 broker + 真 MQTT 客户端：ACL 拦得住吗、跨设备 id 灌数据挡不挡、retain 发给后连上的吗、下行队列真的冲刷吗、遗嘱链路通不通、并发下 state/下行会不会乱序或死锁 |
-| `test_web_frontend.py` | 17 | **前端 JS**：`node --check`、坐标转换和服务端逐点比对、假 DOM 渲染、恶意事件 detail 渲染后不产生真实元素。见 [`WEB.md`](WEB.md) §7 |
-| `test_certs.py` | 14 | 真的 TLS 握手、证书 CN、私钥权限 0600、换 CA 连不上、**mTLS 模式端到端**、每个 listener 都有连接数上限且真传到 broker |
+| `test_web_frontend.py` | 19 | **前端 JS**：`node --check`、坐标转换和服务端逐点比对、假 DOM 渲染、恶意事件 detail 渲染后不产生真实元素、每个 `innerHTML` sink 都转义或纯字面量。见 [`WEB.md`](WEB.md) §7 |
+| `test_certs.py` | 16 | 真的 TLS 握手、证书 CN、私钥权限 0600、换 CA 连不上、**mTLS 模式端到端**、每个 listener 都有连接数上限、ACL 里没有 `svc` 全权限账号 |
 
 几条值得单独提的：
 

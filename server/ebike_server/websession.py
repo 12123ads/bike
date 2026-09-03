@@ -73,37 +73,50 @@ class LoginThrottle:
 
     API token 是 24 字节 urlsafe（约 190 bit），暴力破解本来就不现实，
     但**没有限速的登录接口会变成一个放大器** —— 每次请求都做一次
-    `compare_digest`，攻击者可以用它来打满 CPU。这里按来源 IP 限速。
+    `compare_digest`，攻击者可以用它来打满 CPU。这里按来源限速。
 
-    ⚠ 审计 M6 的两条修复：
-    1. `_fails` 曾经只增不清（过期条目仅在**同一 IP 再次失败**时顺带
-       清理）—— 伪造 X-Forwarded-For 的请求每次换一个值就能无界增长。
-       现在 `blocked()` 顺带做全局清理，且总条目数有硬上限。
-    2. XFF 可伪造是已知的（web.py 只拿它做限速）；真正的兜底是这里的
-       总量上限 —— 就算攻击者轮换 XFF 绕过限速，内存也不会被吃掉。
+    键是**真实 socket 地址**（`web.py` 的 `rate_key`），不是任何请求头。
+    审计 R2：曾经优先用 `X-Forwarded-For`，那等于把限速的键交给攻击者 ——
+    实测每个请求换一个 XFF 值，连打 60 次错 token 一个 429 都没有。
+
+    条目总数有硬上限（`max_tracked_ips`），否则来源轮换能把表撑爆。
+    **逐出时跳过已达上限的键**（审计 R2）：按「最旧」丢会让灌表的一方
+    把真实用户已经攒够的失败记录清掉，那样上限本身就成了绕过限速的手段。
     """
 
     max_attempts: int = 10
     window: int = 300
-    #: _fails 的总条目上限（不同 IP 数）。真实用户是个位数；
-    #: 超过它意味着有人在轮换伪造来源，按最旧的丢。
+    #: _fails 的总条目上限（不同来源数）。真实用户是个位数；
+    #: 超过它意味着来源在轮换。
     max_tracked_ips: int = 1024
 
     _fails: dict[str, list[float]] = field(default_factory=dict)
 
+    def _recent(self, ip: str, now: float) -> list[float]:
+        return [t for t in self._fails.get(ip, []) if now - t < self.window]
+
     def _prune_all(self, now: float) -> None:
-        """清掉所有过期条目；超上限时丢最旧的 IP 键。"""
+        """清掉所有过期条目；仍然超上限时丢最旧的**未被封**的键。
+
+        已达 `max_attempts` 的键不参与逐出 —— 它们正是限速要生效的对象。
+        全都被封时宁可让表停在上限之上（每条只是几个 float），
+        也不清掉任何一个正在生效的封禁。
+        """
         for ip in [k for k, v in self._fails.items()
                    if not any(now - t < self.window for t in v)]:
             del self._fails[ip]
+
         while len(self._fails) >= self.max_tracked_ips:
-            oldest = min(self._fails, key=lambda k: self._fails[k][0])
-            del self._fails[oldest]
+            evictable = [k for k in self._fails
+                         if len(self._recent(k, now)) < self.max_attempts]
+            if not evictable:
+                return
+            del self._fails[min(evictable, key=lambda k: self._fails[k][0])]
 
     def blocked(self, ip: str) -> bool:
         now = time.time()
         self._prune_all(now)
-        hits = [t for t in self._fails.get(ip, []) if now - t < self.window]
+        hits = self._recent(ip, now)
         self._fails[ip] = hits
         return len(hits) >= self.max_attempts
 

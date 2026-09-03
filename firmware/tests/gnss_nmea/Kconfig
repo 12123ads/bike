@@ -1,0 +1,10 @@
+# gnss.c 需要的项目 Kconfig 符号。
+#
+# 真固件的定义在 firmware/nrf52840/Kconfig；gnss.c 只用到日志等级。
+
+config EBIKE_LOG_LEVEL
+	int "本项目模块的日志等级"
+	default 4
+	range 0 4
+
+source "Kconfig.zephyr"

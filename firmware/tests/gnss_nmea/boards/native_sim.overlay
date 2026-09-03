@@ -1,0 +1,44 @@
+/*
+ * native_sim 上顶掉 gnss.c 的两个硬件依赖。
+ *
+ * gnss.c 要 `DT_NODELABEL(uart0)`（NMEA 串口）和 `DT_NODELABEL(gnss_power)`
+ * （电源门控脚）。
+ *
+ * ⚠ **改写的是 uart0**，而 native_sim.dts 把它当 console
+ *   （`zephyr,console = &uart0`）—— 所以 prj.conf 里必须
+ *   `CONFIG_UART_CONSOLE=n` + `CONFIG_POSIX_ARCH_CONSOLE=y`，
+ *   把 ztest 的输出改走宿主 stdout。不然 console 和被测串口是同一个
+ *   uart-emul，喂进去的 NMEA 会和测试输出混在一起。
+ *   （modem_* 那几个测试没这个问题：modem.c 用的是 uart1。）
+ *
+ * ⚠ 必须**改写**已有节点而不是新建同名 label：native_sim.dts 里已经有
+ *   `uart0: uart`，再声明一个会得到
+ *   `devicetree error: Label 'uart0' appears on ...` 。
+ *
+ * ⚠ 波特率写 0（uart-emul 自己的测试也是这么写的）—— 仿真不模拟时序。
+ *
+ * FIFO 给 1024：NMEA 一行最长 82 字节，但测试会连喂多行，留足余量。
+ */
+
+#include <zephyr/dt-bindings/gpio/gpio.h>
+
+&uart0 {
+	compatible = "zephyr,uart-emul";
+	status = "okay";
+	current-speed = <0>;
+	rx-fifo-size = <1024>;
+	tx-fifo-size = <1024>;
+};
+
+/ {
+	ebike_outputs {
+		compatible = "gpio-leds";
+
+		/* GNSS 电源门控。真板子上是高电平开，这里极性无关紧要 ——
+		 * gpio-emul 只需要这根脚存在且可写。 */
+		gnss_power: gnss_power {
+			gpios = <&gpio0 13 GPIO_ACTIVE_HIGH>;
+			label = "GNSS power gate";
+		};
+	};
+};

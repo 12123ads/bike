@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import re
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -286,6 +287,64 @@ def test_throttle_returns_429(tmp_path):
         assert r.status_code == 429
         # 限速期间连**正确**的 token 也进不去 —— 否则限速可以被绕过
         assert c.post("/ui/login", json={"token": TOKEN}).status_code == 429
+
+
+def test_forged_forwarded_for_cannot_bypass_throttle(tmp_path):
+    """审计 R2：限速的键必须是真实 socket 地址，不能是 `X-Forwarded-For`。
+
+    旧实现里 `client_ip()` 优先返回 XFF 的第一段，注释写的是「伪造它最多
+    是绕过自己的限速」。那句话是错的：限速的作用对象就是攻击者。实测每次
+    换一个 XFF 值可以无限次试 token —— 60 次里一个 429 都没有。
+
+    这条测试的判据是「换头不影响封禁」，而不是「XFF 不出现在日志里」。
+    """
+    cfg = ServerConfig(
+        db_path=str(tmp_path / "t.db"), api_token=TOKEN,
+        mqtt=MqttConfig(plain_bind="", tls_bind=""),
+        web=WebConfig(gaode_key_file=""),
+        devices=[DeviceConfig(id="bike01")],
+    )
+    svc = Service(cfg)
+    app = build_app(svc, cfg)
+    with TestClient(app) as c:
+        codes = [
+            c.post("/ui/login", json={"token": "wrong"},
+                   headers={"X-Forwarded-For": f"10.9.{i // 256}.{i % 256}"}).status_code
+            for i in range(20)
+        ]
+        assert 429 in codes, \
+            f"每次换一个伪造 XFF 就绕过了限速：{sorted(set(codes))}"
+        # 封禁之后，再换一个从没出现过的 XFF 仍然应该被挡
+        r = c.post("/ui/login", json={"token": "wrong"},
+                   headers={"X-Forwarded-For": "203.0.113.99"})
+        assert r.status_code == 429, "换个新 XFF 就解封了"
+        # 正确 token 也进不去 —— 限速是按来源的，不看凭据
+        assert c.post("/ui/login", json={"token": TOKEN},
+                      headers={"X-Forwarded-For": "198.51.100.1"}).status_code == 429
+
+
+def test_throttle_eviction_does_not_clear_active_blocks():
+    """审计 R2 的第二半：`max_tracked_ips` 上限不能变成绕过手段。
+
+    旧实现按「最旧的键」逐出，于是灌表的一方能把真实用户已经攒够的失败
+    记录清掉 —— 上限本身成了清除封禁的工具。现在已达上限的键不参与逐出。
+    """
+    t = LoginThrottle(max_attempts=3, window=300, max_tracked_ips=8)
+    for _ in range(3):
+        t.record_failure("victim")
+    assert t.blocked("victim")
+
+    # 灌远超上限的不同来源
+    for i in range(50):
+        t.record_failure(f"10.0.{i // 256}.{i % 256}")
+
+    assert t.blocked("victim"), \
+        "灌表把已生效的封禁挤掉了 —— 上限成了绕过限速的手段"
+    # 上限仍然在起作用：未被封的键不会无界堆积
+    unblocked = sum(1 for k in t._fails
+                    if len(t._recent(k, time.time())) < t.max_attempts)
+    assert unblocked <= t.max_tracked_ips, \
+        f"未被封的条目 {unblocked} 超过上限 —— 内存无界增长"
 
 
 # --- 关掉网页 ---------------------------------------------------------------

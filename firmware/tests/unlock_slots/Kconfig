@@ -1,0 +1,8 @@
+# unlock.c / crypto.c 需要的项目 Kconfig 符号。
+
+config EBIKE_LOG_LEVEL
+	int "本项目模块的日志等级"
+	default 4
+	range 0 4
+
+source "Kconfig.zephyr"

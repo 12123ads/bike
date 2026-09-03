@@ -196,7 +196,8 @@ DTS 属性** —— 走这条路必须自己越过驱动直接写 I2C 寄存器�
 ```bash
 export ZEPHYR_BASE=/opt/ncs/zephyr
 export ZEPHYR_SDK_INSTALL_DIR=/opt/zephyr-sdk/zephyr-sdk-1.0.1
-for t in modem_time modem_downlink motion_still modem_reconnect; do
+for t in modem_time modem_downlink motion_still modem_reconnect \
+         gnss_nmea uplink_events unlock_slots; do
     /opt/zephyrtool/bin/west build -p always -b native_sim -d /tmp/t_$t \
         firmware/tests/$t && /tmp/t_$t/$t/zephyr/zephyr.exe
 done
@@ -205,11 +206,14 @@ done
 | 目录 | 测什么 | 结果 |
 | --- | --- | --- |
 | `modem_time` | NITZ 串 → Unix 秒（±zz 是 1/4 小时、hh:mm:ss 是本地时间），以及「宁可上报 0 也不上报像时间的错数」的拒绝路径 | 11 passed |
-| `modem_downlink` | **下行 URC 解析 + AT 应答匹配**（2026-09-03 审计 M1/M2） | 9 passed |
+| `modem_downlink` | **下行 URC 解析 + AT 应答匹配 + 下行不在命令流里就地投递**（审计 M1/M2/R1） | 12 passed |
 | `motion_still` | 运动/静止状态机与软件静止计时 | 4 passed |
 | `modem_reconnect` | 三级重连阶梯「只重跑坏掉的那一层」 | 5 passed |
+| `gnss_nmea` | NMEA 校验和**真的挡住坏行**、ddmm.mmmm 换算、南纬西经取负、quality=0 不当定位（审计 R4） | 11 passed |
+| `uplink_events` | 事件队列**发送期间不持 `ev_lock`**、发失败留到下一轮、`dn/secret` 接线（审计 M3） | 7 passed |
+| `unlock_slots` | 密钥槽位复用**不继承旧 counter**、同 uid 轮换**保留** counter（审计 M7） | 8 passed |
 
-`modem_downlink` 为什么值得单独一套：它盯的两条都**编得过、跑得起来、
+`modem_downlink` 为什么值得单独一套：它盯的三条都**编得过、跑得起来、
 只是静默做错事** —— 和 §3c 里最难抓的那两个同型。
 
 - **M1 行缓冲**：`LINE_MAX=512` 只能收 236 B 下行，而 `dn_payload` 按 3900 B
@@ -223,10 +227,29 @@ done
   命令答到——`AT+CPOWD=1` 没执行却返回成功，**模组不关机、持续耗电**。
   现在 expect 恰好是 `"OK"` 时要求整行相等；调用方显式等 `SEND OK` 的
   子串匹配路径不受影响（两条测试分别钉住这两侧）。
+- **R1 重入**（第二轮审计，最严重的一条）：`handle_msub` 就地调 `dn_cb`，
+  而 `consume_urc` 的两个调用点都**持 `at_lock`**（`at_cmd_expect` 等应答的
+  循环、`modem_publish` 等裸 `>` 的循环）。于是「一条 AT 命令在飞」时收到
+  下行 → `ack_downlink` → **重入 `modem_publish` 自身**。两个后果实测：
+  static `hexbuf` 被内层覆盖（外层声明 41 字节却只写出 36 个 HEX 字符，
+  模组从下一条命令的字节里补齐）；`k_mutex` 同线程可重入所以不死锁、
+  只是无界递归 —— 按编译产物量的真实帧大小是每层 880 B，第 5 层越过
+  `UPLINK_STACK_SIZE`(4096)。而 `RESET_ON_FATAL_ERROR` 没开、没有看门狗，
+  爆栈 = `arch_system_halt()` 死转 = **车变砖直到人工断电**。
+  触发条件是常态：设备上线时服务端一次性冲刷全部未确认下行，积 4 条就到。
+  现在 `handle_msub` 只入队（4 槽位环形队列），`dn_cb` 只在 `modem_poll()`
+  的 `deliver_downlinks()` 里调 —— 那里不持锁、也不在任何命令流里。
 
-**变异体验证**：把 M1、M2 两处改回修复前的写法重编，
-`test_stale_send_ok_does_not_answer_next_command` 和
-`test_stale_connect_ok_does_not_answer_next_command` 立刻红（7 passed / 2 failed）。
+**变异体验证**（每一条都真的跑过）：
+
+| 改回旧写法 | 结果 |
+| --- | --- |
+| `handle_msub` 就地投递（R1） | `modem_downlink` 3 条红（9 passed / 3 failed） |
+| `at_cmd` 用 `strstr` 判 OK（M2） | 2 条红（7 passed / 2 failed） |
+| `checksum_ok` 用 `strtol`（R4） | `gnss_nmea` 1 条红，报「1.033333,2.050000（9 星）被当成有效定位」 |
+| `flush_events` 持锁发送（M3） | `uplink_events` 1 条红（那条用例耗时从 0.5 s 变 10 s —— 探针真的被卡住了） |
+| `del`/`wipe` 不清 counter（M7） | `unlock_slots` 5 条红 |
+
 M1 那两条在旧代码下仍然过——因为旧代码的失败方式是「静默丢弃」而不是
 「投递截断值」，而这两条断言的正是「不投递」。这个差异本身是实测得到的
 （见 `modem.c` 里 `LINE_MAX` 的注释），审计报告初稿把它写成了「接受错误值」，

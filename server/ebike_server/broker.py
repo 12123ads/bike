@@ -174,12 +174,19 @@ def build_acl(cfg: ServerConfig) -> tuple[dict[str, list[str]], dict[str, list[s
 
     设备**不能**发布 `state`（防被撬开后伪造「一切正常」覆盖服务端判断），
     也**不能**订阅自己的 `up/`。HA **只能**订阅 `state`。
+
+    **没有 `svc` 账号**（审计 R7）。服务端自己发下行走的是
+    `broker.internal_message_broadcast`，以 broker 身份发、不占客户端连接、
+    不过 ACL —— 所以它从来不需要账号，`init` 也从没为它建过口令
+    （`__main__.py` 只为 `cfg.devices` 和 `"ha"` 建）。
+
+    以前这里给 `svc` 配了 `ebike/v1/#` 的读写全权限。那是死配置，
+    但**口令文件是用户可编辑的** —— 谁在 passwd 里手加一行 `svc` 就拿到
+    整棵 topic 树，包括伪造 `state`（正是上面那条「设备不能发 state」
+    要防的东西）。删掉它是零成本的。
     """
-    publish: dict[str, list[str]] = {"svc": [f"{ct.PREFIX}/#"]}
-    subscribe: dict[str, list[str]] = {
-        "svc": [f"{ct.PREFIX}/#"],
-        "ha": [ct.sub_all_state()],
-    }
+    publish: dict[str, list[str]] = {}
+    subscribe: dict[str, list[str]] = {"ha": [ct.sub_all_state()]}
     for d in cfg.devices:
         # 设备只能发 up/# 和自己的 lwt
         publish[d.id] = [
@@ -197,9 +204,15 @@ def build_broker_config(cfg: ServerConfig) -> dict[str, Any]:
     映射，dict 形式和文档一致，也更容易在测试里改一两项。
     """
     publish_acl, subscribe_acl = build_acl(cfg)
-    # amqtt 的坑 #1：publish-acl 空 = 全放行（`topic_checking.py:69-71`）。
-    # 断言的是「每个已配置设备都有 publish 条目」而不是「字典非空」——
-    # 后者恒真（build_acl 里已经塞了 svc 键），那条断言从来不会触发。
+    # amqtt 的坑 #1：`publish_acl` **空字典 = 发布全放行**
+    # （`topic_checking.py:69-71` 为兼容 hbmqtt 的 backward compat 分支）。
+    # 所以要断言两件事：字典非空、且每个已配置设备都有条目。
+    # 审计 R7 删掉 `svc` 之后「字典非空」不再恒真了 —— 设备列表为空时
+    # `publish_acl` 真的会是 `{}`，那就是静默全放行。
+    if not publish_acl:
+        raise RuntimeError(
+            "publish ACL 是空的 —— amqtt 会把发布**全放行**"
+            "（topic_checking.py 的 hbmqtt 兼容分支）。至少要配一台设备")
     missing = [d.id for d in cfg.devices if not publish_acl.get(d.id)]
     if missing:
         raise RuntimeError(f"这些设备没有 publish ACL 条目，会导致发布全放行：{missing}")

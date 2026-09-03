@@ -88,6 +88,31 @@ COMMANDS = frozenset({
     "ping", "locate", "unlock", "lock", "interval", "tier", "reboot",
 })
 
+#: 每个指令允许的 `a` 参数。契约 §6.1 那张表，机器可读版（审计 R3）。
+#:
+#: 形状：cmd → {键: (类型, 允许值)}；`None` 表示该指令不接受 `a`。
+#: 类型 `"int"` 的允许值是 (lo, hi) 闭区间，`"str"` 的是候选集合。
+#:
+#: **为什么必须逐值校验而不是「设备侧会拒」**：设备确实会拒
+#: （`nvstore_set_report_interval` 判 60~86400，`proto.c get_int` 对
+#: `"900"` 这种字符串返回 -EINVAL），但拒绝路径的代价不是零 ——
+#: `service.mark_acked` 只在 `ok=1` 时销账，ack 成 `ok=0` 的行 `acked`
+#: 仍是 0，**留在 pending_downlink 里每次设备上线都重发一遍，永久**。
+#: 一条打错的 `/cmd` 会变成永久的射频开销（每轮唤醒白发一次）。
+#:
+#: 区间来源：`s` 的 60~86400 抄 `nvstore.c` 的 `nvstore_set_report_interval`；
+#: `to` 的上界取 300 s（`gnss_fix` 的 timeout_s，超过它没有意义，
+#: 而 GNSS 全程开着是最耗电的状态）；`m` 的候选抄契约 §6.1 的表。
+CMD_ARGS: dict[str, dict[str, tuple[str, Any]] | None] = {
+    "ping": None,
+    "unlock": None,
+    "lock": None,
+    "reboot": None,
+    "locate": {"to": ("int", (1, 300))},
+    "interval": {"s": ("int", (60, 86400))},
+    "tier": {"m": ("str", frozenset({"off", "pro"}))},
+}
+
 #: `dn/secret` 的 `op` 闭集。契约 §6.2
 SECRET_OPS = frozenset({"set", "del", "wipe"})
 
@@ -390,16 +415,57 @@ def _dumps_downlink(obj: Any) -> bytes:
     return raw
 
 
+def _check_cmd_args(cmd: str, args: dict[str, Any]) -> None:
+    """按 `CMD_ARGS` 逐键逐值校验 `a`（审计 R3）。
+
+    未知键也拒：打错键名（`{"sec": 900}`）在旧实现里会入队、下发、被设备
+    忽略（`get_int("s")` 找不到 → `arg_int` 留 -1 → ack `range` 失败），
+    然后**永久重发**。报文层拒掉，`/cmd` 立刻 400。
+    """
+    spec = CMD_ARGS.get(cmd)
+    if spec is None:
+        raise ContractError(f"指令 {cmd!r} 不接受参数，收到 {sorted(args)}")
+
+    for key, val in args.items():
+        rule = spec.get(key)
+        if rule is None:
+            raise ContractError(
+                f"指令 {cmd!r} 的参数里有未知键 {key!r}，闭集是 {sorted(spec)}")
+        kind, allowed = rule
+        if kind == "int":
+            lo, hi = allowed
+            # bool 是 int 的子类，但 `{"s": true}` 显然不是周期
+            if isinstance(val, bool) or not isinstance(val, int):
+                raise ContractError(
+                    f"{cmd}.a.{key} 必须是整数，收到 {type(val).__name__}")
+            if not lo <= val <= hi:
+                raise ContractError(f"{cmd}.a.{key}={val} 超出 [{lo}, {hi}]")
+        else:
+            if not isinstance(val, str):
+                raise ContractError(
+                    f"{cmd}.a.{key} 必须是字符串，收到 {type(val).__name__}")
+            if val not in allowed:
+                raise ContractError(
+                    f"{cmd}.a.{key}={val!r} 不在 {sorted(allowed)}")
+
+
 def build_cmd(dn_id: str, cmd: str, args: dict[str, Any] | None = None) -> bytes:
     """契约 §6.1。
 
     注意 `unlock` 在这里**不做权限判断** —— 是否允许远程开锁是配置层的事
     （`allow_remote_unlock`），在 api.py 里判。契约层只管报文合法性。
+
+    `args` 按 `CMD_ARGS` 强校验（审计 R3）。以前只挡整条报文的字节数，
+    于是 `{"s": -5}`、`{"s": "900"}`、`{"s": 1e30}`、未知键、嵌套对象
+    全部能入队 —— 设备会拒，但拒了不销账，那条坏报文会被永久重发。
     """
     if cmd not in COMMANDS:
         raise ContractError(f"未知指令 {cmd!r}，闭集是 {sorted(COMMANDS)}")
     body: dict[str, Any] = {"id": dn_id, "c": cmd}
     if args:
+        if not isinstance(args, dict):
+            raise ContractError(f"参数必须是对象，收到 {type(args).__name__}")
+        _check_cmd_args(cmd, args)
         body["a"] = args
     return _dumps_downlink(body)
 

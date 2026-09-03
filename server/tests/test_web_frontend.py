@@ -280,3 +280,83 @@ def test_token_never_stored_in_browser():
     for html in (INDEX_HTML, LOGIN_HTML):
         assert "localStorage" not in html
         assert "sessionStorage" not in html
+
+
+def test_every_innerhtml_sink_is_escaped_or_literal(index_js):
+    """审计 R6：每一处 `innerHTML =` 要么只拼字面量，要么拼过 `esc()`。
+
+    文本层扫描而不是运行时断言 —— 这几个 sink（`mapFailed`、
+    `main().catch`）只在地图加载失败或初始化异常时才走到，
+    在 harness 里造出那个状态比扫源码脆弱得多。
+
+    审计当时的实际情况：`mapFailed` 和 `main().catch` 都把 `e.message`
+    直接拼进 `innerHTML`，而 `api()` 会把服务端的 `body.detail` 塞进
+    `Error`，`_check_dev` 的 404 detail 里含用户给的 `device_id`。
+    当时断在最后一步（`refreshState` 的 catch 只 `console.warn`），
+    是运气不是设计。
+
+    `devsel` 的选项列表改成了 DOM 构建，所以它不该再出现在这里。
+    """
+    js = index_js.read_text(encoding="utf-8")
+
+    # 取出每个 `xxx.innerHTML = <表达式>;` 的右侧。
+    # 手写扫描而不是正则：`renderEvents` 的右侧是
+    # `list.map(e => { ... }).join('')`，里面有分号和引号，
+    # 任何「到第一个 `;`」的正则都会在回调中间切断。
+    def sinks_of(src: str) -> list[str]:
+        out: list[str] = []
+        for m in re.finditer(r"\.innerHTML\s*=\s*", src):
+            i = m.end()
+            depth = 0
+            quote = ""
+            while i < len(src):
+                c = src[i]
+                if quote:
+                    if c == "\\":
+                        i += 2
+                        continue
+                    if c == quote:
+                        quote = ""
+                elif c in "'\"`":
+                    quote = c
+                elif c in "([{":
+                    depth += 1
+                elif c in ")]}":
+                    depth -= 1
+                elif c == ";" and depth == 0:
+                    break
+                i += 1
+            out.append(src[m.end():i])
+        return out
+
+    sinks = sinks_of(js)
+    assert len(sinks) >= 4, f"只找到 {len(sinks)} 个 innerHTML —— 扫描器失配了"
+
+    for expr in sinks:
+        # 去掉字符串字面量，剩下的标识符就是被拼进去的动态值
+        bare = re.sub(r"'(?:[^'\\]|\\.)*'", "''", expr)
+        bare = re.sub(r'"(?:[^"\\]|\\.)*"', '""', bare)
+        dynamic = [
+            name for name in re.findall(r"[A-Za-z_$][\w.$]*", bare)
+            # 这些是控制流/内建，不是被插入的数据
+            if name not in ("esc", "document", "body", "let", "const", "if",
+                            "else", "return", "undefined", "null", "e", "join",
+                            "map", "length")
+        ]
+        if not dynamic:
+            continue        # 纯字面量拼接
+        assert "esc(" in expr, (
+            f"innerHTML 拼了动态值 {dynamic[:4]} 但整段没有 esc()："
+            f"{expr.strip()[:120]}")
+
+
+def test_device_selector_built_via_dom(index_js):
+    """审计 R6：设备下拉不再用字符串拼 `<option>`。
+
+    id 来自配置文件且契约层收窄成 `[a-z0-9-]`，所以那不是一个活的注入口；
+    改掉它是因为渲染层不该依赖上游的形状假设 —— 这条测试钉住这个决定，
+    否则下次有人图省事又拼回去。
+    """
+    js = index_js.read_text(encoding="utf-8")
+    assert "<option value=" not in js, "又用字符串拼 <option> 了"
+    assert "createElement('option')" in js, "设备下拉不是 DOM 构建的"

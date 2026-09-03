@@ -273,14 +273,65 @@ def test_build_secret_rejects_out_of_range_ids():
 
 def test_downlink_size_cap_is_below_device_line_buffer():
     """审计 M1：下行超过 `MAX_DOWNLINK_BYTES` 在设备侧会被整条丢弃，
-    所以服务端构造时就要拒。上限本身必须远小于上行上限。"""
+    所以服务端构造时就要拒。上限本身必须远小于上行上限。
+
+    ⚠ 审计 R3 之后 `args` 已经是逐键逐值的闭集，**合法指令再也拼不出
+    超长报文**（`interval.s` 是 60~86400 的整数，撑不到 256 字节）。
+    所以这条测试改从 `dn_id` 那一侧顶穿 —— 它是这个上限唯一还能被真实
+    触发的入口（`next_dn_id` 生成的 id 很短，这里是兜底防线）。
+    """
     assert ct.MAX_DOWNLINK_BYTES < ct.MAX_PACKET_BYTES
-    # 合法指令 + 超大 args：只有下行上限能拦住它
     with pytest.raises(ct.ContractError, match="下行"):
-        ct.build_cmd("c-1", "interval",
-                     {"s": 900, "pad": "x" * ct.MAX_DOWNLINK_BYTES})
+        ct.build_cmd("c-" + "9" * ct.MAX_DOWNLINK_BYTES, "ping")
     # 正常大小的同一条指令必须过
     assert ct.build_cmd("c-1", "interval", {"s": 900})
+
+
+def test_cmd_args_are_a_closed_set_per_command():
+    """审计 R3：`a` 的键与值按指令逐个校验，不是「只挡字节数」。
+
+    为什么必须在服务端拒而不是「设备会拒」：`mark_acked` 只在 `ok=1` 时
+    销账，ack 成 `ok=0` 的行 `acked` 仍是 0 —— 那条坏报文留在
+    `pending_downlink` 里，**每次设备上线都重发一遍，永久**。
+    一条打错的 `/cmd` 会变成永久的射频开销。
+    """
+    # 合法的必须过
+    assert ct.build_cmd("c-1", "interval", {"s": 60})
+    assert ct.build_cmd("c-1", "interval", {"s": 86400})
+    assert ct.build_cmd("c-1", "locate", {"to": 60})
+    assert ct.build_cmd("c-1", "tier", {"m": "pro"})
+    assert ct.build_cmd("c-1", "ping")
+
+    bad = [
+        ("interval", {"s": 59}, "超出"),          # 下界外：设备侧判 60~86400
+        ("interval", {"s": 86401}, "超出"),       # 上界外
+        ("interval", {"s": -5}, "超出"),
+        ("interval", {"s": 10 ** 30}, "超出"),    # get_int 的 tmp[24] 会饱和
+        ("interval", {"s": "900"}, "必须是整数"),  # 字符串：proto.c 返回 -EINVAL
+        ("interval", {"s": True}, "必须是整数"),   # bool 是 int 子类，要单独挡
+        ("interval", {"s": 900.0}, "必须是整数"),
+        ("interval", {"bogus": 1}, "未知键"),      # 打错键名 → 设备忽略 → 永久重发
+        ("interval", {"s": 900, "extra": 1}, "未知键"),
+        ("locate", {"to": 0}, "超出"),
+        ("locate", {"to": 301}, "超出"),          # gnss_fix 的 timeout 上限
+        ("tier", {"m": "psm"}, "不在"),           # 闭集只有 off / pro
+        ("tier", {"m": 1}, "必须是字符串"),
+        ("ping", {"x": 1}, "不接受参数"),          # 无参指令
+        ("reboot", {"force": True}, "不接受参数"),
+    ]
+    for cmd, args, needle in bad:
+        with pytest.raises(ct.ContractError, match=needle):
+            ct.build_cmd("c-1", cmd, args)
+
+
+def test_cmd_args_table_covers_every_command():
+    """`CMD_ARGS` 必须和 `COMMANDS` 一一对应。
+
+    漏一个指令会让它的 `args` 走进 `spec is None` 分支 —— 那个分支的语义是
+    「这个指令不接受参数」，于是新加的带参指令会被静默拒掉。
+    """
+    assert set(ct.CMD_ARGS) == set(ct.COMMANDS), \
+        f"CMD_ARGS 与 COMMANDS 不一致：{set(ct.CMD_ARGS) ^ set(ct.COMMANDS)}"
 
 
 def test_dumps_is_compact():

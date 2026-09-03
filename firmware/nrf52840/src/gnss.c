@@ -72,20 +72,51 @@ static size_t take_line(char *out, size_t out_len)
 	return 0;
 }
 
+/* 一个十六进制字符 → 值，非法返回 -1。 */
+static int hexval(char c)
+{
+	if (c >= '0' && c <= '9') {
+		return c - '0';
+	}
+	if (c >= 'A' && c <= 'F') {
+		return c - 'A' + 10;
+	}
+	if (c >= 'a' && c <= 'f') {
+		return c - 'a' + 10;
+	}
+	return -1;
+}
+
 /* NMEA 校验和：'$' 之后到 '*' 之前所有字节的 XOR。
- * 必须验 —— 9600 baud 上误码不罕见，一个坏掉的纬度字段会让车瞬移。 */
+ * 必须验 —— 9600 baud 上误码不罕见，一个坏掉的纬度字段会让车瞬移。
+ *
+ * ⚠ **自己解两位 HEX，不用 `strtol`**（审计 R4）：`strtol` 解析失败也返回 0
+ * 且不设错误标记，于是「校验和字段是垃圾」和「校验和就是 00」不可区分 ——
+ * 实测 `"$GGAAGG*--"` 的 XOR 恰好是 0x00，`strtol("--")` 返回 0，
+ * **坏行被当成好行**放进 parse_gga。当前靠 parse_gga 的字段数检查兜住了，
+ * 但那是运气：这道防线的职责就是在解析之前挡掉误码。
+ *
+ * 顺带要求恰好两位 HEX 且后面到行尾没有别的东西 —— NMEA 0183 的校验和
+ * 就是固定两位十六进制。 */
 static bool checksum_ok(const char *line)
 {
 	const char *star = strrchr(line, '*');
+
 	if (star == NULL || line[0] != '$') {
 		return false;
 	}
+	int hi = hexval(star[1]);
+	int lo = hi < 0 ? -1 : hexval(star[2]);
+
+	if (lo < 0 || star[3] != '\0') {
+		return false;   /* 不是恰好两位 HEX */
+	}
+
 	uint8_t sum = 0;
 	for (const char *p = line + 1; p < star; p++) {
 		sum ^= (uint8_t)*p;
 	}
-	long given = strtol(star + 1, NULL, 16);
-	return (long)sum == given;
+	return sum == (uint8_t)((hi << 4) | lo);
 }
 
 /* 取第 idx 个逗号分隔字段（0 = 消息类型）。空字段返回空串。 */

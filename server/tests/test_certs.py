@@ -262,7 +262,7 @@ async def test_cert_mode_acl_still_scoped_to_own_device(cert_mode):
 
 
 def test_publish_acl_assertion_covers_every_device():
-    """原来的断言是「publish_acl 非空」，而 build_acl 里已经塞了 svc 键 ——
+    """原来的断言是「publish_acl 非空」，而 build_acl 里塞了 svc 键 ——
     那条 raise 永远不会触发。改成逐设备检查之后才真的是一道保险。"""
     cfg = ServerConfig(devices=[DeviceConfig(id="bike01")])
     cfg.mqtt.plain_bind = "127.0.0.1:1883"
@@ -282,6 +282,43 @@ def test_publish_acl_assertion_covers_every_device():
             build_broker_config(cfg)
     finally:
         bmod.build_acl = real
+
+
+def test_no_svc_account_in_acl():
+    """审计 R7：ACL 里不能有 `svc` 账号。
+
+    服务端自己发下行走 `internal_message_broadcast`（broker 身份、不过 ACL），
+    从来不需要账号 —— `init` 也没为它建口令。但**口令文件是用户可编辑的**：
+    留着这条 ACL，谁手加一行 `svc` 就拿到整棵 topic 树的读写权，
+    包括伪造 `state`（正是「设备不能发 state」那条规则要防的）。
+    """
+    from ebike_server import contract as ct
+    from ebike_server.broker import build_acl
+
+    pub, sub = build_acl(ServerConfig(devices=[DeviceConfig(id="bike01")]))
+    assert "svc" not in pub, "publish ACL 里又出现了 svc 全权限账号"
+    assert "svc" not in sub, "subscribe ACL 里又出现了 svc 全权限账号"
+    # 该有的还在
+    assert set(pub) == {"bike01"}, f"publish ACL 的账号集变了：{sorted(pub)}"
+    assert set(sub) == {"ha", "bike01"}, f"subscribe ACL 的账号集变了：{sorted(sub)}"
+    # 没有任何条目是整棵树
+    for user, topics in {**pub, **sub}.items():
+        for t in topics:
+            assert t != f"{ct.PREFIX}/#", f"{user} 拿到了整棵 topic 树：{t}"
+
+
+def test_empty_publish_acl_is_refused_not_silently_open():
+    """审计 R7 的连带风险：删掉 `svc` 之后「publish_acl 非空」不再恒真。
+
+    amqtt 的 `publish_acl` **空字典 = 发布全放行**
+    （`topic_checking.py:69-71` 的 hbmqtt 兼容分支）。设备列表为空时
+    `build_acl` 真的会返回 `{}` —— 必须启动失败，不能静默全放行。
+    """
+    cfg = ServerConfig(devices=[])
+    cfg.mqtt.plain_bind = "127.0.0.1:1883"
+    cfg.mqtt.tls_bind = ""
+    with pytest.raises(RuntimeError, match="publish ACL"):
+        build_broker_config(cfg)
 
 
 def test_every_listener_has_a_connection_cap():

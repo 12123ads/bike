@@ -16,6 +16,7 @@ SQLAlchemy 仍在依赖里，但**不是因为「amqtt 的持久化插件要用�
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,7 +24,25 @@ from typing import Any
 
 import aiosqlite
 
+_log = logging.getLogger("ebike.store")
+
 SCHEMA = """
+-- 增量回收（审计 R5）。默认 auto_vacuum=NONE 时 `DELETE` 只把页放进
+-- freelist，**文件永不缩小** —— 容器里用的是具名卷，用户看到的是「卷一直
+-- 在长」而没有任何手段缩回去。
+--
+-- 选 INCREMENTAL 而不是 FULL：FULL 在每次 commit 时搬页，写放大明显；
+-- INCREMENTAL 只是把空页记进 freelist，由 `prune()` 之后显式
+-- `PRAGMA incremental_vacuum` 分批回收。
+--
+-- ⚠ **这一条必须在 `journal_mode=WAL` 之前**（本机实测）：`auto_vacuum`
+-- 只能在库还空着、且**尚未进入 WAL** 的时候设置。反过来写的话它静默失效
+-- （`PRAGMA auto_vacuum` 读回来是 0），于是回收永远不生效而且没有任何报错。
+--
+-- ⚠ 只对**新建**库生效。`auto_vacuum` 是建库时写进 header 的，对已有库
+-- 这条 PRAGMA 是空操作。所以 `reclaim()` 里用 `freelist_count` 判断到底
+-- 回收了没有，没回收就 warn 出「要手动 VACUUM 一次」。
+PRAGMA auto_vacuum=INCREMENTAL;
 PRAGMA journal_mode=WAL;
 
 -- 位置点。t_srv 是排序与展示的依据，t_dev 只用于诊断（契约 §5.6）
@@ -382,4 +401,49 @@ class Store:
             cur = await self.db.execute(f"DELETE FROM {table} WHERE t_srv<?", (cutoff,))
             total += cur.rowcount
         await self.db.commit()
+        if total:
+            await self.reclaim()
         return total
+
+    async def reclaim(self) -> int:
+        """把 `DELETE` 腾出来的页还给文件系统。返回回收的页数（审计 R5）。
+
+        `DELETE` 只把页挂进 freelist，文件大小不变 —— 单车场景下一年也就
+        几 MB，**所以这不是容量问题**，是「卷只增不减且没有任何手段缩回去」
+        的运维问题（容器用具名卷）。周期改短或加车会放大：把 900 s 改成 60 s
+        就是 15 倍。
+
+        `PRAGMA incremental_vacuum` 需要建库时就是 `auto_vacuum=INCREMENTAL`
+        （见 SCHEMA 里那条）。**旧库不是**，那条 PRAGMA 对它是空操作 ——
+        这里通过 `freelist_count` 判断是否真的回收了，没回收就明确 warn，
+        让人知道要手动 `VACUUM` 一次而不是以为回收在跑。
+        """
+        cur = await self.db.execute("PRAGMA freelist_count")
+        row = await cur.fetchone()
+        before = int(row[0]) if row else 0
+        if before == 0:
+            return 0
+
+        # ⚠ **必须把结果行读干**（本机实测）：`PRAGMA incremental_vacuum` 是
+        # 一条语句而不是一次性动作，回收发生在**步进游标**的过程里。
+        # 只 `execute` 不 `fetchall` 只会走一步 —— 1583 个空闲页里只回收 1 个，
+        # 文件一点没缩，而且没有任何报错。
+        #
+        # 显式带页数参数：不带参数是「回收全部」，带上 before 同样是全部，
+        # 但把「要回收多少」写进 SQL 便于对着 freelist_count 核对。
+        cur = await self.db.execute(f"PRAGMA incremental_vacuum({before})")
+        await cur.fetchall()
+        await self.db.commit()
+
+        cur = await self.db.execute("PRAGMA freelist_count")
+        row = await cur.fetchone()
+        after = int(row[0]) if row else 0
+        freed = before - after
+        if freed <= 0:
+            _log.warning(
+                "有 %d 个空闲页但回收不掉 —— 这个库建的时候不是 "
+                "auto_vacuum=INCREMENTAL（旧库）。要缩小文件得停机跑一次 "
+                "`sqlite3 %s 'VACUUM;'`", before, self.path)
+            return 0
+        _log.info("回收了 %d 个空闲页", freed)
+        return freed

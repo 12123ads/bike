@@ -75,11 +75,49 @@ static struct k_spinlock time_lock;
 static uint32_t nitz_utc;
 static int64_t nitz_uptime;   /* 拿到时间时的 uptime，用来推算当前时间 */
 
-/* 下行 URC 的解析缓冲。放静态区而不是栈上。
- * dn_payload 按**下行**上限开（PROTO_MAX_DN_PAYLOAD），不是上行的 3900 ——
+/* 下行 URC 的解析缓冲 —— **一个小队列，不是一块单缓冲**（审计 R1）。
+ *
+ * 为什么必须排队而不能就地投递：`handle_msub` 是从 `consume_urc` 调的，
+ * 而 `consume_urc` 有两个调用点在**持 `at_lock` 的命令流里**
+ * （`at_cmd_expect` 等应答的循环、`modem_publish` 等裸 `>` 的循环）。
+ * 就地调 `dn_cb` 会走 `uplink.c on_downlink → handle_cmd → ack_downlink
+ * → modem_publish`，**重入 `modem_publish` 自身**。两个后果都实测过：
+ *
+ *   1. `modem_publish` 的 `hexbuf`/`cmd` 是 static，内层把它们重写一遍，
+ *      而外层要到 `uart_write_str(hexbuf)` 才用 —— 发出去的是内层的字节，
+ *      长度却是外层声明的。模组按外层 len 取，缺的部分从下一条命令的
+ *      字节里补：一次损坏毁掉这条上行和后面的 AT 流。
+ *   2. `k_mutex` 同线程可重入（`kernel/mutex.c`：owner == _current 时
+ *      只 lock_count++），所以内层拿得到锁、不死锁、继续往下递归。
+ *      实测帧大小：`modem_publish` 688 B + 重入环 192 B = 每层 880 B，
+ *      第 5 层越过 `UPLINK_STACK_SIZE`(4096)。而 `RESET_ON_FATAL_ERROR`
+ *      没开、也没有看门狗 —— 爆栈 = `arch_system_halt()` 死转 = 车变砖。
+ *      触发条件是常态：设备上线时服务端一次性冲刷全部未确认下行
+ *      （`broker.py` 的 on_broker_client_connected），积 4 条就到第 5 层。
+ *
+ * 所以 `dn_cb` **只在一个地方被调**：`modem_poll()` 读完一轮后的
+ * `deliver_downlinks()`，那里不持 `at_lock`、也不在任何命令流里。
+ *
+ * 队列满了**拒收新的**而不是挤掉旧的：`dn/secret` 的连续两次轮换必须按序
+ * 到达（契约 §4.1），丢掉的那条服务端下次上线会重发，而乱序会让设备
+ * 停在旧密钥上。4 个槽位覆盖「一次冲刷来几条」的实际量级。
+ *
+ * `dn_payload` 按**下行**上限开（PROTO_MAX_DN_PAYLOAD），不是上行的 3900 ——
  * 下行整条 URC 在一行里，LINE_MAX 才是天花板（审计 M1）。 */
-static char dn_topic[288];
-static uint8_t dn_payload[PROTO_MAX_DN_PAYLOAD];
+#define DN_QUEUE_SIZE 4
+
+struct dn_msg {
+	char topic[288];
+	uint8_t payload[PROTO_MAX_DN_PAYLOAD];
+	size_t len;
+};
+
+static struct dn_msg dn_queue[DN_QUEUE_SIZE];
+static size_t dn_head;      /* 下一个要投递的槽位 */
+static size_t dn_count;     /* 待投递条数 */
+/* 正在投递。`ack_downlink` 会走回 `modem_publish`，那里可能再收下一条
+ * 下行并入队 —— 那条留给下一次 `modem_poll`，绝不在这里递归下去。 */
+static bool dn_delivering;
 
 /* --- UART 底层 -------------------------------------------------------------- */
 
@@ -200,7 +238,10 @@ static int hex_decode(const char *hex, size_t hex_len, uint8_t *out,
 
 /* MQTT 下行 URC 的形状（AT 手册 V1.6.8）：
  *   +MSUB: "<topic>",<len>,"<hex payload>"
- * 返回 true 表示这一行被当作下行消化掉了。 */
+ * 返回 true 表示这一行被当作下行消化掉了。
+ *
+ * **只入队，不投递**（审计 R1）—— 投递在 `deliver_downlinks()`，
+ * 由 `modem_poll()` 在不持 `at_lock` 时调。理由见 dn_queue 的注释。 */
 static bool handle_msub(const char *line)
 {
 	if (strncmp(line, "+MSUB:", 6) != 0) {
@@ -217,35 +258,76 @@ static bool handle_msub(const char *line)
 		return true;
 	}
 	size_t tlen = (size_t)(q - p);
-	if (tlen >= sizeof(dn_topic)) {
+	if (tlen >= sizeof(dn_queue[0].topic)) {
 		LOG_ERR("下行 topic 过长 %zu", tlen);
 		return true;
 	}
-	memcpy(dn_topic, p, tlen);
-	dn_topic[tlen] = '\0';
 
-	/* payload 在第二对引号里 */
-	p = strchr(q + 1, '"');
-	if (p == NULL) {
+	/* payload 在第二对引号里。**先把两段都定位、校验完再占槽位** ——
+	 * 格式不认识时不该消耗一个队列名额。 */
+	const char *hex = strchr(q + 1, '"');
+	if (hex == NULL) {
 		return true;
 	}
-	p++;
-	q = strchr(p, '"');
-	if (q == NULL) {
+	hex++;
+	const char *hex_end = strchr(hex, '"');
+	if (hex_end == NULL) {
 		return true;
 	}
 
-	int n = hex_decode(p, (size_t)(q - p), dn_payload, sizeof(dn_payload));
+	if (dn_count >= DN_QUEUE_SIZE) {
+		/* 满了就拒收：丢掉的这条服务端下次上线会重发（契约 §4.1），
+		 * 而挤掉队首会让 dn/secret 的连续轮换乱序。 */
+		LOG_ERR("下行队列满（%d 条待处理），丢弃 —— 服务端会重发",
+			DN_QUEUE_SIZE);
+		return true;
+	}
+
+	struct dn_msg *slot = &dn_queue[(dn_head + dn_count) % DN_QUEUE_SIZE];
+	int n = hex_decode(hex, (size_t)(hex_end - hex), slot->payload,
+			   sizeof(slot->payload));
 	if (n < 0) {
 		LOG_ERR("下行 payload HEX 解码失败 %d", n);
-		return true;
+		return true;   /* 槽位没被占用（dn_count 未增），下次复用 */
 	}
 
-	LOG_INF("下行 %s（%d 字节）", dn_topic, n);
-	if (dn_cb) {
-		dn_cb(dn_topic, dn_payload, (size_t)n);
-	}
+	memcpy(slot->topic, p, tlen);
+	slot->topic[tlen] = '\0';
+	slot->len = (size_t)n;
+	dn_count++;
+
+	LOG_INF("下行 %s（%d 字节）已入队", slot->topic, n);
 	return true;
+}
+
+/* 把排队的下行交给上层。**调用方必须不持 `at_lock`**（审计 R1）。
+ *
+ * 不递归：`dn_cb` 会走到 `ack_downlink → modem_publish`，那里可能再收一条
+ * 下行入队 —— `dn_delivering` 保证那条留给下一次 `modem_poll`。
+ * 每次最多投递本轮开始时已在队列里的条数，理由同上。 */
+static void deliver_downlinks(void)
+{
+	if (dn_delivering || dn_cb == NULL) {
+		return;
+	}
+	dn_delivering = true;
+	size_t batch = dn_count;
+
+	while (batch-- > 0 && dn_count > 0) {
+		struct dn_msg *m = &dn_queue[dn_head];
+
+		/* ⚠ **槽位要到回调返回之后才释放。** 先 `dn_count--` 再回调的话，
+		 * 队列满（dn_count == DN_QUEUE_SIZE）时内层 `handle_msub` 算出的
+		 * 入队位置 `(dn_head + dn_count) % DN_QUEUE_SIZE` 正好等于
+		 * `dn_head` —— 会把**正在投递的这一条**覆盖掉。
+		 * 保持计数不动，内层要么因为队满被拒（就是这种情况），
+		 * 要么写进一个真正空闲的槽位。 */
+		dn_cb(m->topic, m->payload, m->len);
+
+		dn_head = (dn_head + 1) % DN_QUEUE_SIZE;
+		dn_count--;
+	}
+	dn_delivering = false;
 }
 
 /* 掉线类 URC。收到就把 connected 清掉，让上层去重连。 */
@@ -538,6 +620,9 @@ int modem_init(modem_dn_cb cb)
 	}
 
 	dn_cb = cb;
+	dn_head = 0;
+	dn_count = 0;
+	dn_delivering = false;
 	ring_buf_init(&rx_ring, sizeof(rx_ring_buf), rx_ring_buf);
 	k_sem_init(&rx_sem, 0, 1);
 	k_mutex_init(&at_lock);
@@ -944,7 +1029,15 @@ int modem_poll(uint32_t timeout_ms)
 		if (consume_urc(line)) {
 			handled++;
 		}
+		/* 每读一行就投递一次，而不是等整个 deadline 走完 ——
+		 * `modem_poll(5000)` 在上报轮末尾要等满 5 秒，那期间收到的
+		 * 指令不该也一起等（`locate` 之类要即时响应）。
+		 * 投递点必须在这里而不是 `consume_urc` 里面：这里没有持
+		 * `at_lock`，而 `dn_cb` 会走回 `modem_publish`（审计 R1）。 */
+		deliver_downlinks();
 	}
+	/* 循环因超时/无数据退出时，队列里可能还有本轮最后入队的那条。 */
+	deliver_downlinks();
 	return handled;
 }
 

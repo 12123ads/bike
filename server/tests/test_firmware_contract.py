@@ -135,12 +135,64 @@ def test_read_line_reports_overflow_instead_of_truncating(modem_c):
 
 
 def test_dn_payload_buffer_sized_for_downlink_not_uplink(modem_c):
-    """dn_payload 按下行上限开。按 PROTO_MAX_PAYLOAD(3900) 开是矛盾的：
-    行缓冲装不下那么大的 HEX，多出来的空间只会掩盖截断（审计 M1）。"""
-    m = re.search(r"static uint8_t dn_payload\[(\w+)\]", modem_c)
-    assert m, "找不到 dn_payload 定义"
+    """下行 payload 缓冲按下行上限开。按 PROTO_MAX_PAYLOAD(3900) 开是矛盾的：
+    行缓冲装不下那么大的 HEX，多出来的空间只会掩盖截断（审计 M1）。
+
+    审计 R1 之后它是 `struct dn_msg` 的成员（一个小队列，不再是单缓冲）。
+    """
+    m = re.search(r"uint8_t payload\[(\w+)\];", modem_c)
+    assert m, "找不到下行 payload 缓冲的定义"
     assert m.group(1) == "PROTO_MAX_DN_PAYLOAD", \
-        f"dn_payload 按 {m.group(1)} 开，应该按 PROTO_MAX_DN_PAYLOAD"
+        f"下行 payload 按 {m.group(1)} 开，应该按 PROTO_MAX_DN_PAYLOAD"
+
+
+def test_downlink_is_queued_not_dispatched_inline(modem_c):
+    """审计 R1：`handle_msub` 只入队，`dn_cb` 只在 `deliver_downlinks` 里调。
+
+    就地调 `dn_cb` 会重入 `modem_publish`（`consume_urc` 的两个调用点都持
+    `at_lock`）：static `hexbuf` 被内层覆盖 → 发出错误字节；递归无界 →
+    第 5 层爆 4 KB 的 uplink 线程栈 → `arch_system_halt()` 死转（没开
+    `RESET_ON_FATAL_ERROR`、没有看门狗）= 车变砖。
+
+    文本层钉住「`dn_cb(` 只出现在一个函数里」。运行时行为由
+    `firmware/tests/modem_downlink` 的三条 ztest 钉住（含变异体验证）。
+    """
+    # 除了声明和赋值，`dn_cb(` 的调用点必须只有一处
+    calls = re.findall(r"^\t+dn_cb\(", modem_c, re.MULTILINE)
+    assert len(calls) == 1, \
+        f"`dn_cb(` 有 {len(calls)} 个调用点 —— 只允许 deliver_downlinks 一处"
+
+    # 那一处必须在 deliver_downlinks 里，而不是 handle_msub 里
+    deliver = re.search(r"static void deliver_downlinks\(void\)\s*\{(.*?)\n\}",
+                        modem_c, re.DOTALL)
+    assert deliver, "找不到 deliver_downlinks —— R1 的投递点没了？"
+    assert "dn_cb(" in deliver.group(1), "deliver_downlinks 里没有投递"
+
+    msub = re.search(r"static bool handle_msub\(const char \*line\)\s*\{(.*?)\n\}",
+                     modem_c, re.DOTALL)
+    assert msub, "找不到 handle_msub"
+    assert "dn_cb(" not in msub.group(1), \
+        "handle_msub 又在就地投递下行了 —— 那条路径会重入 modem_publish（R1）"
+
+
+def test_downlink_delivery_is_outside_at_lock(modem_c):
+    """审计 R1 的另一半：投递点必须在 `modem_poll` 里，而不在任何
+    持 `at_lock` 的函数里。
+
+    `at_cmd_expect` 和 `modem_publish` 都是「拿锁 → 循环读行 →
+    `consume_urc`」的形状；只要 `consume_urc` 不投递，它们就安全。
+    """
+    poll = re.search(r"int modem_poll\(uint32_t timeout_ms\)\s*\{(.*?)\n\}",
+                     modem_c, re.DOTALL)
+    assert poll, "找不到 modem_poll"
+    assert "deliver_downlinks()" in poll.group(1), \
+        "modem_poll 不投递下行了 —— 那下行永远发不上去"
+
+    for fn in ("at_cmd_expect", "modem_publish"):
+        body = re.search(rf"\b{fn}\((.*?)\n\}}", modem_c, re.DOTALL)
+        assert body, f"找不到 {fn}"
+        assert "deliver_downlinks()" not in body.group(1), \
+            f"{fn} 持 at_lock 时投递下行 —— 会重入 modem_publish（R1）"
 
 
 # --- 闭集 -------------------------------------------------------------------

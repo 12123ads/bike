@@ -147,16 +147,34 @@ def test_unknown_cmd_rejected(svc_and_client):
     assert c.post("/cmd/bike01/selfdestruct", headers=AUTH).status_code == 400
 
 
-def test_oversized_cmd_args_rejected_as_client_error(svc_and_client):
-    """审计 M1：超过 `MAX_DOWNLINK_BYTES` 的下行在设备侧会被整条丢弃，
-    所以服务端构造时就拒。**必须是 400 而不是 500** —— args 是客户端给的。
+def test_bad_cmd_args_rejected_as_client_error(svc_and_client):
+    """报文层拒绝必须是 **400 而不是 500** —— `args` 是客户端给的。
+
+    审计 M1 加了整条报文的字节上限，审计 R3 又加了逐指令的 `a` 闭集。
+    两条都走同一个出口（`ContractError` → 400），这里各验一次。
+
+    关键的第二半：**坏报文不能留在队列里**。留下来的话
+    `mark_acked` 只在 `ok=1` 时销账，设备 ack 失败后那一行 `acked` 仍是 0，
+    每次上线都重发 —— 一条打错的 `/cmd` 变成永久的射频开销。
     """
     _, _, c = svc_and_client
-    r = c.post("/cmd/bike01/interval", headers=AUTH,
-               json={"s": 900, "pad": "x" * ct.MAX_DOWNLINK_BYTES})
+
+    # R3：值越界、类型不对、未知键
+    for args, needle in (
+        ({"s": 59}, "超出"),
+        ({"s": "900"}, "必须是整数"),
+        ({"s": 900, "pad": "x" * ct.MAX_DOWNLINK_BYTES}, "未知键"),
+    ):
+        r = c.post("/cmd/bike01/interval", headers=AUTH, json=args)
+        assert r.status_code == 400, f"{args} 得到 {r.status_code}"
+        assert needle in r.json()["detail"], r.json()["detail"]
+
+    # M1：报文整体超长（合法 args 拼不出来，从 args 之外顶）
+    r = c.post("/cmd/bike01/tier", headers=AUTH,
+               json={"m": "pro", "pad": "x" * ct.MAX_DOWNLINK_BYTES})
     assert r.status_code == 400
-    assert "下行" in r.json()["detail"]
-    # 坏报文不能留在队列里
+
+    # 一条都不许留在队列里
     assert c.get("/pending?dev=bike01", headers=AUTH).json()["pending"] == []
 
 

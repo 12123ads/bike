@@ -471,8 +471,13 @@ function loadMap(key, security) {
   });
 }
 
+// `msg` 是**纯文本**，在这里统一 esc()（审计 R6）。
+//
+// 早先的写法是「由调用方负责转义」，那要求每个调用点都记得做，而其中一个
+// 调用点的输入一路来自服务端的 `body.detail`（含用户给的 device_id）。
+// 把责任收到这一处，代价只是 key 文件名不能再用 <code> 包 —— 用引号代替。
 function mapFailed(msg) {
-  $('map').innerHTML = '<div class="maperr"><b>地图没加载出来：</b>' + msg
+  $('map').innerHTML = '<div class="maperr"><b>地图没加载出来：</b>' + esc(msg)
     + '<br><br>其余功能不受影响，位置在左侧以经纬度显示。'
     + '<br><br>检查：<br>'
     + '· <code>/root/gaode.key</code> 里是不是一行 32 位的 key<br>'
@@ -531,8 +536,16 @@ async function main() {
   $('devlabel').textContent = DEV;
   if (CFG.devices.length > 1) {
     $('devrow').style.display = 'flex';
-    $('devsel').innerHTML = CFG.devices
-      .map(d => '<option value="' + d.id + '">' + d.id + '</option>').join('');
+    // 用 DOM 构建而不是拼 HTML（审计 R6）：设备 id 来自配置文件，
+    // 契约层的 DEVICE_ID_RE 也收窄成 [a-z0-9-]，但渲染层不该依赖上游形状。
+    const sel = $('devsel');
+    sel.replaceChildren();
+    for (const d of CFG.devices) {
+      const opt = document.createElement('option');
+      opt.value = d.id;
+      opt.textContent = d.id;
+      sel.appendChild(opt);
+    }
     $('devsel').addEventListener('change', e => {
       DEV = e.target.value;
       $('devlabel').textContent = DEV;
@@ -572,8 +585,10 @@ async function main() {
     if (lastState) drawMarker(lastState);
     refreshTrack();
   } catch (e) {
+    // `mapFailed` 自己转义，所以这里传**纯文本**（审计 R6）。
+    // 配置项名用引号而不是 <code> —— 差别只是没有等宽字体。
     mapFailed(e.message === 'nokey'
-      ? '服务端没读到高德 key（配置项 <code>web.gaode_key_file</code>）。'
+      ? '服务端没读到高德 key（配置项 web.gaode_key_file）。'
       : e.message);
   }
 
@@ -584,7 +599,11 @@ async function main() {
 }
 
 main().catch(e => {
-  document.body.innerHTML = '<div class="maperr">页面初始化失败：' + e.message
+  // esc()（审计 R6）：`api()` 把服务端的 `body.detail` 塞进 Error.message，
+  // 而 `_check_dev` 的 404 detail 里含用户给的 device_id。这里是整页替换，
+  // 是最不该留注入口的位置。
+  document.body.innerHTML = '<div class="maperr">页面初始化失败：'
+    + esc(e.message)
     + '<br><br><a href="/ui/login">重新登录</a></div>';
 });
 </script>

@@ -396,3 +396,62 @@ async def test_prune_zero_means_forever(store):
     await store.add_loc("bike01", [pt(1)], 1)
     assert await store.prune(0) == 0
     assert len(await store.track("bike01", 0, 9999, 10, 0)) == 1
+
+
+async def test_prune_actually_shrinks_the_file(tmp_path):
+    """审计 R5：`DELETE` 只把页挂进 freelist，**文件永不缩小**。
+
+    单车一年也就几 MB，所以这不是容量问题，是「容器具名卷只增不减、
+    且没有任何手段缩回去」的运维问题。周期改短或加车会放大（900s → 60s
+    是 15 倍）。
+
+    这条测试断言的是**文件大小真的降下来了**，不是「调用了某个 PRAGMA」——
+    实测踩到两个静默失效：
+      1. `PRAGMA auto_vacuum` 必须在 `journal_mode=WAL` **之前**，
+         反过来写它静默失效（读回来是 0）。
+      2. `PRAGMA incremental_vacuum` 的回收发生在**步进游标**的过程里，
+         只 `execute` 不 `fetchall` 只走一步（1583 页里回收 1 页）。
+    两个都不报错，只有量文件大小才看得出来。
+    """
+    import time
+
+    db = tmp_path / "big.db"
+    s = Store(str(db))
+    await s.open()
+    try:
+        cur = await s.db.execute("PRAGMA auto_vacuum")
+        av = (await cur.fetchone())[0]
+        assert av == 2, \
+            f"auto_vacuum={av}（2=INCREMENTAL）—— PRAGMA 顺序错了，回收不会生效"
+
+        old = int(time.time()) - 400 * 86400
+        batch = [
+            {"q": i, "t_dev": old + i, "src": "g",
+             "lat": 31.2 + i * 1e-6, "lon": 121.4 + i * 1e-6,
+             "acc": 8.0, "speed": 1.0, "heading": 90, "sats": 9}
+            for i in range(20000)
+        ]
+        for i in range(0, len(batch), 5000):
+            await s.add_loc("bike01", batch[i:i + 5000], old)
+        # WAL 里的页也算文件占用，先落盘再量
+        await s.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        await s.db.commit()
+        before = db.stat().st_size
+        assert before > 1_000_000, f"样本太小测不出来：{before} 字节"
+
+        assert await s.prune(365) == 20000
+        await s.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        await s.db.commit()
+        after = db.stat().st_size
+
+        assert after < before // 2, \
+            f"prune 之后文件没缩小：{before} → {after} 字节（freelist 没回收）"
+    finally:
+        await s.close()
+
+
+async def test_reclaim_is_a_noop_when_nothing_freed(store):
+    """没有空闲页时 `reclaim` 不该做事、也不该报错 —— 它在每次 prune 后被调。"""
+    assert await store.reclaim() == 0
+    await store.add_loc("bike01", [pt(1)], 1)
+    assert await store.reclaim() == 0

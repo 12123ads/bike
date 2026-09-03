@@ -34,7 +34,7 @@ static const struct device *const euart = DEVICE_DT_GET(DT_NODELABEL(uart1));
 
 /* --- dn_cb 收到的东西 ------------------------------------------------------- */
 
-#define CB_MAX 4
+#define CB_MAX 8
 
 static struct {
 	char topic[288];
@@ -43,22 +43,60 @@ static struct {
 } cb_log[CB_MAX];
 static size_t cb_count;
 
+/* 审计 R1 的观测点。
+ *
+ * `cb_forbidden` 由测试在「一条 AT 命令正在飞」的区间置位 —— 回调在那期间
+ * 被调到就是重入（旧代码的行为：`handle_msub` 就地调 `dn_cb`，而
+ * `consume_urc` 的两个调用点都持 `at_lock`）。
+ *
+ * `cb_depth` / `cb_max_depth` 数嵌套层数：投递期间若又有下行到达并被就地
+ * 投递，深度会 > 1，而那正是爆栈的机制。 */
+static bool cb_forbidden;
+static int cb_violations;
+static int cb_depth;
+static int cb_max_depth;
+/* 回调里要不要顺手再 poll 一次（模拟 ack_downlink → modem_publish →
+ * consume_urc 那条真实的回环路径）。 */
+static bool cb_repoll;
+
 static void on_downlink(const char *topic, const uint8_t *payload, size_t len)
 {
-	if (cb_count >= CB_MAX) {
-		return;
+	if (cb_forbidden) {
+		cb_violations++;
 	}
-	strncpy(cb_log[cb_count].topic, topic, sizeof(cb_log[0].topic) - 1);
-	cb_log[cb_count].topic[sizeof(cb_log[0].topic) - 1] = '\0';
-	size_t n = len < sizeof(cb_log[0].payload) ? len : sizeof(cb_log[0].payload);
-	memcpy(cb_log[cb_count].payload, payload, n);
-	cb_log[cb_count].len = n;
-	cb_count++;
+	cb_depth++;
+	if (cb_depth > cb_max_depth) {
+		cb_max_depth = cb_depth;
+	}
+
+	if (cb_count < CB_MAX) {
+		strncpy(cb_log[cb_count].topic, topic, sizeof(cb_log[0].topic) - 1);
+		cb_log[cb_count].topic[sizeof(cb_log[0].topic) - 1] = '\0';
+		size_t n = len < sizeof(cb_log[0].payload)
+				   ? len : sizeof(cb_log[0].payload);
+		memcpy(cb_log[cb_count].payload, payload, n);
+		cb_log[cb_count].len = n;
+		cb_count++;
+	}
+
+	if (cb_repoll) {
+		/* 真固件在这里发 ack，那条路径会走到 modem_publish → consume_urc。
+		 * 这里用 modem_poll 代替：同样是「回调里再读一轮 URC」，
+		 * 而且不需要一个连上的会话。 */
+		(void)modem_poll(20);
+	}
+
+	cb_depth--;
 }
 
 static void cb_reset(void)
 {
 	cb_count = 0;
+	cb_violations = 0;
+	cb_depth = 0;
+	cb_max_depth = 0;
+	cb_forbidden = false;
+	cb_repoll = false;
 	memset(cb_log, 0, sizeof(cb_log));
 }
 
@@ -88,19 +126,34 @@ static void feed_line(const char *line)
 	(void)modem_poll(150);
 }
 
-/* 拼一条 +MSUB URC：topic + HEX(payload)。 */
-static void feed_msub(const char *topic, const char *json)
+/* 拼一条 +MSUB URC 到 out：topic + HEX(payload)。不喂、不 poll。 */
+static void build_msub(char *out, size_t out_len, const char *topic,
+		       const char *json)
 {
-	static char line[4096];
-	size_t pos = (size_t)snprintf(line, sizeof(line), "+MSUB: \"%s\",%zu,\"",
+	size_t pos = (size_t)snprintf(out, out_len, "+MSUB: \"%s\",%zu,\"",
 				      topic, strlen(json));
 
 	for (size_t i = 0; json[i] != '\0'; i++) {
-		pos += (size_t)snprintf(line + pos, sizeof(line) - pos, "%02X",
+		pos += (size_t)snprintf(out + pos, out_len - pos, "%02X",
 					(uint8_t)json[i]);
 	}
-	(void)snprintf(line + pos, sizeof(line) - pos, "\"");
-	feed_line(line);
+	(void)snprintf(out + pos, out_len - pos, "\"\r\n");
+}
+
+/* 塞进 FIFO 但**不 poll** —— 让它像真实的迟到 URC 一样留在流里，
+ * 等下一条 AT 命令去读到它。 */
+static void feed_msub_raw(const char *topic, const char *json)
+{
+	static char line[4096];
+
+	build_msub(line, sizeof(line), topic, json);
+	feed_raw(line, strlen(line));
+}
+
+static void feed_msub(const char *topic, const char *json)
+{
+	feed_msub_raw(topic, json);
+	(void)modem_poll(150);
 }
 
 static void *setup(void)
@@ -308,4 +361,114 @@ ZTEST(modem_downlink, test_overlong_topic_dropped)
 
 	feed_line(line);
 	zassert_equal(cb_count, 0, "超长 topic 被截断后投递了");
+}
+
+/* --- R1：下行绝不在命令流里就地投递 ----------------------------------------- */
+
+/* **这条是 R1 的核心。**
+ *
+ * 旧代码 `handle_msub` 就地调 `dn_cb`，而 `consume_urc` 有两个调用点在
+ * 持 `at_lock` 的命令流里（`at_cmd_expect` 等应答的循环、`modem_publish`
+ * 等裸 `>` 的循环）。于是「一条 AT 命令正在飞」的当口收到下行，会一路
+ * 走到 `ack_downlink → modem_publish` **重入 `modem_publish` 自身** ——
+ * static `hexbuf` 被内层覆盖（发出错误字节），且递归无界（第 5 层爆 4 KB 栈）。
+ *
+ * 观测手段：把一条 `+MSUB` 和 `AT+CSQ` 的应答一起塞进 FIFO，然后调
+ * `modem_csq()`。命令执行期间 `cb_forbidden` 置位 —— 回调被调到就是重入。
+ *
+ * - 修复前：`modem_csq` 内部 `read_line` 读到 `+MSUB` → `consume_urc` →
+ *   `handle_msub` 就地 `dn_cb` → `cb_violations` > 0。
+ * - 修复后：`handle_msub` 只入队，`cb_violations == 0`；那条下行留到
+ *   下一次 `modem_poll()` 才投递，且内容完整。
+ *
+ * 两条断言都要：只查 violations 的话，「永远不投递」也是绿的。 */
+ZTEST(modem_downlink, test_downlink_not_delivered_from_inside_at_command)
+{
+	const char *json = "{\"id\":\"c-11\",\"c\":\"ping\"}";
+
+	/* 下行先到，紧跟 AT+CSQ 的应答 —— 真实时序就是这样混在一条流上。 */
+	feed_msub_raw("ebike/v1/bike01/dn/cmd", json);
+	feed_raw("+CSQ: 24,0\r\nOK\r\n", 16);
+
+	cb_forbidden = true;
+	int csq = modem_csq();
+
+	cb_forbidden = false;
+
+	zassert_equal(csq, 24, "AT+CSQ 没拿到应答（csq=%d）—— "
+				"下行 URC 把命令流搅乱了", csq);
+	zassert_equal(cb_violations, 0,
+		      "下行在 AT 命令执行期间被就地投递了（%d 次）—— "
+		      "那条路径会重入 modem_publish：static hexbuf 被覆盖、"
+		      "递归爆栈（审计 R1）", cb_violations);
+	zassert_equal(cb_count, 0, "命令期间就投递了 %zu 条", cb_count);
+
+	/* 关键的另一半：它不能被丢掉，只是被推迟。 */
+	(void)modem_poll(150);
+	zassert_equal(cb_count, 1,
+		      "推迟之后下行丢了（收到 %zu 条）—— 排队不等于丢弃",
+		      cb_count);
+	zassert_mem_equal(cb_log[0].payload, json, strlen(json),
+			  "推迟投递的内容不对");
+	zassert_equal(cb_log[0].len, strlen(json), "长度不对");
+}
+
+/* 投递期间又来一条下行时，不能递归下去。
+ *
+ * 真固件的回环是 `dn_cb → handle_cmd → ack_downlink → modem_publish →
+ * consume_urc`；这里用「回调里再 `modem_poll` 一次」代替，同样是
+ * 「投递中再读一轮 URC」，而且不需要一个连上的会话。
+ *
+ * 修复前：第二条会在第一条的回调里被就地投递，深度 2 —— 那正是爆栈机制。
+ * 修复后：`dn_delivering` 挡住，深度恒为 1，第二条留到外层的下一轮。 */
+ZTEST(modem_downlink, test_delivery_does_not_nest)
+{
+	const char *a = "{\"id\":\"c-12\",\"c\":\"ping\"}";
+	const char *b = "{\"id\":\"c-13\",\"c\":\"locate\"}";
+
+	feed_msub_raw("ebike/v1/bike01/dn/cmd", a);
+	feed_msub_raw("ebike/v1/bike01/dn/cmd", b);
+
+	cb_repoll = true;
+	(void)modem_poll(300);
+	cb_repoll = false;
+
+	zassert_equal(cb_max_depth, 1,
+		      "回调嵌套到了 %d 层 —— 每层 880 字节，"
+		      "uplink 线程栈只有 4096（审计 R1）", cb_max_depth);
+	zassert_equal(cb_count, 2, "两条都该投递到（收到 %zu 条）", cb_count);
+	zassert_mem_equal(cb_log[0].payload, a, strlen(a), "第一条内容不对");
+	zassert_mem_equal(cb_log[1].payload, b, strlen(b),
+			  "第二条内容不对 —— 队列顺序错了？"
+			  "dn/secret 的连续轮换依赖这个顺序");
+}
+
+/* 队列满了要拒收新的、且**已排队的那些必须完整投递出去**。
+ *
+ * 反向护栏：如果 `deliver_downlinks` 在回调前就 `dn_count--`，队满时内层
+ * 算出的入队位置正好是正在投递的那个槽位 —— 内容会被覆盖。
+ * DN_QUEUE_SIZE 是 4，这里灌 6 条。 */
+ZTEST(modem_downlink, test_queue_full_drops_newest_keeps_queued_intact)
+{
+	static char json[6][48];
+
+	for (int i = 0; i < 6; i++) {
+		(void)snprintf(json[i], sizeof(json[i]),
+			       "{\"id\":\"c-%d\",\"c\":\"ping\"}", 20 + i);
+		feed_msub_raw("ebike/v1/bike01/dn/cmd", json[i]);
+	}
+
+	cb_repoll = true;
+	(void)modem_poll(400);
+	cb_repoll = false;
+
+	zassert_equal(cb_max_depth, 1, "队满时回调嵌套了 %d 层", cb_max_depth);
+	zassert_true(cb_count >= 4,
+		     "队列容量 4 但只投递了 %zu 条 —— 排队的被覆盖了", cb_count);
+
+	/* 前 4 条必须是最早入队的 4 条，且内容逐字节完整。 */
+	for (int i = 0; i < 4; i++) {
+		zassert_mem_equal(cb_log[i].payload, json[i], strlen(json[i]),
+				  "第 %d 条内容被覆盖了（队满时槽位复用）", i);
+	}
 }

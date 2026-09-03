@@ -147,11 +147,12 @@ static char msg_buf[PROTO_MAX_PAYLOAD];
  * **只重试一次。** 重连本身已经是三级阶梯（modem.h），它失败意味着
  * 网络或模组真的不可用，继续试只是在抽车电池。
  *
- * ⚠ **不要在下行回调里用这个。** `ack_downlink()` 跑在 `modem_poll()` →
- * `consume_urc()` 的调用栈里，此刻 `at_lock` 已经被持有（k_mutex 可重入，
- * 所以 publish 本身没事），但在那里重连等于「一边遍历 URC 一边把会话拆掉」。
- * ack 发不出去是可以接受的：服务端会在下次上线时重发，而下行指令都是幂等的
- * （契约 §4.1）。
+ * 下行回调（`on_downlink` → `ack_downlink`）里用 `modem_publish` 是安全的：
+ * 审计 R1 之后 `dn_cb` 只从 `modem_poll()` 的 `deliver_downlinks()` 调，
+ * 那里不持 `at_lock`、也不在任何命令流里，所以不会重入 `modem_publish`。
+ * `ack_downlink` 仍然刻意用裸 `modem_publish` 而不是这个函数 —— ack 发不
+ * 出去是可以接受的（服务端下次上线重发，下行都幂等，契约 §4.1），
+ * 而在投递下行的当口走三分钟重连阶梯会把后面排队的指令一起拖住。
  */
 static int publish_retry(const char *topic, const char *buf, size_t len)
 {
