@@ -64,10 +64,19 @@ def build_web_router(svc: Service, cfg: ServerConfig) -> APIRouter:
             body = await request.json()
         except (json.JSONDecodeError, ValueError):
             raise HTTPException(status_code=400, detail="请求体不是 JSON") from None
+        # 审计 L14：合法 JSON 不一定是 dict（"x"、[1,2] 都能 parse），
+        # body.get 会 AttributeError → 500。未认证即可触发。
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
 
         import secrets as _s
         supplied = str(body.get("token") or "")
-        if not _s.compare_digest(supplied, cfg.api_token):
+        # 审计 M5：compare_digest 只认 ASCII-only str，非 ASCII 直接抛
+        # TypeError → 500，且发生在限速计数之前（畸形 token 无限打不触发
+        # 429）。先按字节比较：token 生成本来就是 urlsafe（ASCII），
+        # 任何非 ASCII 输入必然不匹配，编码后比较既安全又不受限制。
+        if not _s.compare_digest(supplied.encode("utf-8", "replace"),
+                                 cfg.api_token.encode("utf-8")):
             throttle.record_failure(ip)
             log.warning("登录失败，来源 %s", ip)
             raise HTTPException(status_code=401, detail="token 不对")

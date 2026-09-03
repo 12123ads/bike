@@ -587,3 +587,43 @@ def test_bsim_test_mtu_matches_firmware(prj_conf):
     for sym in ("BT_L2CAP_TX_MTU", "BT_BUF_ACL_RX_SIZE"):
         assert kconf_int(btext, sym) == kconf_int(prj_conf, sym), \
             f"bsim 测试与固件的 {sym} 不一致"
+
+
+# --- AT 命令层（2026-09-03 审计 H2 之后补：modem.c 之前完全不在扫描范围） ------
+
+
+@pytest.fixture(scope="module")
+def modem_c() -> str:
+    p = FW / "src" / "modem.c"
+    if not p.exists():
+        pytest.skip(f"没有固件源码 {p}")
+    return p.read_text(encoding="utf-8")
+
+
+def test_mconfig_will_topic_is_quoted_topic_literal(proto_h, modem_c):
+    """Air780EP 的 MCONFIG 是 7 参数位：
+    clientid, username, password, will_qos, will_retain, will_topic, will_message。
+    keepalive 属于 AT+MCONNECT，不在 MCONFIG 里。
+
+    上一版在 will_retain 后多塞了一个 `60`，把后半段整体顶错位：
+    will_topic 配成了 "60"、LWT topic 串被当成遗嘱内容 —— 遗嘱永远
+    发不到契约的 lwt topic，服务端收不到 lwt=1（审计 H2）。
+    """
+    # 只认真正的格式串行（注释里的语法示例也含 AT+MCONFIG，不能误匹配）。
+    # 格式串行以制表符开头、AT+MCONFIG 紧跟在开引号后。
+    lines = [ln for ln in modem_c.splitlines()
+             if '"AT+MCONFIG=' in ln]
+    assert lines, "modem.c 里找不到 AT+MCONFIG 格式串"
+    line = lines[0]
+    # 格式串里的 " 在 C 源码中是 \\" —— 7 参数位：3 字符串,1,1,字符串,字符串
+    assert '\\"%s\\",\\"%s\\",\\"%s\\",1,1,\\"%s\\"' in line, \
+        "MCONFIG 参数形状变了 —— 对照 Air780EP 手册的 7 参数位重新核对"
+    assert ",1,1,60," not in line, \
+        "MCONFIG 里又混进了 keepalive —— keepalive 属于 AT+MCONNECT"
+    assert "TOPIC_LWT" in modem_c
+
+
+def test_mconnect_carries_keepalive(modem_c):
+    """keepalive 的正确位置：AT+MCONNECT=<clean_session>,<keepalive>。"""
+    assert 'AT+MCONNECT=1,60' in modem_c, \
+        "keepalive 不在 AT+MCONNECT 里 —— 检查它是不是又被塞进 MCONFIG"

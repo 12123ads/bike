@@ -74,21 +74,43 @@ class LoginThrottle:
     API token 是 24 字节 urlsafe（约 190 bit），暴力破解本来就不现实，
     但**没有限速的登录接口会变成一个放大器** —— 每次请求都做一次
     `compare_digest`，攻击者可以用它来打满 CPU。这里按来源 IP 限速。
+
+    ⚠ 审计 M6 的两条修复：
+    1. `_fails` 曾经只增不清（过期条目仅在**同一 IP 再次失败**时顺带
+       清理）—— 伪造 X-Forwarded-For 的请求每次换一个值就能无界增长。
+       现在 `blocked()` 顺带做全局清理，且总条目数有硬上限。
+    2. XFF 可伪造是已知的（web.py 只拿它做限速）；真正的兜底是这里的
+       总量上限 —— 就算攻击者轮换 XFF 绕过限速，内存也不会被吃掉。
     """
 
     max_attempts: int = 10
     window: int = 300
+    #: _fails 的总条目上限（不同 IP 数）。真实用户是个位数；
+    #: 超过它意味着有人在轮换伪造来源，按最旧的丢。
+    max_tracked_ips: int = 1024
 
     _fails: dict[str, list[float]] = field(default_factory=dict)
 
+    def _prune_all(self, now: float) -> None:
+        """清掉所有过期条目；超上限时丢最旧的 IP 键。"""
+        for ip in [k for k, v in self._fails.items()
+                   if not any(now - t < self.window for t in v)]:
+            del self._fails[ip]
+        while len(self._fails) >= self.max_tracked_ips:
+            oldest = min(self._fails, key=lambda k: self._fails[k][0])
+            del self._fails[oldest]
+
     def blocked(self, ip: str) -> bool:
         now = time.time()
+        self._prune_all(now)
         hits = [t for t in self._fails.get(ip, []) if now - t < self.window]
         self._fails[ip] = hits
         return len(hits) >= self.max_attempts
 
     def record_failure(self, ip: str) -> None:
-        self._fails.setdefault(ip, []).append(time.time())
+        now = time.time()
+        self._prune_all(now)
+        self._fails.setdefault(ip, []).append(now)
 
     def reset(self, ip: str) -> None:
         self._fails.pop(ip, None)

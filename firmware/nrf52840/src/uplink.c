@@ -365,30 +365,55 @@ void uplink_request_now(void)
 
 static void flush_events(void)
 {
-	k_mutex_lock(&ev_lock, K_FOREVER);
+	/* 锁内只做快照和清标记，**发送在锁外**（审计 M3）：
+	 * publish_retry 含最坏 3 分钟的重连阶梯（modem.h），持锁发送会把
+	 * 也调 uplink_queue_event 的传感器驱动线程、系统工作队列
+	 * （包括锁释放脉冲 release_work！）和 unlock_workq 全部卡住 ——
+	 * 恰在「车被撬、事件密集、网络又差」的时刻。
+	 *
+	 * 发送失败的槽位重新标 used，留到下一轮（q 已分配，服务端按
+	 * (dev,q) 去重，重发安全 —— 契约 §5）。 */
+	static struct queued_event snap[EVENT_QUEUE_SIZE];
+	bool pending[EVENT_QUEUE_SIZE];
+
+	k_mutex_lock(&ev_lock);
 	for (size_t i = 0; i < EVENT_QUEUE_SIZE; i++) {
-		if (!ev_queue[i].used) {
-			continue;
-		}
-		int n = proto_enc_event(msg_buf, sizeof(msg_buf),
-					ev_queue[i].t, ev_queue[i].q,
-					ev_queue[i].ev,
-					ev_queue[i].detail[0] ? ev_queue[i].detail
-							      : NULL);
-		if (n < 0) {
-			LOG_ERR("拼事件失败 %d，丢弃", n);
-			ev_queue[i].used = false;
-			continue;
-		}
-		if (publish_retry(TOPIC_UP_EVENT, msg_buf, (size_t)n) == 0) {
-			ev_queue[i].used = false;
-		} else {
-			/* 发不出去就留着下一轮再试。q 已经分配了，
-			 * 服务端靠 (dev,q) 去重，重发是安全的（契约 §5）。 */
-			LOG_WRN("事件发送失败，留到下一轮");
+		pending[i] = ev_queue[i].used;
+		if (pending[i]) {
+			snap[i] = ev_queue[i];
 		}
 	}
 	k_mutex_unlock(&ev_lock);
+
+	for (size_t i = 0; i < EVENT_QUEUE_SIZE; i++) {
+		if (!pending[i]) {
+			continue;
+		}
+		int n = proto_enc_event(msg_buf, sizeof(msg_buf),
+					snap[i].t, snap[i].q, snap[i].ev,
+					snap[i].detail[0] ? snap[i].detail
+							  : NULL);
+		if (n < 0) {
+			LOG_ERR("拼事件失败 %d，丢弃", n);
+			k_mutex_lock(&ev_lock);
+			if (ev_queue[i].used && ev_queue[i].q == snap[i].q) {
+				ev_queue[i].used = false;
+			}
+			k_mutex_unlock(&ev_lock);
+			continue;
+		}
+		if (publish_retry(TOPIC_UP_EVENT, msg_buf, (size_t)n) == 0) {
+			k_mutex_lock(&ev_lock);
+			/* 只清「还是这一条」的槽位：发送期间新事件可能
+			 * 覆盖了被丢最旧的它（队列满时）。q 是唯一键。 */
+			if (ev_queue[i].used && ev_queue[i].q == snap[i].q) {
+				ev_queue[i].used = false;
+			}
+			k_mutex_unlock(&ev_lock);
+		} else {
+			LOG_WRN("事件发送失败，留到下一轮");
+		}
+	}
 }
 
 /* --- 一轮上报 --------------------------------------------------------------- */

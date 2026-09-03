@@ -110,32 +110,35 @@ class Service:
 
     # --- 上行 ----------------------------------------------------------------
 
-    async def ingest(self, client_id: str | None, topic: str, payload: bytes) -> None:
+    async def ingest(self, username: str | None, topic: str, payload: bytes) -> None:
         """处理一条上行。**所有校验失败都只记日志不抛** —— 畸形报文是常态
         （固件调试期尤其），不能让它影响别的设备或弄死 broker 的 task。
+
+        ``username`` 是 **broker 认证过的用户名**（password 模式 = 口令文件里的
+        账号；cert 模式 = 证书 SAN 里的设备 id）。它才是身份 —— MQTT 的
+        client_id 是 CONNECT 包里客户端自报的，与凭据无关，不能拿来判权。
         """
         try:
             parsed = ct.parse_topic(topic)
         except ct.ContractError:
-            log.warning("丢弃：topic 不属于契约 %r (client=%s)", topic, client_id)
+            log.warning("丢弃：topic 不属于契约 %r (user=%s)", topic, username)
             return
 
         dev, suffix = parsed.device_id, parsed.suffix
 
         # ⚠ MESSAGE_RECEIVED 在 broker 的 ACL 检查**之前**触发
         # （amqtt/broker.py:753 的注释明说了），所以这里自己再判一次身份。
-        # 没有这一层，一个能登录的客户端可以往别的设备 id 下灌报文。
-        #
-        # **顺序要紧**：这个判断不能挂在「dev 已配置」的条件里。
-        # parse_topic 接受任何符合 `[a-z0-9-]{1,32}` 的 id，所以先查配置再判身份
-        # 等于给未配置的 id 开了后门 —— bike01 的合法凭据能把行写进
-        # `ebike/v1/bike99/up/loc`，正是本注释声称要挡住的事。
-        if client_id is not None and client_id not in {dev, "svc"}:
-            log.warning("丢弃：client %r 无权发 %s", client_id, topic)
+        # 判据是「认证用户名 == topic 里的设备 id」—— 设备账号的用户名就是
+        # 设备 id（契约 §4）。`ha` 只读账号在这里被挡住，无论它把 client_id
+        # 报成什么；2026-09-03 审计 H1 之前的实现按 client_id 判且白名单含
+        # "svc"，等于允许任何持凭据者冒充任意设备。
+        if username != dev:
+            log.warning("丢弃：user %r 无权发 %s", username, topic)
             return
 
         # 未配置的设备一律丢。允许它们落库会让 /devices、/state 和 HA 看不到的
         # 数据堆在库里，且 build_state 拿不到 volt_curve/geofence。
+        # （到这里 username == dev，所以等价于「这个账号没配设备」。）
         if self.cfg.device(dev) is None:
             log.warning("丢弃：%s 不是已配置的设备（topic=%s）", dev, topic)
             return
@@ -188,6 +191,13 @@ class Service:
         elif suffix == ct.UP_ACK:
             assert isinstance(data, dict)
             row = await self.store.downlink(data["dn_id"])
+            # 审计 M10：dn_id 是全局主键，必须校验这条下行确实属于本设备。
+            # 否则（多车时）bike02 一条 ack 能把 bike01 的密钥轮换标记为已送达；
+            # 单车时配合身份冒充也能销账别人的下行。
+            if row is not None and row["dev"] != dev:
+                log.warning("丢弃：%s ack 了 %s 的下行 %s",
+                            dev, row["dev"], data["dn_id"])
+                return
             found = await self.store.mark_acked(
                 data["dn_id"], data["ok"], data.get("err"))
             if not found:
@@ -196,7 +206,7 @@ class Service:
             elif not data["ok"]:
                 log.warning("%s 拒绝了下行 %s: %s",
                             dev, data["dn_id"], data.get("err"))
-            elif row is not None:
+            else:
                 await self._apply_acked_cmd(dev, row)
 
     async def _apply_acked_cmd(self, dev: str, row: dict[str, Any]) -> None:
@@ -256,6 +266,27 @@ class Service:
         except (json.JSONDecodeError, ValueError, TypeError):
             pass
         await self.store.set_dev_fields(dev, lwt=flag)
+
+    async def ingest_lwt_will(self, topic: str, payload: bytes) -> None:
+        """broker 代发遗嘱的落库入口（审计 M9 / 契约 §4.2）。
+
+        amqtt 非优雅断连的遗嘱走 `_broadcast_message`，不触发
+        MESSAGE_RECEIVED，`IngestPlugin` 的常规路径看不到它；
+        `IngestPlugin.on_broker_retained_message` 从遗嘱 retain
+        （will_retain=1）那条路把它转到这里。身份在这里重新判：
+        topic 必须落在已配置设备上（遗嘱的 topic 是设备 CONNECT 时
+        自己配的，broker 原样广播，服务端只信已配置设备的 lwt topic）。
+        """
+        try:
+            parsed = ct.parse_topic(topic)
+        except ct.ContractError:
+            return
+        dev, suffix = parsed.device_id, parsed.suffix
+        if suffix != ct.LWT or self.cfg.device(dev) is None:
+            return
+        async with self._lock(dev):
+            await self._on_lwt(dev, payload)
+            await self.publish_state(dev)
 
     async def on_device_online(self, client_id: str) -> None:
         """CLIENT_CONNECTED 时冲刷下行队列（契约 §4.1）。"""

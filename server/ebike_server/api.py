@@ -42,10 +42,15 @@ def build_app(svc: Service, cfg: ServerConfig) -> FastAPI:
 
         用 `secrets.compare_digest` 而不是 `==`：token 比较的时间差可以被用来
         逐字节猜 token。这个接口能远程开锁（如果打开了），值得做对。
+
+        ⚠ 按字节比较（审计 M5）：str 版的 compare_digest 只认 ASCII，
+        HTTP 头经 latin-1 解码可含非 ASCII → TypeError → 未认证 500。
+        token 生成是 urlsafe（纯 ASCII），编码后比较语义不变。
         """
         import secrets as _s
-        expected = f"Bearer {cfg.api_token}"
-        if not authorization or not _s.compare_digest(authorization, expected):
+        expected = f"Bearer {cfg.api_token}".encode()
+        if not authorization or not _s.compare_digest(
+                authorization.encode("utf-8", "replace"), expected):
             raise HTTPException(status_code=401, detail="unauthorized")
 
     def check_dev(device_id: str) -> str:

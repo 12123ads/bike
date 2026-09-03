@@ -611,10 +611,19 @@ static int stage_session(void)
 		return rc;
 	}
 
-	/* MQTT 参数。LWT 在这里配（契约 §4.2：payload 是 {"lwt":1}，retain）。 */
+	/* MQTT 参数 + LWT（契约 §4.2：payload 是 {"lwt":1}，retain）。
+	 *
+	 * ⚠ 参数顺序对着合宙 Air780EP AT 手册的 MCONFIG 语法（7 个参数位）：
+	 *   AT+MCONFIG=<clientid>,<username>,<password>[,<will_qos>,
+	 *               <will_retain>,"<will_topic>","<will_message>"]
+	 * keepalive 不在 MCONFIG 里 —— 它属于下面的 AT+MCONNECT。
+	 *
+	 * 上一版多塞了一个 "60"，把整个后半段顶错位：will_topic 被配成
+	 * "60"、topic 串被当成遗嘱内容 —— 遗嘱发不到契约的 lwt topic，
+	 * 服务端永远收不到 lwt=1（2026-09-03 审计 H2）。 */
 	char cmd[512];
 	int n = snprintf(cmd, sizeof(cmd),
-		"AT+MCONFIG=\"%s\",\"%s\",\"%s\",1,1,60,\"%s\",\"{\\\"lwt\\\":1}\"",
+		"AT+MCONFIG=\"%s\",\"%s\",\"%s\",1,1,\"%s\",\"{\\\"lwt\\\":1}\"",
 		PROTO_DEVICE_ID, PROTO_DEVICE_ID, CONFIG_EBIKE_MQTT_PASSWORD,
 		TOPIC_LWT);
 	if (n < 0 || (size_t)n >= sizeof(cmd)) {

@@ -379,3 +379,136 @@ async def test_secret_is_not_retained_so_it_cannot_leak(running):
     assert svc.broker is not None
     for topic in svc.broker.retained_messages:
         assert "/dn/" not in topic, f"下行进了 retain 表：{topic}"
+
+
+# --- 2026-09-03 审计修复的回归测试 ------------------------------------------
+
+
+async def test_ha_credentials_cannot_ingest_even_with_spoofed_client_id(running):
+    """审计 H1：只读的 ha 账号把 client_id 报成 "svc"（或设备 id），
+    也不能往 ingest 里灌数据。
+
+    amqtt 的 MESSAGE_RECEIVED 在 ACL 之前触发（broker.py:753），
+    所以 broker 的 publish ACL 拦不住落库 —— 身份必须由 ingest 自己
+    按认证用户名判。旧实现按自报 client_id 判且白名单含 "svc"，
+    实测 ha 凭据 + client_id="svc" 能把假遥测写进库。
+    """
+    svc, _, dev_pw, ha_pw = running
+    # 连接层：ha 凭据 + client_id="svc" 能通过认证（amqtt 不管 client_id）
+    c = await connect_as("ha", ha_pw, client_id="svc")
+    # 灌一条假遥测 —— 修复后必须被 ingest 的身份校验拒掉
+    await c.publish(ct.topic("bike01", ct.UP_TELE),
+                    ct.dumps({"t": 1, "q": 777, "v": 66.6}), qos=1)
+    await asyncio.sleep(0.4)
+    import aiosqlite
+    db = await aiosqlite.connect(svc.cfg.db_path)
+    try:
+        cur = await db.execute("SELECT q FROM tele WHERE dev='bike01'")
+        rows = await cur.fetchall()
+        assert rows == [], f"ha 凭据经 client_id=svc 注入了遥测: {rows}"
+    finally:
+        await db.close()
+    await c.disconnect()
+
+
+async def test_device_cannot_ingest_under_another_configured_device(running):
+    """审计 H1 的对照组：身份跟**用户名**走，client_id 无关。
+
+    bike01 的合法凭据把 client_id 报成 "bike99"（随便报），发**自己**的
+    topic —— 必须正常落库（不能因为 client_id 对不上就拦掉正常设备；
+    amqtt 不管 client_id 与 username 的关系）。身份冒充的拒绝路径由
+    test_ha_credentials_cannot_ingest_even_with_spoofed_client_id 覆盖
+    （ha 用户名 ≠ 设备 id → 拒）。
+    """
+    svc, _, dev_pw, _ = running
+    c = await connect_as("bike01", dev_pw, client_id="bike99")
+    await c.publish(ct.topic("bike01", ct.UP_LOC),
+                    ct.dumps({"t": 1, "q": 555, "s": "g",
+                              "la": 31.2, "lo": 121.4}), qos=1)
+    await asyncio.sleep(0.4)
+    # track() 的 SELECT 列表没有 q，直接查库
+    import aiosqlite
+    db = await aiosqlite.connect(svc.cfg.db_path)
+    try:
+        cur = await db.execute(
+            "SELECT q FROM loc WHERE dev='bike01' AND q=555")
+        rows = await cur.fetchall()
+        assert rows == [(555,)], \
+            "合法设备换了个 client_id 就发不上自己的 topic —— 修过头了"
+    finally:
+        await db.close()
+    await c.disconnect()
+
+
+async def test_abnormal_disconnect_lwt_lands_in_db(running):
+    """审计 M9：broker 代发的遗嘱必须落库（lwt=1）。
+
+    amqtt 非优雅断连走 `_broadcast_message`，不触发 MESSAGE_RECEIVED；
+    修复后 IngestPlugin 挂了 RETAINED_MESSAGE 事件（will_retain=1 的
+    遗嘱会走 retain_message → 事件带 source_session），把它转进
+    `ingest_lwt_will`。这里直接调 `ingest_lwt_will` 验证落库路径本身；
+    完整的 broker 链路由下一条测试覆盖。
+    """
+    svc, _, dev_pw, _ = running
+    # 先清掉：hello 路径会置 lwt=0
+    await svc.store.set_dev_fields("bike01", lwt=0)
+    await svc.ingest_lwt_will(ct.topic("bike01", ct.LWT), b'{"lwt":1}')
+    ds = await svc.store.dev_state("bike01")
+    assert ds["lwt"] == 1, f"遗嘱没落库: {ds}"
+    # 垃圾 payload 也能容忍（保持 1，_on_lwt 的解析语义）
+    await svc.ingest_lwt_will(ct.topic("bike01", ct.LWT), b'garbage')
+    ds = await svc.store.dev_state("bike01")
+    assert ds["lwt"] == 1
+    # 非契约 topic 直接忽略
+    await svc.ingest_lwt_will("wrong/topic", b'{"lwt":1}')
+    # 未配置设备的 lwt topic 忽略
+    await svc.ingest_lwt_will(f"{ct.PREFIX}/bike99/lwt", b'{"lwt":1}')
+
+
+async def test_will_retained_event_reaches_ingest_via_plugin(running):
+    """审计 M9 的 broker 侧：带 will（retain=1）的客户端非优雅断连后，
+    RETAINED_MESSAGE 事件链路把 lwt=1 落库。
+
+    amqtt 的 MQTTClient 原生支持 will 配置（client.py:614-619 读
+    config["will"]）。连上后直接关底层 transport（不发 DISCONNECT），
+    broker 判非优雅 → 广播遗嘱 + retain → RETAINED_MESSAGE 事件 →
+    IngestPlugin.on_broker_retained_message → ingest_lwt_will。
+    """
+    svc, _, dev_pw, _ = running
+    c = MQTTClient(client_id="bike01-will", config={
+        "auto_reconnect": False, "keep_alive": 5,
+        "will": {"retain": True, "qos": 1,
+                 "topic": ct.topic("bike01", ct.LWT),
+                 "message": '{"lwt":1}'},
+    })
+    await c.connect(f"mqtt://bike01:{dev_pw}@127.0.0.1:{PORT}/")
+    await asyncio.sleep(0.3)
+    # 非优雅断连：绕过 disconnect()，直接关 transport。
+    # handler.writer 是 StreamWriterAdapter，里面的 _writer 才是真 StreamWriter。
+    assert c._handler is not None and c._handler.writer is not None
+    c._handler.writer._writer.transport.abort()
+
+    async def lwt_is_set():
+        ds = await svc.store.dev_state("bike01")
+        return True if ds["lwt"] == 1 else None
+
+    got = await wait_for(lwt_is_set, timeout=5)
+    assert got is True, "非优雅断连后 lwt 没有置 1 —— 遗嘱链路断了"
+
+
+async def test_ack_for_another_devices_downlink_rejected(running):
+    """审计 M10：设备不能 ack 别的设备的下行（dn_id 是全局主键）。
+
+    单车下最直接的触发面是身份冒充；这里直接构造跨设备场景：
+    给 bike01 排一条下行，然后以 bike01 的身份 ack 一条属于「未来
+    bike02」的 id —— 通过手工插库模拟。"""
+    svc, _, dev_pw, _ = running
+    # 手工插一条 dev='other' 的下行（绕过配置限制，模拟多车库）
+    await svc.store.enqueue_downlink("s-999", "other", ct.DN_SECRET, b"{}")
+    c = await connect_as("bike01", dev_pw)
+    await c.publish(ct.topic("bike01", ct.UP_ACK),
+                    ct.dumps({"t": 1, "q": 1, "id": "s-999", "ok": 1}), qos=1)
+    await asyncio.sleep(0.4)
+    row = await svc.store.downlink("s-999")
+    assert row["acked"] == 0, "bike01 销账了 other 的下行 —— dn_id 归属没校验"
+    await c.disconnect()

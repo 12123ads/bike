@@ -47,9 +47,13 @@ struct user_key {
  * 返回应答长度；缓冲不够返回负数。
  *
  * 这个函数**传输无关**：报文格式是 ISO7816-4 APDU，但载体是 BLE 的
- * GATT write（ble_unlock.c）。它跑在 ble_unlock.c 自有 work queue 的
- * 单线程上，所以下面那些无锁静态状态是安全的 —— 前提是**只有那一个线程**
- * 碰它们（CONFIG_BT_MAX_CONN=1 是这个前提的一部分）。
+ * GATT write（ble_unlock.c）。nonce 状态（cur_nonce/nonce_valid/selected）
+ * 跑在 ble_unlock.c 自有 work queue 的单线程上（CONFIG_BT_MAX_CONN=1
+ * 是这个前提的一部分）。
+ *
+ * ⚠ users[]/key_set_id 是**例外**：密钥下发（unlock_set/del/wipe_secrets）
+ * 从 uplink 线程调，与 unlock_workq 的 APDU 处理并发 —— 这部分用
+ * users_lock 互斥（unlock.c，2026-09-03 审计 H3）。
  *
  * 里面不做 flash 写入 —— counter 的持久化是异步交给 nvstore 的。
  */

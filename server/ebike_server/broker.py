@@ -45,6 +45,13 @@ class IngestPlugin(BasePlugin[BrokerContext]):
     #: `plugin_class(context)` 固定签名实例化插件，插不进自定义参数。
     service: ClassVar["Service | None"] = None
 
+    #: client_id → 认证用户名。amqtt 的 MESSAGE_RECEIVED 事件只带 client_id
+    #: （`broker.py:753`），而 client_id 是 CONNECT 包里**客户端自报**的、
+    #: 与凭据无关；认证身份在 session.username 里。这里在 CLIENT_CONNECTED
+    #: 时把两者记下来，MESSAGE_RECEIVED 时用它做身份判断。
+    #: 断开即清。单实例进程内共享（IngestPlugin 本身也是类属性单例模式）。
+    _auth_users: ClassVar[dict[str, str]] = {}
+
     async def on_broker_message_received(self, *, client_id: str | None = None,
                                          message: ApplicationMessage | None = None,
                                          **_: Any) -> None:
@@ -58,8 +65,12 @@ class IngestPlugin(BasePlugin[BrokerContext]):
         svc = IngestPlugin.service
         if svc is None or message is None or not message.topic:
             return
+        # 认证用户名，而非自报 client_id —— 2026-09-03 审计 H1：
+        # 任何持合法凭据的客户端把 client_id 填成目标设备 id（或 "svc"）
+        # 就能冒充它往 ingest 里灌数据。client_id 不是身份。
+        username = IngestPlugin._auth_users.get(client_id) if client_id else None
         try:
-            await svc.ingest(client_id, message.topic, bytes(message.data or b""))
+            await svc.ingest(username, message.topic, bytes(message.data or b""))
         except Exception:
             # 一条畸形报文不能弄死 broker 的 handler 任务
             log.exception("ingest 失败 topic=%s client=%s", message.topic, client_id)
@@ -70,7 +81,14 @@ class IngestPlugin(BasePlugin[BrokerContext]):
         svc = IngestPlugin.service
         if svc is None or client_id is None:
             return
-        log.info("客户端连上: %s", client_id)
+        # 记录认证身份。password 模式下 FileAuthPlugin 校验过的 username；
+        # cert 模式下 DeviceCertAuthPlugin 已保证 username == client_id。
+        # username 为空意味着这条连接根本没过认证（理论上到不了这里），
+        # 记成 "" 让后续 ingest 的严格匹配直接拒掉它。
+        IngestPlugin._auth_users[client_id] = (
+            client_session.username if client_session else "") or ""
+        log.info("客户端连上: %s (user=%s)", client_id,
+                 IngestPlugin._auth_users[client_id] or "?")
         # 契约 §4.1：设备一上线就冲刷未确认的下行队列。
         # 放在这里而不是等 up/hello，是因为 hello 有可能丢（QoS1 也只是至少一次，
         # 不是一定及时），而 CLIENT_CONNECTED 是 broker 本地事实。
@@ -78,12 +96,45 @@ class IngestPlugin(BasePlugin[BrokerContext]):
 
     async def on_broker_client_disconnected(self, *, client_id: str | None = None,
                                             **_: Any) -> None:
+        if client_id is not None:
+            IngestPlugin._auth_users.pop(client_id, None)
         log.info("客户端断开: %s", client_id)
 
     @dataclass
     class Config:
         """本插件无配置项，但 amqtt 要求这个类存在（`_load_str_plugin` 里
         用 dacite 严格模式填充它）。"""
+
+    async def on_broker_retained_message(
+            self, *, retained_message: Any = None, **_: Any) -> None:
+        """遗嘱落库路径（审计 M9 / 契约 §4.2）。
+
+        amqtt 的非优雅断连走 `_handle_disconnect → _broadcast_message`
+        （`broker.py:681`），这条路径**不触发** MESSAGE_RECEIVED——所以
+        `on_broker_message_received` 永远看不到 broker 代发的遗嘱，lwt=1
+        从来落不了库。唯一带数据的钩子是遗嘱 retain 时（will_retain=1，
+        固件 `AT+MCONFIG` 第 5 参数配的）触发的这个事件：
+        `retain_message(source_session, will_topic, ...) → RETAINED_MESSAGE`
+        （`broker.py:687-693, 846`）。
+
+        判据：topic 必须是契约的 lwt 后缀，且 source_session 非空
+        （服务端自己 retain state 时 source_session=None，`broker.py:324`）。
+        payload 走 `_on_lwt` 的既有解析，不认就当垃圾丢。
+        """
+        svc = IngestPlugin.service
+        if svc is None or retained_message is None:
+            return
+        topic = getattr(retained_message, "topic", None)
+        if not topic or not topic.endswith("/" + ct.LWT):
+            return
+        source = getattr(retained_message, "source_session", None)
+        if source is None:
+            return   # 服务端自己的 retain（state），不是遗嘱
+        try:
+            data = bytes(getattr(retained_message, "data", b"") or b"")
+            await svc.ingest_lwt_will(topic, data)
+        except Exception:
+            log.exception("遗嘱处理失败 topic=%s", topic)
 
 
 class DeviceCertAuthPlugin(UserAuthCertPlugin):
