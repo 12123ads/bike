@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import re
 from dataclasses import dataclass
@@ -19,12 +21,27 @@ PREFIX = f"ebike/{VERSION}"
 #: 设备 id。出厂烧录，等于 MQTT 用户名。契约 §4
 DEVICE_ID_RE = re.compile(r"^[a-z0-9-]{1,32}$")
 
-#: Air780EP 的单包上限，契约 §1 / DESIGN.md §8.2
+#: Air780EP 的单包上限，契约 §1 / DESIGN.md §8.2。这是**上行**的上限。
 MAX_PACKET_BYTES = 4100
+#: **下行**上限（审计 M1）。下行整条 `+MSUB: "<topic>",<len>,"<hex>"` URC 在
+#: 设备侧**一行**里到达，而 HEX 让 payload 翻倍 —— 固件的行缓冲
+#: （modem.c 的 LINE_MAX=640）才是真天花板，不是 4100。
+#:
+#: 超限的下行在设备侧被整条丢弃（`read_line` → -EMSGSIZE）。此前更糟：
+#: 静默截断 → 截掉 payload 的结束引号 → `handle_msub` 无日志丢弃 →
+#: **下行凭空消失，而这边每次设备上线都重发同一条**。
+#: 在构造时挡住，让 `/cmd`、`/secret` 立刻 400。
+#:
+#: 固件侧同一个数字是 `PROTO_MAX_DN_PAYLOAD`，
+#: `test_firmware_contract.py` 钉住两边一致并验 LINE_MAX 装得下。
+MAX_DOWNLINK_BYTES = 256
 #: topic 上限，同上
 MAX_TOPIC_BYTES = 256
 #: 批量位置点上限。契约 §5.2 的算术：20 × 95B ≈ 1.95KB，HEX 后 3.9KB，留 5% 余量
 MAX_BATCH_POINTS = 20
+#: HMAC secret 的原始字节数。契约 §6.2：`k` 是 base64 的 32 字节。
+#: 固件侧是 `unlock.h` 的 SECRET_LEN。
+SECRET_BYTES = 32
 
 # --- topic 后缀 ---------------------------------------------------------------
 
@@ -272,16 +289,53 @@ def parse_tele(raw: bytes) -> dict[str, Any]:
     }
 
 
+#: `up/event` 的 `d` 里允许出现的键，以及每个键的类型/范围。契约 §5.4。
+#: **值必须逐个校验**（审计 M4）：只校验「d 是对象」会让任意字符串
+#: 一路存进库、再被网页的事件面板拼进 innerHTML —— 存储型 XSS。
+#: 键名闭集也顺带挡住「设备塞一堆自定义字段把库撑大」。
+_EVENT_DETAIL_SPEC: dict[str, tuple[str, float, float]] = {
+    "mg": ("int", 0, 16000),        # 触发幅度，LIS2DW12 ±2g 满量程 2000mg，留余量
+    "uid": ("int", 0, 2**32 - 1),   # per-user 密钥 id
+    "lv": ("int", 0, 3),            # 欠压等级，DESIGN.md §6 的四级
+    "v": ("num", 0.0, 70.0),        # 电压，同 up/tele 的 v
+    "locked": ("bool", 0, 1),       # 锁位置反馈
+    "c": ("int", -2**31, 2**31 - 1),  # ble_err 的错误码（Zephyr 负 errno）
+}
+
+
+def _check_event_detail(detail: dict[str, Any]) -> dict[str, Any]:
+    """校验 `d` 的每个值。未知键、类型不对、越界一律拒收整条报文。"""
+    for key, val in detail.items():
+        spec = _EVENT_DETAIL_SPEC.get(key)
+        if spec is None:
+            raise ContractError(f"事件 d 里有未知键 {key!r}，"
+                                f"闭集是 {sorted(_EVENT_DETAIL_SPEC)}")
+        kind, lo, hi = spec
+        if kind == "bool":
+            if not isinstance(val, bool):
+                raise ContractError(f"d.{key} 必须是布尔，收到 {type(val).__name__}")
+            continue
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            raise ContractError(f"d.{key} 必须是数字，收到 {type(val).__name__}")
+        if kind == "int" and not isinstance(val, int):
+            raise ContractError(f"d.{key} 必须是整数，收到 {type(val).__name__}")
+        if not lo <= val <= hi:
+            raise ContractError(f"d.{key}={val} 超出 [{lo}, {hi}]")
+    return detail
+
+
 def parse_event(raw: bytes) -> dict[str, Any]:
-    """契约 §5.4。`e` 是闭集，未知值拒收。"""
+    """契约 §5.4。`e` 是闭集，未知值拒收；`d` 的键与值也逐个校验。"""
     o = _obj(load_payload(raw))
     t, q = _envelope(o)
     kind = _str(o, "e", maxlen=16)
     if kind not in EVENT_KINDS:
         raise ContractError(f"事件 e={kind!r} 不在 {sorted(EVENT_KINDS)}")
     detail = o.get("d")
-    if detail is not None and not isinstance(detail, dict):
-        raise ContractError("d 必须是对象或缺省")
+    if detail is not None:
+        if not isinstance(detail, dict):
+            raise ContractError("d 必须是对象或缺省")
+        _check_event_detail(detail)
     return {"t_dev": t, "q": q, "kind": kind, "detail": detail}
 
 
@@ -318,7 +372,21 @@ def dumps(obj: Any) -> bytes:
     """
     raw = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()
     if len(raw) > MAX_PACKET_BYTES:
-        raise ContractError(f"下行 {len(raw)} 字节，超过 {MAX_PACKET_BYTES}")
+        raise ContractError(f"报文 {len(raw)} 字节，超过 {MAX_PACKET_BYTES}")
+    return raw
+
+
+def _dumps_downlink(obj: Any) -> bytes:
+    """下行专用：额外挡住 `MAX_DOWNLINK_BYTES`（审计 M1）。
+
+    设备侧下行整条 URC 在一行里到达，超过固件行缓冲的会被**整条丢弃**；
+    在这里挡住比让它静默消失好 —— 至少 `/cmd`、`/secret` 会立刻 400。
+    """
+    raw = dumps(obj)
+    if len(raw) > MAX_DOWNLINK_BYTES:
+        raise ContractError(
+            f"下行 {len(raw)} 字节，超过设备能收的上限 {MAX_DOWNLINK_BYTES}"
+            "（固件行缓冲的物理限制，见 modem.c 的 LINE_MAX）")
     return raw
 
 
@@ -333,7 +401,7 @@ def build_cmd(dn_id: str, cmd: str, args: dict[str, Any] | None = None) -> bytes
     body: dict[str, Any] = {"id": dn_id, "c": cmd}
     if args:
         body["a"] = args
-    return dumps(body)
+    return _dumps_downlink(body)
 
 
 def build_secret(dn_id: str, op: str, *, uid: int | None = None,
@@ -341,6 +409,10 @@ def build_secret(dn_id: str, op: str, *, uid: int | None = None,
     """契约 §6.2。**这条报文里有明文密钥材料**，保护完全依赖 TLS。
 
     `retain=False` 是硬要求（DN_RETAIN），发送方不要自己传 retain。
+
+    ⚠ `k` 必须是 **base64 编码的恰好 32 字节**（审计 M3）：固件侧
+    `proto_dec_secret` 强校验 `olen == 32`，不合规的会被 ack 成 `badfmt`
+    并一直重发 —— 在这里挡住，让 `/secret` 立刻 400。
     """
     if op not in SECRET_OPS:
         raise ContractError(f"未知 op {op!r}，闭集是 {sorted(SECRET_OPS)}")
@@ -348,13 +420,30 @@ def build_secret(dn_id: str, op: str, *, uid: int | None = None,
     if op in ("set", "del"):
         if uid is None:
             raise ContractError(f"op={op} 必须带 uid")
+        if isinstance(uid, bool) or not isinstance(uid, int):
+            raise ContractError(f"uid 必须是整数，收到 {type(uid).__name__}")
+        if not 0 <= uid <= 2**32 - 1:
+            raise ContractError(f"uid={uid} 超出 uint32")
         body["uid"] = uid
     if op == "set":
         if key_b64 is None or kid is None:
             raise ContractError("op=set 必须带 kid 和 k")
+        if isinstance(kid, bool) or not isinstance(kid, int):
+            raise ContractError(f"kid 必须是整数，收到 {type(kid).__name__}")
+        if not 0 <= kid <= 65535:
+            raise ContractError(f"kid={kid} 超出 uint16")
+        if not isinstance(key_b64, str):
+            raise ContractError(f"k 必须是字符串，收到 {type(key_b64).__name__}")
+        try:
+            key_raw = base64.b64decode(key_b64, validate=True)
+        except (binascii.Error, ValueError) as e:
+            raise ContractError(f"k 不是合法 base64: {e}") from e
+        if len(key_raw) != SECRET_BYTES:
+            raise ContractError(
+                f"k 解码后 {len(key_raw)} 字节，契约 §6.2 要求 {SECRET_BYTES}")
         body["kid"] = kid
         body["k"] = key_b64
-    return dumps(body)
+    return _dumps_downlink(body)
 
 
 def redact(obj: Any) -> Any:

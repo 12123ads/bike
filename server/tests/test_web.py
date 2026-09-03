@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import base64
 import re
 
 import pytest
@@ -195,11 +196,13 @@ def test_track_limit_is_clamped_not_rejected(web):
 def test_pending_hides_secret_payload(web):
     _, _, c = web
     login(c)
-    c.post("/secret/bike01", headers={"Authorization": f"Bearer {TOKEN}"},
-           json={"op": "set", "uid": 1, "kid": 1, "key_b64": "SUPERSECRET"})
+    key32 = base64.b64encode(bytes(range(32))).decode()
+    r = c.post("/secret/bike01", headers={"Authorization": f"Bearer {TOKEN}"},
+               json={"op": "set", "uid": 1, "kid": 1, "key_b64": key32})
+    assert r.status_code == 200
     r = c.get("/api/pending?dev=bike01")
     assert r.status_code == 200
-    assert "SUPERSECRET" not in r.text
+    assert key32 not in r.text
 
 
 # --- 指令 -------------------------------------------------------------------

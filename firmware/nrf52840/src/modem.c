@@ -26,8 +26,30 @@ static const struct gpio_dt_spec pwrkey =
 	GPIO_DT_SPEC_GET(DT_NODELABEL(modem_pwrkey), gpios);
 
 /* 9600 baud ≈ 1 字节/ms。一行 AT 应答通常 < 64 字节，
- * 但 MQTT 下行的 URC 会带整个 payload，所以行缓冲要够大。 */
-#define LINE_MAX      512
+ * 但 MQTT 下行的 URC 会带整个 payload，所以行缓冲要够大。
+ *
+ * ⚠ **这个尺寸就是「设备能收多大的下行」**（审计 M1）。
+ * `+MSUB: "<topic>",<len>,"<hex payload>"` 一整条在一行里，而 HEX 模式
+ * 让 payload 字节数翻倍：
+ *
+ *   可收 payload = (LINE_MAX-1 - 框架) / 2，框架 = `+MSUB: ""` + topic
+ *                                          + `,<len>,` + 两个引号 ≈ 39
+ *   512 → 236 字节      640 → 300 字节
+ *
+ * 上一版 LINE_MAX=512 而 `dn_payload` 按 PROTO_MAX_PAYLOAD(3900) 开，
+ * 两个数字差 16 倍：**声称能收 3900，实际 236 以上就收不到**。
+ *
+ * 而且失败是完全静默的（实测确认，不是推断）：read_line 截掉尾部 →
+ * 那一刀必然砍掉 payload 的结束引号（HEX 区里只有 0-9A-F，不可能出现
+ * 一个字面量 `"`）→ `handle_msub` 走「找不到结束引号」分支 →
+ * `return true`（当作已消化）**且一条日志都不打**。
+ * 症状是「下行凭空消失、服务端每次上线重发同一条」，
+ * 而不是「收到一个截断的错值」。
+ *
+ * 现在两端都硬拒且都有日志：设备侧 read_line 返回 -EMSGSIZE 并 LOG_ERR，
+ * 服务端侧 `contract.MAX_DOWNLINK_BYTES` = PROTO_MAX_DN_PAYLOAD，
+ * 构造时就 400。两个数字由 test_firmware_contract.py 钉住一致。 */
+#define LINE_MAX      640
 #define RX_RING_SIZE  2048
 /* AT 命令的默认超时。9600 下一来一回加模组处理，2 秒是宽裕的；
  * 网络相关的命令单独给更长的超时。 */
@@ -53,9 +75,11 @@ static struct k_spinlock time_lock;
 static uint32_t nitz_utc;
 static int64_t nitz_uptime;   /* 拿到时间时的 uptime，用来推算当前时间 */
 
-/* 下行 URC 的解析缓冲。放静态区而不是栈上：LINE_MAX + payload 可能上 KB。 */
+/* 下行 URC 的解析缓冲。放静态区而不是栈上。
+ * dn_payload 按**下行**上限开（PROTO_MAX_DN_PAYLOAD），不是上行的 3900 ——
+ * 下行整条 URC 在一行里，LINE_MAX 才是天花板（审计 M1）。 */
 static char dn_topic[288];
-static uint8_t dn_payload[PROTO_MAX_PAYLOAD];
+static uint8_t dn_payload[PROTO_MAX_DN_PAYLOAD];
 
 /* --- UART 底层 -------------------------------------------------------------- */
 
@@ -87,14 +111,21 @@ static void uart_write_str(const char *s)
 	}
 }
 
-/* 读一行（以 '\n' 结束）。返回长度，超时返回 -ETIMEDOUT。
+/* 读一行（以 '\n' 结束）。返回长度；超时返回 -ETIMEDOUT，
+ * **超长返回 -EMSGSIZE**（行已被读干到 '\n'，调用方可以继续读下一行）。
  *
  * ⚠ 裸 '>' 提示符**不带换行**（§8.5 的陷阱之一），所以单独处理：
- * 读到 '>' 就立刻返回，不等换行。 */
+ * 读到 '>' 就立刻返回，不等换行。
+ *
+ * ⚠ **超长必须显式报错，不能静默截断**（审计 M1）。截断的下一站是
+ * `handle_msub` 的「找不到 payload 结束引号」分支，它 `return true` 且
+ * **不打日志** —— 下行凭空消失，而服务端每次设备上线都重发同一条。
+ * 报 -EMSGSIZE 让这件事有一条 LOG_ERR，且调用方能区分它和超时。 */
 static int read_line(char *out, size_t out_len, uint32_t timeout_ms)
 {
 	int64_t deadline = k_uptime_get() + timeout_ms;
 	size_t n = 0;
+	bool overflow = false;
 
 	while (k_uptime_get() < deadline) {
 		uint8_t c;
@@ -111,27 +142,35 @@ static int read_line(char *out, size_t out_len, uint32_t timeout_ms)
 			continue;
 		}
 		if (c == '\n') {
-			if (n == 0) {
+			if (n == 0 && !overflow) {
 				continue;   /* 空行，AT 应答前后都有 */
 			}
 			out[n] = '\0';
+			if (overflow) {
+				LOG_ERR("行超过 %d 字节被丢弃（前 %zu 字节：%.32s…）"
+					" —— 下行报文过大？", LINE_MAX, n, out);
+				return -EMSGSIZE;
+			}
 			return (int)n;
 		}
 		if (n + 1 < out_len) {
 			out[n++] = (char)c;
+		} else {
+			/* 继续读到 '\n' 保持行同步，但整行作废 */
+			overflow = true;
 		}
 
 		/* 裸提示符：收到就返回，它后面没有换行 */
-		if (n == 1 && out[0] == '>') {
+		if (n == 1 && !overflow && out[0] == '>') {
 			out[1] = '\0';
 			return 1;
 		}
 	}
-	if (n > 0) {
+	if (n > 0 && !overflow) {
 		out[n] = '\0';
 		return (int)n;
 	}
-	return -ETIMEDOUT;
+	return overflow ? -EMSGSIZE : -ETIMEDOUT;
 }
 
 /* --- URC 处理 --------------------------------------------------------------- */
@@ -366,6 +405,11 @@ static int at_cmd_expect(const char *cmd, const char *expect,
 	while (k_uptime_get() < deadline) {
 		int64_t left = deadline - k_uptime_get();
 		int n = read_line(line, sizeof(line), (uint32_t)left);
+		if (n == -EMSGSIZE) {
+			/* 超长行已被丢弃但流是同步的 —— 继续等本命令的应答，
+			 * 不要把它当成超时（审计 M1）。 */
+			continue;
+		}
 		if (n < 0) {
 			break;
 		}
@@ -391,7 +435,20 @@ static int at_cmd_expect(const char *cmd, const char *expect,
 		 * `CONNACK OK` 这些**是**要交给调用方的信息行（它们同时也是
 		 * 某些命令的 expect），不能一起排除掉。 */
 		bool is_final_ok = (strcmp(line, "OK") == 0);
-		bool matched = (strstr(line, expect) != NULL);
+
+		/* ⚠ **迟到的带外 URC 不能替本命令「答到」**（审计 M2）。
+		 *
+		 * `at_cmd()` 的 expect 是 `"OK"`，而 `SEND OK` / `CONNECT OK` /
+		 * `CONNACK OK` 都是带外 URC（§8.5），子串匹配会命中它们。
+		 * 时序：publish 等 `SEND OK` 超时放弃 → URC 迟到滞留 ring →
+		 * 下一条 `AT+CPOWD=1` 读到它 → `strstr(...,"OK")` 命中 →
+		 * **命令没执行却返回成功**（模组实际没关机，持续耗电）。
+		 *
+		 * 修法：expect 恰好是 `"OK"` 时要求**整行**是 "OK"（终结码本来
+		 * 就是独占一行）；调用方显式等 `SEND OK` 之类时才用子串匹配。 */
+		bool matched = (strcmp(expect, "OK") == 0)
+			? is_final_ok
+			: (strstr(line, expect) != NULL);
 		bool errored = (!matched && strstr(line, "ERROR") != NULL);
 
 		if (resp != NULL && resp_len > 0 && line[0] != '\0' && !is_final_ok) {
@@ -830,6 +887,9 @@ int modem_publish(const char *topic, const uint8_t *payload, size_t len,
 	while (k_uptime_get() < deadline) {
 		int64_t left = deadline - k_uptime_get();
 		int r = read_line(line, sizeof(line), (uint32_t)left);
+		if (r == -EMSGSIZE) {
+			continue;   /* 超长行已丢弃，流仍同步（审计 M1） */
+		}
 		if (r < 0) {
 			break;
 		}
@@ -874,6 +934,9 @@ int modem_poll(uint32_t timeout_ms)
 	while (k_uptime_get() < deadline) {
 		int64_t left = deadline - k_uptime_get();
 		int n = read_line(line, sizeof(line), (uint32_t)left);
+		if (n == -EMSGSIZE) {
+			continue;   /* 超长行已丢弃，流仍同步（审计 M1） */
+		}
 		if (n < 0) {
 			break;
 		}
@@ -923,7 +986,9 @@ uint32_t modem_utc(void)
 
 int modem_lbs(double *lat, double *lon, float *acc_m)
 {
-	if (!connected) {
+	/* 审计 L1：原来是裸 `!connected`，违反本文件 41-47 行自己立的规矩
+	 * （connected 必须 atomic 访问）。 */
+	if (atomic_get(&connected) == 0) {
 		return -ENOTCONN;
 	}
 	char resp[128] = { 0 };
@@ -945,12 +1010,27 @@ int modem_lbs(double *lat, double *lon, float *acc_m)
 	if (p == NULL) {
 		return -EINVAL;
 	}
-	*lon = strtod(p + 1, NULL);
+	double lon_v = strtod(p + 1, NULL);
 	p = strchr(p + 1, ',');
 	if (p == NULL) {
 		return -EINVAL;
 	}
-	*lat = strtod(p + 1, NULL);
+	double lat_v = strtod(p + 1, NULL);
+
+	/* ⚠ 字段为空或不是数字时 strtod 返回 0.0，**不能当成有效坐标** ——
+	 * (0,0) 在几内亚湾，服务端的范围校验（契约 §5.2 的 ±90/±180）拦不住它，
+	 * 落库后地图上车会瞬移到那里（审计 M2）。
+	 * GNSS 路径有同样的防护（gnss.c 的 `f->valid = (lat != 0 || lon != 0)`），
+	 * 这里补齐。顺带把范围也判掉：基站定位偶发给出越界值时同样丢弃。 */
+	if ((lat_v == 0.0 && lon_v == 0.0) ||
+	    lat_v < -90.0 || lat_v > 90.0 ||
+	    lon_v < -180.0 || lon_v > 180.0) {
+		LOG_WRN("基站定位给了无效坐标 %.6f,%.6f —— 丢弃", lat_v, lon_v);
+		return -EINVAL;
+	}
+
+	*lat = lat_v;
+	*lon = lon_v;
 
 	/* 基站定位没有精度字段。给一个保守的固定值 ——
 	 * 契约 §5.2 要求 `a` 能反映粗糙度，1000 m 是城区基站定位的典型量级。

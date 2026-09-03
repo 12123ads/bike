@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import base64
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -16,6 +18,8 @@ from ebike_server.service import Service
 
 TOKEN = "testtoken"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
+#: 合法的 §6.2 密钥：base64 的恰好 32 字节（契约层强校验，见审计 M3）。
+KEY32 = base64.b64encode(bytes(range(32))).decode()
 
 
 @pytest.fixture
@@ -143,6 +147,19 @@ def test_unknown_cmd_rejected(svc_and_client):
     assert c.post("/cmd/bike01/selfdestruct", headers=AUTH).status_code == 400
 
 
+def test_oversized_cmd_args_rejected_as_client_error(svc_and_client):
+    """审计 M1：超过 `MAX_DOWNLINK_BYTES` 的下行在设备侧会被整条丢弃，
+    所以服务端构造时就拒。**必须是 400 而不是 500** —— args 是客户端给的。
+    """
+    _, _, c = svc_and_client
+    r = c.post("/cmd/bike01/interval", headers=AUTH,
+               json={"s": 900, "pad": "x" * ct.MAX_DOWNLINK_BYTES})
+    assert r.status_code == 400
+    assert "下行" in r.json()["detail"]
+    # 坏报文不能留在队列里
+    assert c.get("/pending?dev=bike01", headers=AUTH).json()["pending"] == []
+
+
 def test_remote_unlock_disabled_by_default(svc_and_client):
     """契约 §6.1：远程开锁绕过 BLE 挑战应答，默认必须关着。"""
     _, cfg, c = svc_and_client
@@ -162,9 +179,9 @@ def test_secret_response_does_not_echo_key(svc_and_client):
     """契约 §6.2：明文密钥不能回显，也不能进日志。"""
     _, _, c = svc_and_client
     r = c.post("/secret/bike01", headers=AUTH,
-               json={"op": "set", "uid": 1, "kid": 8, "key_b64": "SUPERSECRET"})
+               json={"op": "set", "uid": 1, "kid": 8, "key_b64": KEY32})
     assert r.status_code == 200
-    assert "SUPERSECRET" not in r.text
+    assert KEY32 not in r.text
 
 
 def test_secret_bad_op_rejected(svc_and_client):
@@ -179,14 +196,29 @@ def test_secret_missing_fields_rejected(svc_and_client):
     assert r.status_code == 400
 
 
+@pytest.mark.parametrize("bad_key", [
+    "SUPERSECRET",          # 不是合法 base64
+    "QUFBQQ==",             # 合法 base64 但只有 4 字节
+    "SUPERSECRET!!",        # 非法字符
+])
+def test_secret_bad_key_rejected_at_the_door(svc_and_client, bad_key):
+    """审计 M3：长度不对的密钥以前会入队，然后被设备 ack 成 `badfmt`
+    并被服务端**无限重发**。现在 `/secret` 直接 400，队列里不留坏报文。"""
+    _, _, c = svc_and_client
+    r = c.post("/secret/bike01", headers=AUTH,
+               json={"op": "set", "uid": 1, "kid": 8, "key_b64": bad_key})
+    assert r.status_code == 400
+    assert c.get("/pending?dev=bike01", headers=AUTH).json()["pending"] == []
+
+
 def test_pending_hides_payload(svc_and_client):
     """/pending 是诊断接口，但队列里可能有明文密钥。"""
     _, _, c = svc_and_client
     c.post("/secret/bike01", headers=AUTH,
-           json={"op": "set", "uid": 1, "kid": 8, "key_b64": "SUPERSECRET"})
+           json={"op": "set", "uid": 1, "kid": 8, "key_b64": KEY32})
     r = c.get("/pending?dev=bike01", headers=AUTH)
     assert r.status_code == 200
-    assert "SUPERSECRET" not in r.text
+    assert KEY32 not in r.text
     rows = r.json()["pending"]
     assert len(rows) == 1 and rows[0]["suffix"] == ct.DN_SECRET
     assert rows[0]["bytes"] > 0
@@ -224,6 +256,49 @@ def test_docker_defaults_bind_all_and_disable_plaintext(tmp_path):
     assert cfg.http_bind.startswith("0.0.0.0:")
     assert cfg.mqtt.tls_bind.startswith("0.0.0.0:")
     assert cfg.mqtt.plain_bind == "", "容器配置不该开明文 MQTT 口"
+
+
+def test_write_default_covers_every_config_field(tmp_path):
+    """`write_default` 手写字段列表，漏一个就是「配置项存在但 init 不写」——
+    用户改不到它（`_hydrate` 未知键会报错，但缺键只是静默用默认值）。
+
+    审计 M12 加 `mqtt.max_connections` 时正好踩到这条：漏写会让人以为
+    连接数上限不可配。
+    """
+    import dataclasses
+    import json as jsonmod
+
+    from ebike_server import config as cfgmod
+
+    p = cfgmod.write_default(tmp_path / "config.json")
+    data = jsonmod.loads(p.read_text(encoding="utf-8"))
+
+    # 顶层：跳过下划线开头的内部字段
+    top = {f.name for f in dataclasses.fields(cfgmod.ServerConfig)
+           if not f.name.startswith("_")}
+    assert top - set(data) == set(), f"顶层漏写：{top - set(data)}"
+
+    for section, cls in (("mqtt", cfgmod.MqttConfig), ("web", cfgmod.WebConfig)):
+        want = {f.name for f in dataclasses.fields(cls)
+                if not f.name.startswith("_")}
+        # web.gaode_key 是运行期从文件/环境变量填的，不该出现在配置文件里
+        want.discard("gaode_key")
+        missing = want - set(data[section])
+        assert missing == set(), f"{section} 段漏写：{missing}"
+
+
+def test_max_connections_survives_a_config_roundtrip(tmp_path):
+    """审计 M12：改了配置文件里的上限必须真的生效。"""
+    import json as jsonmod
+
+    from ebike_server import config as cfgmod
+
+    p = cfgmod.write_default(tmp_path / "config.json")
+    data = jsonmod.loads(p.read_text(encoding="utf-8"))
+    assert data["mqtt"]["max_connections"] > 0, "默认配置没有连接数上限"
+    data["mqtt"]["max_connections"] = 7
+    p.write_text(jsonmod.dumps(data), encoding="utf-8")
+    assert cfgmod.load(p).mqtt.max_connections == 7
 
 
 def test_missing_config_raises_not_silently_defaults(tmp_path):

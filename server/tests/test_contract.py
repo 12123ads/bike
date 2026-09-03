@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -159,6 +160,48 @@ def test_all_documented_events_parse():
         ct.parse_event(j({"t": 1, "q": 3, "e": kind}))
 
 
+def test_all_documented_detail_shapes_parse():
+    """契约 §5.4 那张表里每种 `d` 的形状都必须能过。"""
+    ok = [
+        {"e": "motion", "d": {"mg": 180}},
+        {"e": "unlock_ok", "d": {"uid": 1}},
+        {"e": "unlock_deny", "d": {"uid": 0}},
+        {"e": "lock_state", "d": {"locked": True}},
+        {"e": "lock_state", "d": {"locked": False}},
+        {"e": "lowbatt", "d": {"lv": 1, "v": 48.1}},
+        {"e": "lowbatt", "d": {"lv": 3, "v": 41.9}},   # 固件确实会发 lv=3
+        {"e": "ble_err", "d": {"c": -22}},
+        {"e": "boot"},                                  # 无 d
+    ]
+    for body in ok:
+        ct.parse_event(j({"t": 1, "q": 3, **body}))
+
+
+@pytest.mark.parametrize("bad_detail", [
+    # 审计 M4：字符串值曾经能一路进库、再进网页的 innerHTML（存储型 XSS）
+    {"mg": "<img src=x onerror=alert(1)>"},
+    {"uid": '"><svg onload=alert(2)>'},
+    {"v": "46.2"},                # 字符串数字也不行
+    {"mg": True},                 # bool 不是数字（bool 是 int 子类，要显式挡）
+    {"locked": 1},                # locked 必须是布尔，不是 0/1
+    {"lv": 9},                    # 越界：DESIGN.md §6 只有 0~3
+    {"mg": -1},                   # 幅度不能是负的
+    {"v": 999.9},                 # 电压上限同 up/tele
+    {"evil": 1},                  # 未知键
+    {"mg": 180, "evil": "x"},     # 混进未知键也拒
+])
+def test_bad_event_detail_rejected(bad_detail):
+    with pytest.raises(ct.ContractError):
+        ct.parse_event(j({"t": 1, "q": 3, "e": "motion", "d": bad_detail}))
+
+
+def test_event_detail_keys_match_documented_set():
+    """`d` 的键闭集必须和文档 §5.4 那张表一致。"""
+    text = DOC.read_text(encoding="utf-8")
+    for key in ct._EVENT_DETAIL_SPEC:
+        assert f'"{key}"' in text, f"文档 §5.4 里没有 d.{key}"
+
+
 # --- up/ack -----------------------------------------------------------------
 
 
@@ -187,14 +230,57 @@ def test_all_documented_commands_build():
         ct.build_cmd("c-1", cmd)
 
 
+#: 合法的 §6.2 密钥：base64 的恰好 32 字节。
+KEY32 = base64.b64encode(bytes(range(32))).decode()
+
+
 def test_build_secret_requires_fields():
     with pytest.raises(ct.ContractError):
         ct.build_secret("s-1", "set", uid=1)          # 缺 kid/k
     with pytest.raises(ct.ContractError):
         ct.build_secret("s-1", "del")                 # 缺 uid
-    raw = ct.build_secret("s-1", "set", uid=1, kid=8, key_b64="AAAA")
-    assert json.loads(raw)["k"] == "AAAA"
+    raw = ct.build_secret("s-1", "set", uid=1, kid=8, key_b64=KEY32)
+    assert json.loads(raw)["k"] == KEY32
     ct.build_secret("s-1", "wipe")                    # wipe 不需要 uid
+
+
+def test_build_secret_rejects_wrong_key_length():
+    """契约 §6.2：`k` 是 base64 的**恰好 32 字节**（审计 M3）。
+
+    固件 `proto_dec_secret` 强校验 `olen == SECRET_LEN`，短了/长了都会被
+    ack 成 `badfmt`，而服务端会一直重发同一条坏报文。在构造时就挡住。
+    """
+    for bad in (b"", bytes(31), bytes(33), bytes(64)):
+        with pytest.raises(ct.ContractError, match="32"):
+            ct.build_secret("s-1", "set", uid=1, kid=8,
+                            key_b64=base64.b64encode(bad).decode())
+
+
+def test_build_secret_rejects_non_base64():
+    with pytest.raises(ct.ContractError, match="base64"):
+        ct.build_secret("s-1", "set", uid=1, kid=8, key_b64="SUPERSECRET!!")
+
+
+def test_build_secret_rejects_out_of_range_ids():
+    """uid 是 uint32、kid 是 uint16（契约 §6.2 / 固件 `struct user_key`）。"""
+    with pytest.raises(ct.ContractError, match="kid"):
+        ct.build_secret("s-1", "set", uid=1, kid=65536, key_b64=KEY32)
+    with pytest.raises(ct.ContractError, match="uid"):
+        ct.build_secret("s-1", "set", uid=2**32, kid=1, key_b64=KEY32)
+    with pytest.raises(ct.ContractError, match="uid"):
+        ct.build_secret("s-1", "del", uid=-1)
+
+
+def test_downlink_size_cap_is_below_device_line_buffer():
+    """审计 M1：下行超过 `MAX_DOWNLINK_BYTES` 在设备侧会被整条丢弃，
+    所以服务端构造时就要拒。上限本身必须远小于上行上限。"""
+    assert ct.MAX_DOWNLINK_BYTES < ct.MAX_PACKET_BYTES
+    # 合法指令 + 超大 args：只有下行上限能拦住它
+    with pytest.raises(ct.ContractError, match="下行"):
+        ct.build_cmd("c-1", "interval",
+                     {"s": 900, "pad": "x" * ct.MAX_DOWNLINK_BYTES})
+    # 正常大小的同一条指令必须过
+    assert ct.build_cmd("c-1", "interval", {"s": 900})
 
 
 def test_dumps_is_compact():

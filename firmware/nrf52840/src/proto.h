@@ -29,8 +29,24 @@
 #define TOPIC_DN_CMD      PROTO_PREFIX "/" PROTO_DEVICE_ID "/dn/cmd"
 #define TOPIC_DN_SECRET   PROTO_PREFIX "/" PROTO_DEVICE_ID "/dn/secret"
 
-/* 契约 §1：Air780EP 单包上限。留 200 字节余量给 AT 命令头。 */
+/* 契约 §1：Air780EP 单包上限。留 200 字节余量给 AT 命令头。
+ * 这是**上行**的上限（我们自己拼报文，长度可控）。 */
 #define PROTO_MAX_PAYLOAD  3900
+
+/* **下行**上限（审计 M1）。上行和下行的约束不同：
+ * 下行整条 `+MSUB: "<topic>",<len>,"<hex>"` URC 在**一行**里到达，
+ * 而 HEX 让 payload 翻倍 —— 行缓冲（modem.c 的 LINE_MAX）才是真正的
+ * 天花板，不是 3900。
+ *
+ *   256×2 + 框架 39 = 551 ≤ LINE_MAX-1 = 639   ✓（余量 88）
+ *
+ * 256 对所有契约 §6 的下行都有充裕余量：最长的是 `dn/secret`
+ * （设备 id 顶到 32 字符 + base64 密钥），实测 90 字节。
+ *
+ * 服务端侧同一个数字在 `contract.MAX_DOWNLINK_BYTES`，
+ * `test_firmware_contract.py` 钉住两边一致，并单独验 LINE_MAX 装得下。 */
+#define PROTO_MAX_DN_PAYLOAD  256
+
 /* 契约 §5.2：批量位置点上限，服务端会硬拒超过的 */
 #define PROTO_MAX_BATCH    20
 
@@ -74,7 +90,11 @@ struct proto_loc {
 struct proto_tele {
 	uint32_t t;
 	uint32_t q;
-	float volt;        /* 电池电压 V */
+	/* 电池电压 V。**ADC 读失败时不能发 0.0** —— 服务端会当真值落库，
+	 * HA 上显示 0V/0%，看起来像被剪线（审计 M8）。缺省靠 has_volt，
+	 * 和下面 temp/has_temp 一个道理。契约 §5.3 说 v 可省。 */
+	float volt;
+	bool has_volt;
 	int8_t csq;        /* AT+CSQ 的 rssi，负数缺省 */
 	uint32_t uptime;
 	/* 芯片结温，摄氏度。**不能用负数当缺省标记** —— 冬天真的会是负的，

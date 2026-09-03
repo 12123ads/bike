@@ -76,6 +76,19 @@ python3 -m venv .venv && .venv/bin/python -m pip install -e server[dev]
 
 裸跑时 `plain_bind` 默认 `127.0.0.1:1883`，方便本机调试；容器配置里是空的。
 
+### 连接数上限
+
+`mqtt.max_connections` 默认 **32**，对**每个** listener 分别生效。
+
+amqtt 自己的默认是 `-1`（不限制），而它读 CONNECT 包的那一步
+（`BrokerProtocolHandler.init_from_connect`）**没有超时** —— 一个只完成 TCP/TLS
+握手却不发 CONNECT 的连接会永久占着一个 asyncio 任务和一份 TLS 会话内存。
+8883 是公网端口，这条路径不设限就是一个免费的内存耗尽面。
+
+真实需求是 1 台车 + 1 个 HA = 2 条；32 留了「旧会话还没超时就重连」和多车的余量。
+上限满了之后新连接**排队等名额**而不是被拒（amqtt 用 `asyncio.Semaphore`），
+配合 `timeout_disconnect_delay=2` 让僵死连接自己掉。
+
 ## 3. HTTP API
 
 全部要 `Authorization: Bearer <api_token>`，除了 `/health`。
@@ -159,19 +172,19 @@ FastAPI 默认在这三个地址**无鉴权**公开完整 schema，包括 `/cmd/
 cd server && ../.venv/bin/python -m pytest -q
 ```
 
-**240 条全过、1 条跳过**（本机实测，约 23 秒）。分九层：
+**301 条全过、1 条跳过**（本机实测，约 30 秒）。分九层：
 
 | 文件 | 条数 | 测什么 |
 | --- | --- | --- |
-| `test_contract.py` | 39 | 契约编解码。重点在**拒绝路径**——畸形报文被放过去会一路污染到 HA |
-| `test_firmware_contract.py` | 39 | **固件 C 源码和服务端的契约一致性**（文本层交叉检查，见 [`FIRMWARE.md`](FIRMWARE.md)） |
-| `test_web.py` | 33+1skip | 网页鉴权边界、cookie 标记、登录限速、高德 key 读取失败要 warn |
+| `test_firmware_contract.py` | 68 | **固件 C 源码和服务端的契约一致性**（文本层交叉检查，见 [`FIRMWARE.md`](FIRMWARE.md)）。含下行大小上限三处数字自洽（`LINE_MAX` / `PROTO_MAX_DN_PAYLOAD` / `MAX_DOWNLINK_BYTES`） |
+| `test_contract.py` | 55 | 契约编解码。重点在**拒绝路径**——畸形报文被放过去会一路污染到 HA。含 `dn/secret` 的 `k` 必须是 base64 的恰好 32 字节、下行大小上限 |
+| `test_web.py` | 34 | 网页鉴权边界、cookie 标记、登录限速、高德 key 读取失败要 warn |
 | `test_ha_contract.py` | 32 | **HA 集成和服务端的契约一致性**，见 [`HA.md`](HA.md) §6 |
 | `test_store_derive.py` | 30 | SQLite 去重、下行队列顺序与 id 跨重启唯一、`interval` 回写、在线判定、移动判定、坐标转换 |
-| `test_api.py` | 23 | 鉴权、参数边界、远程开锁默认关、密钥不回显、`/health` 不泄露、交互式文档已关 |
-| `test_web_frontend.py` | 16 | **前端 JS**：`node --check`、坐标转换和服务端逐点比对、假 DOM 渲染。见 [`WEB.md`](WEB.md) §7 |
-| `test_e2e.py` | 15 | 真起 broker + 真 MQTT 客户端：ACL 拦得住吗、跨设备 id 灌数据挡不挡、retain 发给后连上的吗、下行队列真的冲刷吗 |
-| `test_certs.py` | 12 | 真的 TLS 握手、证书 CN、私钥权限 0600、换 CA 连不上、**mTLS 模式端到端** |
+| `test_api.py` | 29 | 鉴权、参数边界、远程开锁默认关、密钥不回显、`/health` 不泄露、交互式文档已关、超限下行是 400 而非 500、`init` 必须写全每个配置字段 |
+| `test_e2e.py` | 23 | 真起 broker + 真 MQTT 客户端：ACL 拦得住吗、跨设备 id 灌数据挡不挡、retain 发给后连上的吗、下行队列真的冲刷吗、遗嘱链路通不通、并发下 state/下行会不会乱序或死锁 |
+| `test_web_frontend.py` | 17 | **前端 JS**：`node --check`、坐标转换和服务端逐点比对、假 DOM 渲染、恶意事件 detail 渲染后不产生真实元素。见 [`WEB.md`](WEB.md) §7 |
+| `test_certs.py` | 14 | 真的 TLS 握手、证书 CN、私钥权限 0600、换 CA 连不上、**mTLS 模式端到端**、每个 listener 都有连接数上限且真传到 broker |
 
 几条值得单独提的：
 
@@ -193,6 +206,17 @@ cd server && ../.venv/bin/python -m pytest -q
   能把行写进 `ebike/v1/bike99/up/loc`。
 - `test_cert_mode_device_can_publish_and_subscribe` 是 mTLS 模式的第一条
   端到端测试（见第 5 节第 4 条）。
+- `test_publish_state_calls_are_serialized` 钉住 M11 的锁纪律，而且**自带探针
+  自检**：先证明加锁后零交错，再故意绕过锁跑一遍并断言**必须**观测到交错。
+  没有第二段的话，探针本身不灵敏（比如时序窗口太窄）时这条测试是个空壳。
+- `test_ingest_and_http_paths_do_not_deadlock` 是 M11 的反向护栏：
+  `asyncio.Lock` 不可重入，持锁调用方必须走 `_locked` 变体。搞错一处就是
+  **永久死锁**（整个设备的上行全停），比乱序严重得多。
+- `test_oversized_cmd_args_rejected_as_client_error` 钉住「超限下行是 400 不是
+  500」——`args` 由客户端给，报文层拒绝属于客户端错误。
+- `test_write_default_covers_every_config_field` 遍历 dataclass 字段比对
+  `init` 生成的 JSON。漏写一个字段不会报错，只会让用户**改不到那个配置项**
+  （`_hydrate` 拒未知键，但缺键静默用默认值）。加 `max_connections` 时正好踩到。
 
 ## 7. Docker 里手动验过的
 

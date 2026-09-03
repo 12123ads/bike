@@ -135,6 +135,15 @@ EVENTS_FIXTURE = [
     {"t_srv": 1788280200, "kind": "lowbatt", "detail": {"lv": 1, "v": 46.2}},
 ]
 
+#: 恶意 detail：契约层现在会拒掉这种值（`_check_event_detail`），
+#: 但渲染层是第二道墙 —— 上游放松校验时它不能变成存储型 XSS（审计 M4）。
+XSS_EVENTS_FIXTURE = [
+    {"t_srv": 1788280500, "kind": "motion",
+     "detail": {"mg": "<img src=x onerror=alert(1)>"}},
+    {"t_srv": 1788280400, "kind": "<script>bad()</script>",
+     "detail": {"uid": "\"><svg onload=alert(2)>"}},
+]
+
 
 @pytest.fixture(scope="module")
 def rendered(index_js, tmp_path_factory) -> dict:
@@ -194,6 +203,45 @@ def test_events_rendered_with_labels(rendered):
     assert "电量低" in html and "46.2" in html
     # 危险事件要有区分的 class，好上颜色
     assert "ev-unlock_deny" in html and "ev-lowbatt" in html
+
+
+@pytest.fixture(scope="module")
+def rendered_xss(index_js, tmp_path_factory) -> dict:
+    d = tmp_path_factory.mktemp("render_xss")
+    (d / "state.json").write_text(json.dumps(STATE_FIXTURE), encoding="utf-8")
+    (d / "events.json").write_text(json.dumps(XSS_EVENTS_FIXTURE),
+                                   encoding="utf-8")
+    out = d / "out.json"
+    r = subprocess.run(
+        ["node", str(HARNESS / "render_harness.cjs"), str(index_js),
+         str(d / "state.json"), str(d / "events.json"), str(out)],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert r.returncode == 0, r.stderr
+    return json.loads(out.read_text(encoding="utf-8"))
+
+
+def test_event_detail_is_escaped_before_innerhtml(rendered_xss):
+    """审计 M4：事件面板用 innerHTML 拼动态文本，必须转义。
+
+    契约层现在也会拒掉这种 detail（`_check_event_detail`），但渲染层是
+    独立的第二道墙：上游放松一次校验就不该等于存储型 XSS —— 那条链是
+    「MQTT 凭据 → 伪造 event → 浏览器执行 → 用会话 cookie 调
+    /api/cmd/.../unlock」。
+
+    判据是**结构**而不是关键字：注入内容里的 `onerror=alert(1)` 作为纯
+    文本留在页面上无害（`<` 已被转义成 `&lt;`，形不成标签）。所以断言
+    「HTML 里的每一个裸 `<` 都是我们自己生成的 li/span 标签」。
+    """
+    html = rendered_xss["events_html"] or ""
+    raw_tags = re.findall(r"<(/?[a-zA-Z][^\s>]*)", html)
+    allowed = {"li", "/li", "span", "/span"}
+    assert set(raw_tags) <= allowed, \
+        f"渲染出了我们没生成的标签（转义漏了）：{set(raw_tags) - allowed}"
+    # 注入内容必须以转义形式存在（证明内容没被丢掉，只是失效了）
+    assert "&lt;img" in html and "&lt;svg" in html and "&lt;script" in html
+    # class 属性里也不能逃出引号
+    assert 'class="ev-&lt;script&gt;bad()&lt;/script&gt;"' in html
 
 
 def test_unlock_button_disabled_when_server_says_no(rendered):

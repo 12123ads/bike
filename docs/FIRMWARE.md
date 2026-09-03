@@ -187,6 +187,51 @@ STATIONARY 只是挂上去（多写一个寄存器位，无害），日志里明
 `lis2dw12_all_on_int1_set()`），**但 Zephyr 驱动从不调它，也没有对应的
 DTS 属性** —— 走这条路必须自己越过驱动直接写 I2C 寄存器。
 
+## 3e. 运行时测试清单（native_sim + ztest）
+
+`firmware/tests/` 下的每个目录都是一个独立的 ztest 应用，**编的是
+`firmware/nrf52840/src` 里的原件**，一行没为测试改过。硬件依赖用
+`uart-emul` / `gpio-emul` / 假驱动顶掉（各自的 `boards/native_sim.overlay`）。
+
+```bash
+export ZEPHYR_BASE=/opt/ncs/zephyr
+export ZEPHYR_SDK_INSTALL_DIR=/opt/zephyr-sdk/zephyr-sdk-1.0.1
+for t in modem_time modem_downlink motion_still modem_reconnect; do
+    /opt/zephyrtool/bin/west build -p always -b native_sim -d /tmp/t_$t \
+        firmware/tests/$t && /tmp/t_$t/$t/zephyr/zephyr.exe
+done
+```
+
+| 目录 | 测什么 | 结果 |
+| --- | --- | --- |
+| `modem_time` | NITZ 串 → Unix 秒（±zz 是 1/4 小时、hh:mm:ss 是本地时间），以及「宁可上报 0 也不上报像时间的错数」的拒绝路径 | 11 passed |
+| `modem_downlink` | **下行 URC 解析 + AT 应答匹配**（2026-09-03 审计 M1/M2） | 9 passed |
+| `motion_still` | 运动/静止状态机与软件静止计时 | 4 passed |
+| `modem_reconnect` | 三级重连阶梯「只重跑坏掉的那一层」 | 5 passed |
+
+`modem_downlink` 为什么值得单独一套：它盯的两条都**编得过、跑得起来、
+只是静默做错事** —— 和 §3c 里最难抓的那两个同型。
+
+- **M1 行缓冲**：`LINE_MAX=512` 只能收 236 B 下行，而 `dn_payload` 按 3900 B
+  开——差 16 倍。超限的行被截断后必然丢掉 payload 的结束引号，
+  `handle_msub` 走「格式不认识」分支**且不打日志**：下行凭空消失，
+  服务端每次上线重发同一条。现在 `read_line` 返回 `-EMSGSIZE` 并 LOG_ERR，
+  `LINE_MAX=640` / `PROTO_MAX_DN_PAYLOAD=256` / `contract.MAX_DOWNLINK_BYTES`
+  三个数字互相自洽，由 `test_firmware_contract.py` 钉住。
+- **M2 应答匹配**：`at_cmd()` 用 `strstr(line,"OK")` 判成功，而 `SEND OK` /
+  `CONNECT OK` / `CONNACK OK` 都是带外 URC。一条迟到的 `SEND OK` 能替下一条
+  命令答到——`AT+CPOWD=1` 没执行却返回成功，**模组不关机、持续耗电**。
+  现在 expect 恰好是 `"OK"` 时要求整行相等；调用方显式等 `SEND OK` 的
+  子串匹配路径不受影响（两条测试分别钉住这两侧）。
+
+**变异体验证**：把 M1、M2 两处改回修复前的写法重编，
+`test_stale_send_ok_does_not_answer_next_command` 和
+`test_stale_connect_ok_does_not_answer_next_command` 立刻红（7 passed / 2 failed）。
+M1 那两条在旧代码下仍然过——因为旧代码的失败方式是「静默丢弃」而不是
+「投递截断值」，而这两条断言的正是「不投递」。这个差异本身是实测得到的
+（见 `modem.c` 里 `LINE_MAX` 的注释），审计报告初稿把它写成了「接受错误值」，
+已更正。
+
 ## 4. R0 阶段必须先验的两件事
 
 这两条来自 §8.7，都是**硬门禁**，不验就往下做会白干：

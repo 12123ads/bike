@@ -92,6 +92,57 @@ def test_firmware_payload_limit_is_below_contract_limit(proto_h):
         "固件上限比契约小太多，20 点批量可能放不下"
 
 
+def test_downlink_limit_matches_server(proto_h):
+    """审计 M1：下行上限两边必须是同一个数字。
+
+    服务端 `MAX_DOWNLINK_BYTES` 挡住构造，固件 `PROTO_MAX_DN_PAYLOAD` 决定
+    解析缓冲。不一致的一侧会静默丢报文（固件小）或让坏报文入队（服务端大）。
+    """
+    assert define_int(proto_h, "PROTO_MAX_DN_PAYLOAD") == ct.MAX_DOWNLINK_BYTES
+
+
+def test_line_buffer_fits_largest_downlink(proto_h, modem_c):
+    """审计 M1：`+MSUB: "<topic>",<len>,"<hex>"` 整条在**一行**里到达，
+    HEX 让 payload 翻倍 —— LINE_MAX 必须装得下最大下行，否则整条被丢。
+
+    topic 的实际上界由 `DEVICE_ID_RE` 定（≤32 字符），不是 `MAX_TOPIC_BYTES`
+    那个宽松的门限值。
+    """
+    line_max = define_int(modem_c, "LINE_MAX")
+    dn_max = define_int(proto_h, "PROTO_MAX_DN_PAYLOAD")
+    assert line_max is not None and dn_max is not None
+    # 最长的下行 topic：设备 id 顶到 32 字符 + 最长后缀
+    longest_topic = max(len(ct.topic("x" * 32, s)) for s in ct.DN_SUFFIXES)
+    # `+MSUB: "<topic>",<len>,"<hex>"` 的框架字符（引号、逗号、长度数字）
+    frame = len('+MSUB: "",9999,""')
+    need = dn_max * 2 + longest_topic + frame
+    assert line_max >= need, (
+        f"LINE_MAX={line_max} 装不下最大下行：{dn_max} 字节 HEX 后 "
+        f"{dn_max * 2} + topic {longest_topic} + 框架 {frame} = {need}")
+
+
+def test_read_line_reports_overflow_instead_of_truncating(modem_c):
+    """审计 M1：超长行**不能静默截断**。
+
+    截断后的 HEX 仍是合法偶数长度，`hex_decode` 会成功、`get_int` 会把
+    `"s":900` 截成的 `"s":90` 正常解析 —— 上报周期静默改错 10 倍。
+    """
+    m = re.search(r"static int read_line\([^)]*\)\s*\{(.*?)\n\}", modem_c, re.S)
+    assert m, "找不到 read_line"
+    body = m.group(1)
+    assert "EMSGSIZE" in body, "read_line 不报超长，可能又在静默截断"
+    assert "overflow" in body, "没有 overflow 标记，截断行会被当成正常行返回"
+
+
+def test_dn_payload_buffer_sized_for_downlink_not_uplink(modem_c):
+    """dn_payload 按下行上限开。按 PROTO_MAX_PAYLOAD(3900) 开是矛盾的：
+    行缓冲装不下那么大的 HEX，多出来的空间只会掩盖截断（审计 M1）。"""
+    m = re.search(r"static uint8_t dn_payload\[(\w+)\]", modem_c)
+    assert m, "找不到 dn_payload 定义"
+    assert m.group(1) == "PROTO_MAX_DN_PAYLOAD", \
+        f"dn_payload 按 {m.group(1)} 开，应该按 PROTO_MAX_DN_PAYLOAD"
+
+
 # --- 闭集 -------------------------------------------------------------------
 
 
@@ -161,6 +212,35 @@ def test_tele_temp_is_optional(proto_c):
         "uplink 没有显式声明不报温度"
     assert not re.search(r"\.temp\s*=\s*0\s*,", uplink), \
         "uplink 又在用 .temp = 0 当占位值"
+
+
+def test_tele_volt_is_optional_not_fake_zero(proto_c):
+    """契约 §5.3：`v` 也可省。**ADC 读失败不能发 0.0**（审计 M8）。
+
+    固件曾经写 `.volt = mv > 0 ? mv/1000 : 0.0f` 并无条件编进报文 ——
+    服务端把 0.0 当真值落库、`volt_to_pct` 插值到曲线最低点，HA 上
+    显示 0V/0%，看起来像被剪线。这和 `tmp` 是同一个原则，同一个修法。
+    """
+    assert "has_volt" in proto_c, "v 没有可选开关，可能又在发假 0.0"
+    assert re.search(r"if \(t->has_volt\)", proto_c), "v 不是条件发送的"
+
+    uplink = (FW / "src" / "uplink.c").read_text(encoding="utf-8")
+    assert re.search(r"\.has_volt\s*=\s*mv > 0", uplink), \
+        "uplink 没把 has_volt 绑到 ADC 读数有效性上"
+
+
+def test_lbs_rejects_null_island_and_out_of_range():
+    """审计 M2：`+CIPGSMLOC` 字段为空时 strtod 返回 0.0，
+    (0,0)（几内亚湾）落在服务端的 ±90/±180 校验内，拦不住 ——
+    固件侧必须自己判。GNSS 路径本来就有同款防护（gnss.c 的 valid）。
+    """
+    modem = (FW / "src" / "modem.c").read_text(encoding="utf-8")
+    m = re.search(r"int modem_lbs\(.*?\n\}", modem, re.S)
+    assert m, "找不到 modem_lbs"
+    body = m.group(0)
+    assert "lat_v == 0.0 && lon_v == 0.0" in body, \
+        "modem_lbs 没挡 (0,0) —— 坏响应会变成「车在几内亚湾」"
+    assert "-90.0" in body and "180.0" in body, "modem_lbs 没做范围校验"
 
 
 def test_ack_fields(proto_c):

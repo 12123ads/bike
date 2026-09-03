@@ -325,6 +325,15 @@ function renderState(s) {
   drawMarker(s);
 }
 
+// 转义任何要进 innerHTML 的动态文本（审计 M4）。
+// 契约层已经把 up/event 的 d 值收窄成数字/布尔闭集，这里是第二道墙：
+// 上游若放松校验，这里不会变成存储型 XSS。
+function esc(v) {
+  return String(v).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
 function renderEvents(list) {
   const ul = $('events');
   if (!list.length) { ul.innerHTML = '<li><span class="k">暂无事件</span></li>'; return; }
@@ -336,21 +345,27 @@ function renderEvents(list) {
   ul.innerHTML = list.map(e => {
     let extra = '';
     if (e.detail) {
-      if (e.detail.mg !== undefined) extra = ' ' + e.detail.mg + ' mg';
+      if (e.detail.mg !== undefined) extra = ' ' + esc(e.detail.mg) + ' mg';
       else if (e.detail.locked !== undefined) extra = e.detail.locked ? '（锁上）' : '（打开）';
-      else if (e.detail.lv !== undefined) extra = '（' + e.detail.lv + ' 级，' + e.detail.v + ' V）';
-      else if (e.detail.uid !== undefined) extra = ' uid=' + e.detail.uid;
+      else if (e.detail.lv !== undefined)
+        extra = '（' + esc(e.detail.lv) + ' 级，' + esc(e.detail.v) + ' V）';
+      else if (e.detail.uid !== undefined) extra = ' uid=' + esc(e.detail.uid);
+      else if (e.detail.c !== undefined) extra = ' 码=' + esc(e.detail.c);
     }
-    return '<li class="ev-' + e.kind + '"><span class="k">'
-      + (LABEL[e.kind] || e.kind) + extra
-      + '</span><span class="t">' + fmtAgo(e.t_srv) + '</span></li>';
+    // e.kind 是契约闭集（parse_event 校验过），但一样转义 —— class
+    // 属性里注入同样能逃出去。
+    return '<li class="ev-' + esc(e.kind) + '"><span class="k">'
+      + (LABEL[e.kind] || esc(e.kind)) + extra
+      + '</span><span class="t">' + esc(fmtAgo(e.t_srv)) + '</span></li>';
   }).join('');
 }
 
 function renderPending(rows) {
   if (!rows.length) { $('pending').textContent = '无'; return; }
+  // id/suffix 是服务端生成的（c-12 / dn/cmd），tries 是整数；
+  // 仍然转义 —— 渲染层不该依赖上游的形状假设。
   $('pending').innerHTML = rows.map(r =>
-    r.id + ' → ' + r.suffix + '，已尝试 ' + r.tries + ' 次'
+    esc(r.id) + ' → ' + esc(r.suffix) + '，已尝试 ' + esc(r.tries) + ' 次'
   ).join('<br>') + '<br><span style="color:#7d8595">'
     + '省电档下设备可能几十分钟才上线，届时会自动送达。</span>';
 }

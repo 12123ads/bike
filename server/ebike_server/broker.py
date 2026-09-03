@@ -205,14 +205,23 @@ def build_broker_config(cfg: ServerConfig) -> dict[str, Any]:
         raise RuntimeError(f"这些设备没有 publish ACL 条目，会导致发布全放行：{missing}")
 
     listeners: dict[str, Any] = {}
+    # 审计 M12：每个 listener 都要有连接数上限。amqtt 默认 -1（无限），
+    # 而它读 CONNECT 包没有超时 —— 只连不发的 socket 会永久占用一个
+    # asyncio 任务 + 一份 TLS 会话内存。上限是唯一的兜底。
+    # 注意不能只给 tls：`ListenerConfig.apply` 只在字段等于**默认值**时才从
+    # default listener 继承，而 max_connections 的默认是 0（= 不限），
+    # 所以每个 listener 都显式写上。
+    max_conn = cfg.mqtt.max_connections
     if cfg.mqtt.plain_bind:
         host, port = split_bind(cfg.mqtt.plain_bind, 1883)
-        listeners["plain"] = {"type": "tcp", "bind": f"{host}:{port}"}
+        listeners["plain"] = {"type": "tcp", "bind": f"{host}:{port}",
+                              "max_connections": max_conn}
     if cfg.mqtt.tls_bind:
         host, port = split_bind(cfg.mqtt.tls_bind, 8883)
         listeners["tls"] = {
             "type": "tcp",
             "bind": f"{host}:{port}",
+            "max_connections": max_conn,
             "ssl": True,
             "certfile": cfg.mqtt.certfile,
             "keyfile": cfg.mqtt.keyfile,

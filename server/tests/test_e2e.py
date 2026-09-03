@@ -11,6 +11,7 @@ broker 行为下才成立，单元测试全绿也可能这里全红。
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 
 import pytest
@@ -21,6 +22,8 @@ from ebike_server.config import DeviceConfig, MqttConfig, ServerConfig
 from ebike_server.service import Service
 
 PORT = 21883  # 挑一个不常用的，避免和真实 broker 撞
+#: 合法的 §6.2 密钥：base64 的恰好 32 字节（契约层强校验，见审计 M3）。
+KEY32 = base64.b64encode(bytes(range(32))).decode()
 
 
 @pytest.fixture
@@ -301,13 +304,13 @@ async def _is_empty(svc, dev):
 async def test_secret_never_retained(running):
     """契约 §6.2：密钥不能留在 broker 的 retain 表里。"""
     svc, _, dev_pw, _ = running
-    await svc.enqueue_secret("bike01", "set", uid=1, kid=8, key_b64="QUFBQQ==")
+    await svc.enqueue_secret("bike01", "set", uid=1, kid=8, key_b64=KEY32)
     dev = await connect_as("bike01", dev_pw)
     await dev.subscribe([(f"{ct.PREFIX}/bike01/dn/#", 1)])
     await dev.publish(ct.topic("bike01", ct.UP_HELLO),
                       ct.dumps({"t": 1, "q": 1, "kid": 0}), qos=1)
     msg = await deliver(dev, 3)
-    assert msg is not None and json.loads(msg.data)["k"] == "QUFBQQ=="
+    assert msg is not None and json.loads(msg.data)["k"] == KEY32
 
     # broker 的 retain 表里不能有这个 topic
     assert svc.broker is not None
@@ -370,7 +373,7 @@ async def test_secret_is_not_retained_so_it_cannot_leak(running):
     """上一条那个泄漏路径推的是 retain 表里的东西。
     密钥不进 retain 表（契约 §4.1），所以泄漏不了 —— 这是那个决定的额外收益。"""
     svc, _, dev_pw, ha_pw = running
-    await svc.enqueue_secret("bike01", "set", uid=1, kid=1, key_b64="U0VDUkVU")
+    await svc.enqueue_secret("bike01", "set", uid=1, kid=1, key_b64=KEY32)
 
     ha = await connect_as("ha", ha_pw)
     await ha.subscribe([(f"{ct.PREFIX}/#", 1)])   # ACL 会拒，但 filter 会进表
@@ -512,3 +515,105 @@ async def test_ack_for_another_devices_downlink_rejected(running):
     row = await svc.store.downlink("s-999")
     assert row["acked"] == 0, "bike01 销账了 other 的下行 —— dn_id 归属没校验"
     await c.disconnect()
+
+
+async def test_publish_state_calls_are_serialized(running):
+    """审计 M11：`publish_state` 自己拿设备锁。
+
+    「算 state → 比对旧值 → 发布 → 写回 state_json」必须整体原子，否则两个
+    并发调用（`/state/{id}`、`/devices`、`_tick` 三条 HTTP/定时路径 + ingest）
+    算出的 state 可以按**相反顺序**写进 retain 表 —— HA 上显示陈旧值。
+
+    检测手段：只有 publish_state 会调 `retain_message`，在它里面人为拉长
+    窗口并数重入次数。锁在时重入恒为 0。
+
+    第二段用**不带锁的** `_publish_state_locked` 跑同样的并发 —— 它必须
+    交错。否则这条测试就是个空壳（探针本身不灵敏，加锁与否都是 0）。
+    """
+    svc, _, _, _ = running
+    assert svc.broker is not None
+    inflight = 0
+    overlaps = 0
+    orig = svc.broker.retain_message
+
+    async def spy(*a, **kw):
+        nonlocal inflight, overlaps
+        inflight += 1
+        try:
+            if inflight > 1:
+                overlaps += 1
+            await asyncio.sleep(0.05)   # 把交错窗口拉大
+            return await orig(*a, **kw)
+        finally:
+            inflight -= 1
+
+    svc.broker.retain_message = spy          # type: ignore[method-assign]
+    try:
+        await asyncio.gather(*(svc.publish_state("bike01", force=True)
+                               for _ in range(4)))
+        assert overlaps == 0, f"{overlaps} 次 publish_state 交错 —— 锁没生效"
+
+        # 探针自检：绕过锁必须能观测到交错
+        overlaps = 0
+        await asyncio.gather(*(svc._publish_state_locked("bike01", force=True)
+                               for _ in range(4)))
+        assert overlaps > 0, \
+            "绕过锁也没观测到交错 —— 这个探针测不出 M11，别信上面那条断言"
+    finally:
+        svc.broker.retain_message = orig     # type: ignore[method-assign]
+
+
+async def test_concurrent_enqueue_preserves_downlink_order(running):
+    """审计 M11：入队 + 冲刷在同一把锁里，下行按 id 顺序到达。
+
+    `flush_downlinks` 的文档说顺序是硬要求（连续两次密钥轮换必须按序到达，
+    否则设备停在旧密钥上）。两个并发 HTTP 请求各自「入队 → 冲刷」时，
+    没有锁的话第二条可以先发出去。
+    """
+    svc, _, dev_pw, _ = running
+    dev = await connect_as("bike01", dev_pw)
+    await dev.subscribe([(f"{ct.PREFIX}/bike01/dn/#", 1)])
+
+    ids = await asyncio.gather(*(svc.enqueue_cmd("bike01", "ping")
+                                 for _ in range(3)))
+    seen: list[str] = []
+    while len(seen) < 3:
+        msg = await deliver(dev, 3)
+        if msg is None:
+            break
+        dn_id = json.loads(msg.data)["id"]
+        if dn_id not in seen:
+            seen.append(dn_id)
+    await dev.disconnect()
+
+    # 每次冲刷都重发全部未确认的，所以同一个 id 可能重复到达；
+    # 要断言的是**首次出现的顺序**和入队顺序一致。
+    assert seen == sorted(ids, key=lambda s: int(s.split("-")[1])), \
+        f"下行乱序：入队 {ids}，到达 {seen}"
+
+
+async def test_ingest_and_http_paths_do_not_deadlock(running):
+    """审计 M11 的反向风险：`asyncio.Lock` 不可重入。
+
+    ingest 持锁后必须走 `_locked` 变体；`on_device_online` 反过来不能自己
+    包锁再调公开版。任一处搞错就是**永久死锁**（整个设备的上行全停）。
+    这条测试把三条路径并发跑一遍，超时即失败。
+    """
+    svc, _, dev_pw, _ = running
+    dev = await connect_as("bike01", dev_pw)
+
+    async def exercise() -> None:
+        await asyncio.gather(
+            svc.ingest("bike01", ct.topic("bike01", ct.UP_HELLO),
+                       ct.dumps({"t": 1, "q": 1, "kid": 0})),
+            svc.ingest("bike01", ct.topic("bike01", ct.UP_TELE),
+                       ct.dumps({"t": 2, "q": 2, "v": 48.1})),
+            svc.ingest_lwt_will(ct.topic("bike01", ct.LWT), b'{"lwt":1}'),
+            svc.on_device_online("bike01"),
+            svc.publish_state("bike01"),
+            svc.enqueue_cmd("bike01", "ping"),
+            svc.flush_downlinks("bike01"),
+        )
+
+    await asyncio.wait_for(exercise(), timeout=10)
+    await dev.disconnect()

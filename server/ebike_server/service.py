@@ -157,7 +157,8 @@ class Service:
                 except ct.ContractError as e:
                     log.warning("丢弃：%s 不合契约: %s", topic, e)
                     return
-            await self.publish_state(dev)
+            # 已持锁 —— 用 _locked 变体（`asyncio.Lock` 不可重入，审计 M11）
+            await self._publish_state_locked(dev)
 
     async def _on_up(self, dev: str, suffix: str, payload: bytes, t_srv: int) -> None:
         parser = ct.UP_PARSERS[suffix]
@@ -187,7 +188,9 @@ class Service:
             await self.store.set_dev_fields(dev, lwt=0)
             log.info("%s hello fw=%s kid=%s rst=%s",
                      dev, data.get("fw"), data.get("kid"), data.get("rst"))
-            await self.flush_downlinks(dev)
+            # 已持锁（ingest 里的 `async with self._lock(dev)`）—— 必须用
+            # _locked 变体，`asyncio.Lock` 不可重入，调公开版会死锁（审计 M11）
+            await self._flush_downlinks_locked(dev)
         elif suffix == ct.UP_ACK:
             assert isinstance(data, dict)
             row = await self.store.downlink(data["dn_id"])
@@ -286,14 +289,15 @@ class Service:
             return
         async with self._lock(dev):
             await self._on_lwt(dev, payload)
-            await self.publish_state(dev)
+            # 已持锁 —— _locked 变体（审计 M11）
+            await self._publish_state_locked(dev)
 
     async def on_device_online(self, client_id: str) -> None:
         """CLIENT_CONNECTED 时冲刷下行队列（契约 §4.1）。"""
         if self.cfg.device(client_id) is None:
             return
-        async with self._lock(client_id):
-            await self.flush_downlinks(client_id)
+        # flush_downlinks 自己拿锁（审计 M11），这里不再包一层 —— 包了会死锁。
+        await self.flush_downlinks(client_id)
 
     # --- 下行 ----------------------------------------------------------------
 
@@ -306,22 +310,38 @@ class Service:
                           args: dict[str, Any] | None = None) -> str:
         dn_id = await self.next_dn_id("c")
         payload = ct.build_cmd(dn_id, cmd, args)
-        await self.store.enqueue_downlink(dn_id, dev, ct.DN_CMD, payload)
-        await self.flush_downlinks(dev)
+        # 审计 M11：入队和冲刷必须在同一把锁里。两个并发 HTTP 请求各自
+        # 「入队 → 冲刷」交错时，后入队的可能先发出去 —— 而 flush_downlinks
+        # 的文档说顺序是硬要求（连续两次密钥轮换必须按序到达）。
+        async with self._lock(dev):
+            await self.store.enqueue_downlink(dn_id, dev, ct.DN_CMD, payload)
+            await self._flush_downlinks_locked(dev)
         return dn_id
 
     async def enqueue_secret(self, dev: str, op: str, **kw: Any) -> str:
         dn_id = await self.next_dn_id("s")
         payload = ct.build_secret(dn_id, op, **kw)
-        await self.store.enqueue_downlink(dn_id, dev, ct.DN_SECRET, payload)
-        await self.flush_downlinks(dev)
+        async with self._lock(dev):
+            await self.store.enqueue_downlink(dn_id, dev, ct.DN_SECRET, payload)
+            await self._flush_downlinks_locked(dev)
         return dn_id
 
     async def flush_downlinks(self, dev: str) -> int:
         """把未确认的下行按创建顺序发出去。返回发了几条。
 
+        **自己拿锁**。已经持锁的调用方（ingest 路径）用 `_flush_downlinks_locked`
+        —— `asyncio.Lock` 不可重入，在持锁时调这个会死锁。
+        """
+        async with self._lock(dev):
+            return await self._flush_downlinks_locked(dev)
+
+    async def _flush_downlinks_locked(self, dev: str) -> int:
+        """`flush_downlinks` 的实现。**调用方必须已持 `_lock(dev)`。**
+
         **顺序是硬要求**：连续两次密钥轮换必须按序到达，否则设备会停在旧密钥上。
         每次都重发全部未确认的（而不是只发新的），因为设备可能漏掉了中间某条。
+        锁保证「读队列 → 逐条发 → 标记已发」不与另一个冲刷交错 ——
+        否则两个协程会各读到同一批 pending 行并把它们发两遍、且顺序交错。
         """
         if self.broker is None:
             return 0
@@ -340,7 +360,25 @@ class Service:
     # --- state ---------------------------------------------------------------
 
     async def publish_state(self, dev: str, *, force: bool = False) -> dict[str, Any]:
-        """算 state 并 retain 发布。`force=True` 用于进程启动时恢复 retain。"""
+        """算 state 并 retain 发布。`force=True` 用于进程启动时恢复 retain。
+
+        **自己拿锁**（审计 M11）。已经持锁的调用方（ingest 路径）用
+        `_publish_state_locked` —— `asyncio.Lock` 不可重入。
+
+        以前这个方法不拿锁，而 ingest 路径持锁调它：`/state/{id}`、`/devices`、
+        `_tick` 三条不持锁的路径可以和 ingest 交错，让**旧 state 晚于新 state**
+        写进 retain 表（HA 上显示陈旧值，下一轮 tick 才自愈）。
+        """
+        async with self._lock(dev):
+            return await self._publish_state_locked(dev, force=force)
+
+    async def _publish_state_locked(self, dev: str, *,
+                                    force: bool = False) -> dict[str, Any]:
+        """`publish_state` 的实现。**调用方必须已持 `_lock(dev)`。**
+
+        锁保护的不变量：「算 state → 比对旧值 → 发布 → 写回 state_json」
+        整体原子。少了它，两个协程算出的 state 可以按相反顺序写 retain。
+        """
         state = await build_state(self.store, dev, self.cfg)
         ds = await self.store.dev_state(dev)
         if not force and not state_changed(ds.get("state_json"), state):

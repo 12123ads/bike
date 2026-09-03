@@ -137,7 +137,6 @@ int unlock_del_secret(uint32_t uid)
 {
 	static struct user_key snap[MAX_USERS];
 	uint16_t kid_out;
-	int rc;
 
 	k_mutex_lock(&users_lock, K_FOREVER);
 	struct user_key *u = find_user_locked(uid);

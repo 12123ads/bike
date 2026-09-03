@@ -376,7 +376,7 @@ static void flush_events(void)
 	static struct queued_event snap[EVENT_QUEUE_SIZE];
 	bool pending[EVENT_QUEUE_SIZE];
 
-	k_mutex_lock(&ev_lock);
+	k_mutex_lock(&ev_lock, K_FOREVER);
 	for (size_t i = 0; i < EVENT_QUEUE_SIZE; i++) {
 		pending[i] = ev_queue[i].used;
 		if (pending[i]) {
@@ -395,7 +395,7 @@ static void flush_events(void)
 							  : NULL);
 		if (n < 0) {
 			LOG_ERR("拼事件失败 %d，丢弃", n);
-			k_mutex_lock(&ev_lock);
+			k_mutex_lock(&ev_lock, K_FOREVER);
 			if (ev_queue[i].used && ev_queue[i].q == snap[i].q) {
 				ev_queue[i].used = false;
 			}
@@ -403,7 +403,7 @@ static void flush_events(void)
 			continue;
 		}
 		if (publish_retry(TOPIC_UP_EVENT, msg_buf, (size_t)n) == 0) {
-			k_mutex_lock(&ev_lock);
+			k_mutex_lock(&ev_lock, K_FOREVER);
 			/* 只清「还是这一条」的槽位：发送期间新事件可能
 			 * 覆盖了被丢最旧的它（队列满时）。q 是唯一键。 */
 			if (ev_queue[i].used && ev_queue[i].q == snap[i].q) {
@@ -489,7 +489,11 @@ int uplink_cycle(bool want_gnss)
 	struct proto_tele tele = {
 		.t = modem_utc(),
 		.q = nvstore_next_q(),
+		/* ADC 读失败（mv <= 0）就不发 v —— 发 0.0 会被服务端当真值
+		 * 落库、HA 上显示 0V/0%，看起来像被剪线（审计 M8）。
+		 * 这和下面 temp 的处理是同一个原则。 */
 		.volt = mv > 0 ? (float)mv / 1000.0f : 0.0f,
+		.has_volt = mv > 0,
 		.csq = (int8_t)modem_csq(),
 		.uptime = (uint32_t)(k_uptime_get() / 1000),
 		/* ⚠ **不报芯片温度。** 以前这里硬编码 `.temp = 0`，那是假数据 ——

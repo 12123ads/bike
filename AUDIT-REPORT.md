@@ -17,6 +17,7 @@
 - [契约一致性与测试盲区](#契约一致性与测试盲区)
 - [已审查无发现的模块](#已审查无发现的模块)
 - [建议修复优先级](#建议修复优先级)
+- [修复状态（已全部修完）](#修复状态2026-09-03分支-fixaudit-findings)
 
 ---
 
@@ -101,7 +102,13 @@ int n = snprintf(cmd, sizeof(cmd),
 
 ### M1. `LINE_MAX=512` 静默截断下行 URC — `modem.c:30, 120-122`
 
-`read_line` 逐字节丢弃超出 512 的行内容，无任何标记；而 `dn_payload[PROTO_MAX_PAYLOAD]`（3900）表明设计意图是收完整下行。任何下行 payload 超约 470 hex 字符即被截断。**具体误接受路径**：`interval` 指令的 `"s":900` 截成 `90` → `get_int` 解析前缀成功 → `nvstore_set_report_interval(90)` 通过 60~86400 校验 → **ack 成功，上报周期被静默改错 10 倍**。故障模式是「错误接受」而非「显式拒绝」。当前指令集都小，但缓冲尺寸与契约上限（3900）直接矛盾。
+`read_line` 逐字节丢弃超出 512 的行内容，无任何标记；而 `dn_payload[PROTO_MAX_PAYLOAD]`（3900）表明设计意图是收完整下行。**两个数字差 16 倍**：512 字节行缓冲装下 `+MSUB: "<topic>",<len>,"<hex>"` 之后只剩 236 字节的实际 payload 容量（HEX 翻倍），而代码声称能收 3900。
+
+**修复时实测确认了真实故障模式**（初稿写的「`"s":900` 截成 `"s":90` 被 `get_int` 正常解析 → 上报周期静默改错 10 倍」**不成立**）：截断点落在 HEX 区内，而 HEX 区只有 `0-9A-F`，不可能再出现一个字面量 `"` —— 所以 `handle_msub` 必然走「找不到 payload 结束引号」分支，那个分支 `return true`（当作已消化）**且一条日志都不打**。
+
+实际症状因此是**下行凭空消失**：设备侧无任何记录，服务端侧 `/pending` 的 `tries` 每次设备上线加一，永远等不到 ack。比「接受一个错值」更难查，但破坏面小一些（不会执行错误指令）。
+
+`"s":900` 那条推理链本身是对的 —— `get_int` 确实会接受被截断的 `"s":90`（宿主机验证过）—— 只是**触发不了**，因为报文在到达解码层之前就被丢掉了。这也说明防线必须在读行那一层。
 
 ### M2. `at_cmd` 子串匹配可被迟到的 URC「答到」— `modem.c:393-395, 847-850`
 
@@ -284,3 +291,31 @@ amqtt 默认 `max_connections=-1`（无限制）；`ConnectPacket.from_stream` �
 5. **M1 + M2**（modem 解析）：`LINE_MAX` 与 `dn_payload` 对齐或加显式超长拒绝；expect 匹配排除已知 URC 或改精确匹配。
 6. **M4 + M10**（Web/ack 加固）：事件 detail 渲染前转义；ack 校验下行归属。
 7. **M8**（数据质量）：`has_volt` 缺省不发；LBS 加 (0,0) 防护。
+
+---
+
+## 修复状态（2026-09-03，分支 `fix/audit-findings`）
+
+**全部 3 高危 + 12 中危 + 相关低危已修完并验证。** 报告正文保留原始描述（含被实测推翻的 M1 故障模式，那一条已在原地更正并说明差异）——审计和修复是两件事，事后改写发现记录会丢掉「当时看到什么」这一层信息。
+
+| # | 修了什么 | 验证方式 |
+|---|---|---|
+| H1 | ingest 身份判据改为**认证用户名**，删掉 `"svc"` 白名单 | e2e：ha 凭据 + `client_id="svc"` 灌遥测被拒；对照组「合法设备换 client_id 仍能发自己 topic」 |
+| H2 | `AT+MCONFIG` 参数位纠正（7 参数位，keepalive 属于 `MCONNECT`） | 契约测试扫 `modem.c` 钉住 will topic 是引号字面量 |
+| H3 | `users[]` 全部访问纳入 `users_lock`，快照后落盘 | bsim 8 条断言仍全过 |
+| M1 | `LINE_MAX` 512→640、`dn_payload` 按新的 `PROTO_MAX_DN_PAYLOAD=256` 开、`read_line` 超长返回 `-EMSGSIZE` 并 LOG_ERR；服务端加 `MAX_DOWNLINK_BYTES` 构造期拦截（`/cmd`、`/secret` → 400） | ztest `modem_downlink` 9 条（含「超长丢整条」「丢完流仍同步」）；契约测试钉住三个数字自洽；HTTP 实测 400 |
+| M2 | expect 恰好 `"OK"` 时要求**整行相等**；显式等 `SEND OK`/`CONNACK OK` 的子串路径不变 | ztest 变异体验证：改回旧写法后那两条立刻红（7 passed / 2 failed） |
+| M3 | `flush_events` 改「锁内快照 → 锁外发送 → 锁内按 q 清槽」 | 固件编译 + 逐条 review；`q` 作唯一键防清错槽位 |
+| M4 | `renderEvents` 改 DOM 构建 + `esc()`；服务端 `_EVENT_DETAIL_SPEC` 逐值校验（键、类型、范围） | 前端 harness 注入 `<img onerror>`/`<svg onload>`，断言 DOM 里零 `img`/`svg`/`script` 元素；浏览器实测同样结论 |
+| M5+L14 | 登录路径 `isinstance(body, dict)` + ASCII 短路 | api/web 测试 |
+| M6 | 限速改用真实 socket 地址（XFF 只做日志），`_fails` 加上限 | web 测试 |
+| M7 | `unlock_del_secret` / `wipe` 清 `counter`（防槽位复用继承旧值把新手机锁在门外） | 固件编译 + bsim |
+| M8 | `has_volt` 缺省不发 `v`；`modem_lbs` 挡 (0,0) 与越界坐标 | 宿主机 proto 测试 10 组；契约测试钉住「不得再出现 `.volt = ... : 0.0f` 无条件编码」；烟雾测试确认 `tele.volt` 落库为 NULL、网页显示 `—` |
+| M9 | `IngestPlugin` 挂 `RETAINED_MESSAGE` 接 broker 代发遗嘱 → `ingest_lwt_will` | e2e：真客户端配 will 后 abort transport，`lwt` 落库为 1 |
+| M10 | `up/ack` 校验 `dn_id` 归属本设备 | e2e：跨设备 ack 不销账 |
+| M11 | `publish_state` / `flush_downlinks` **自己拿锁**，持锁调用方走 `_locked` 变体（`asyncio.Lock` 不可重入） | e2e 3 条：交错探针（含「绕过锁必须能观测到交错」的自检）、并发入队顺序、三路径并发不死锁 |
+| M12 | 每个 listener 显式 `max_connections`（默认 32，可配） | 测试验配置字典 + `Server.semaphore` 真的建起来；另加「`write_default` 必须写全每个 dataclass 字段」的覆盖测试 |
+
+**总验证量**：服务端 pytest **301 passed / 1 skipped**（基线 260，新增 41 条）；固件编译零警告（FLASH 27.46% / RAM 22.94%）；native_sim ztest 4 套 **29 passed**（新增 `modem_downlink` 9 条）；BabbleSim 8 条断言全过；服务端 + 设备 + 网页三方烟雾测试走通。
+
+**顺带修掉的、审计没报的两个编译错**：`flush_events` 三处 `k_mutex_lock` 漏了 `K_FOREVER` 参数（M3 引入）、`unlock_del_secret` 的 `rc` 变量未使用（M7 引入）。两个都只在真编译时暴露 —— 审计基线说「固件可编译」，但那是审计**之前**的状态。

@@ -50,6 +50,18 @@ class MqttConfig:
 
     password_file: str = str(DEFAULT_DIR / "passwd")
 
+    #: 每个 listener 的并发连接上限（审计 M12）。amqtt 默认 `-1` = 无限制，
+    #: 而 8883 是公网暴露端口：慢速连接可以无限堆积，每条占一个 asyncio 任务
+    #: 加一份 TLS 会话内存，直到进程 OOM。这是**唯一**的兜底手段 ——
+    #: amqtt 读 CONNECT 包（`BrokerProtocolHandler.init_from_connect`）**没有超时**，
+    #: 只连不发的 socket 会一直占着名额，所以名额必须有限。
+    #:
+    #: 真实需求是 1 台车 + 1 个 HA + 1 个服务端自己 = 3 条。给 32 是留了
+    #: 重连尚未超时的旧会话和多车扩展的余量；上限满了新连接会排队等名额
+    #: （amqtt 用 `asyncio.Semaphore`，不是拒连），配合 `timeout_disconnect_delay`
+    #: 让僵死连接自己掉。0 或负数 = 不限制（不建议对外网 listener 这么配）。
+    max_connections: int = 32
+
 
 @dataclass
 class DeviceConfig:
@@ -275,6 +287,7 @@ def write_default(path: str | Path, *, docker: bool = False) -> Path:
             "mode": cfg.mqtt.mode,
             "cert_uri_domain": cfg.mqtt.cert_uri_domain,
             "password_file": cfg.mqtt.password_file,
+            "max_connections": cfg.mqtt.max_connections,
         },
         "web": {
             "enabled": cfg.web.enabled,

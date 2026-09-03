@@ -282,3 +282,52 @@ def test_publish_acl_assertion_covers_every_device():
             build_broker_config(cfg)
     finally:
         bmod.build_acl = real
+
+
+def test_every_listener_has_a_connection_cap():
+    """审计 M12：8883 是公网口，amqtt 默认 `max_connections=-1`（无限），
+    且它读 CONNECT 包**没有超时** —— 只连不发的 socket 会永久占一个任务 +
+    一份 TLS 会话内存。上限是唯一兜底。
+
+    必须**每个** listener 都显式写：`ListenerConfig.apply` 只在字段等于默认值
+    时才从 default listener 继承，而 `max_connections` 的默认是 0（= 不限），
+    所以「只给 tls 配」并不会让 plain 继承到限制。
+    """
+    cfg = ServerConfig(devices=[DeviceConfig(id="bike01")])
+    cfg.mqtt.plain_bind = "127.0.0.1:1883"
+    cfg.mqtt.tls_bind = "0.0.0.0:8883"
+    conf = build_broker_config(cfg)
+
+    assert len(conf["listeners"]) == 2
+    for name, listener in conf["listeners"].items():
+        cap = listener.get("max_connections")
+        assert isinstance(cap, int) and cap > 0, \
+            f"listener {name!r} 没有连接数上限：{listener}"
+
+
+async def test_connection_cap_reaches_the_running_broker(tmp_path):
+    """上一条测的是配置字典；这条确认 amqtt 真的把它读进了 `Server.semaphore`
+    —— 配置键名拼错会静默退回无限制（dacite 对 listener 段不是 strict）。"""
+    from ebike_server.config import MqttConfig
+
+    passwd = tmp_path / "passwd"
+    certs.make_password(passwd, "bike01")
+    cfg = ServerConfig(
+        db_path=str(tmp_path / "t.db"),
+        mqtt=MqttConfig(plain_bind="127.0.0.1:21993", tls_bind="",
+                        password_file=str(passwd), max_connections=4),
+        devices=[DeviceConfig(id="bike01")],
+    )
+    svc = Service(cfg)
+    await svc.start()
+    try:
+        assert svc.broker is not None
+        servers = svc.broker._servers            # amqtt 内部；没有公开访问器
+        assert servers, "broker 没起 listener"
+        for name, server in servers.items():
+            assert server.max_connections == 4, \
+                f"listener {name!r} 的上限没传到 broker：{server.max_connections}"
+            assert server.semaphore is not None, \
+                f"listener {name!r} 没建 semaphore —— 等于不限制"
+    finally:
+        await svc.stop()

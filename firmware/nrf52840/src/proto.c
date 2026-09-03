@@ -146,10 +146,19 @@ int proto_enc_loc_batch(char *buf, size_t len,
 
 int proto_enc_tele(char *buf, size_t len, const struct proto_tele *t)
 {
-	int n = snprintf(buf, len, "{\"t\":%u,\"q\":%u,\"v\":%.1f,\"up\":%u",
-			 t->t, t->q, (double)t->volt, t->uptime);
+	int n = snprintf(buf, len, "{\"t\":%u,\"q\":%u,\"up\":%u",
+			 t->t, t->q, t->uptime);
 	if (n < 0 || (size_t)n >= len) {
 		return -ENOMEM;
+	}
+	/* 契约 §5.3：v 可省。ADC 读失败就整个字段不发 ——
+	 * 发 0.0 会被服务端当真值落库（审计 M8），和 tmp 同一个道理。 */
+	if (t->has_volt) {
+		int k = snprintf(buf + n, len - n, ",\"v\":%.1f", (double)t->volt);
+		if (k < 0 || (size_t)(n + k) >= len) {
+			return -ENOMEM;
+		}
+		n += k;
 	}
 	if (t->csq >= 0) {
 		int k = snprintf(buf + n, len - n, ",\"csq\":%d", t->csq);

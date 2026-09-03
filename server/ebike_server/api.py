@@ -137,7 +137,12 @@ def build_app(svc: Service, cfg: ServerConfig) -> FastAPI:
                 status_code=403,
                 detail="远程开锁已禁用。它绕过 BLE 挑战应答，"
                        "打开需要在配置里设 allow_remote_unlock=true")
-        dn_id = await svc.enqueue_cmd(dev, cmd, args)
+        try:
+            dn_id = await svc.enqueue_cmd(dev, cmd, args)
+        except ct.ContractError as e:
+            # 报文层的拒绝（未知 args 形状、超过 MAX_DOWNLINK_BYTES）是
+            # **客户端错误**，不是 500。审计 M1 加下行上限后这条路径才活起来。
+            raise HTTPException(status_code=400, detail=str(e)) from e
         return {"queued": dn_id, "dev": dev, "cmd": cmd}
 
     @app.post("/secret/{device_id}", dependencies=[Depends(auth)])
