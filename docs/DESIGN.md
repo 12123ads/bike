@@ -313,6 +313,18 @@ P0.09 → P0.10 → P1.11 → P1.13 → P1.15 → P0.02 → P0.29 → P0.31 → 
 **末尾两个 VBAT 焊盘接的是同一个网络**（`promicro.kicad_sch` 里 y=172.72 与 y=175.26
 两段导线落在同一个 VBAT 电源符号上），5 V 灌哪一个都一样。
 
+**背面 SWD 焊盘的丝印是 `CLK` / `DIO`**（实物核对）。`CLK` = SWCLK，`DIO` = SWDIO。
+归档的 `ADR-001 §5.3` 把它们写成 `SWC` / `SWD`，**以这里为准**。
+J-Link 另外两根线，若背面没有一并引出就从 J3 取：**GND = 第 11 个焊盘、
+VTref = 第 9 个焊盘（EXTVCC，板载 LDO 的 3.3 V 输出）**。
+`RESET` 是第 10 个焊盘，和 GND 相邻 —— 既是「镊子双击短接进 UF2 bootloader」
+的那两个点，也是要做 connect-under-reset 时接 J-Link nRESET 的地方
+（`nrfjprog --recover` 本身不需要它）。
+
+⚠ **VTref 不要接 VBAT。** 它只是电平参考、不给板子供电，而 VBAT 在装车时是 5 V，
+SWD 引脚是 3.3 V 域（§3.2）。另外将来若真按本节的省电建议开机拉低 P0.13 关掉
+ME6217，EXTVCC 会掉到 0 V —— 那时调试要么保留 LDO，要么在 J-Link 侧固定 3.3 V 电平。
+
 **板上电源拓扑**：
 
 ```
@@ -334,6 +346,8 @@ VDDH → ME6217C33 VIN；ME6217 CE ← POWER_PIN = P0.13；ME6217 VOUT → EXTVC
    **一旦做了 `--recover`，重刷 bootloader 不是可选步骤**：板子依赖
    `UICR_REGOUT0_VALUE = UICR_REGOUT0_VOUT_3V3`，`--recover` 擦掉 UICR 后
    REGOUT0 回落到 1.8 V，不重刷就起不来。
+   **手上这块板子已经实测过了（2026-09-04，见下）：NFCPINS 已开放、REGOUT0 已经是
+   3.3 V → 不需要 `--recover`，也不要做。**
 2. **pinctrl 冲突**。ZMK 的 `spi1_default` 把 MOSI 放在 **P0.10**，
    上游 `promicro_nrf52840-pinctrl.dtsi` 的 uart0 是 **TX=P0.09 / RX=P0.10**。
    本方案的 overlay 已经把 uart0 挪到 P0.06/P0.08 并关掉 spi1，
@@ -342,6 +356,46 @@ VDDH → ME6217C33 VIN；ME6217 CE ← POWER_PIN = P0.13；ME6217 VOUT → EXTVC
    `POWER_PIN` 的 R4 实测过 0.42 µA / 7~8 µA / ~750 µA 三种结果；
    D1 装成硅二极管而非肖特基 → +56 µA；R10-R11 未贴。
    **拿到板子第一件事是测静态电流，不要相信任何标称值。**
+   （**2026-09-04 仍未测** —— 那次上机只做了 SWD 通路与芯片体检。）
+
+**2026-09-04 首次上机实测（J-Link SWD）**
+
+四线接法（背面 `CLK` / `DIO`，加 J3 第 11 焊盘 GND、第 9 焊盘 EXTVCC 作 VTref）
+**实测可用**，读 flash / UICR / 内核寄存器全程无错。顺带把 J3 的第 9、第 11 两个焊盘
+从「netlist 数出来的」升级成实测确认（VTref 读到 3.300 V、链路稳定）；
+其余 11 个焊盘的顺序仍然只有 netlist 依据。
+
+| 项 | 实测值 | 结论 |
+| --- | --- | --- |
+| 探针 | `VID_1366&PID_0101`；`J-Link ARM-OB STM32 compiled Aug 22 2012`；HW V7.00；S/N 报 `-1` | 山寨 OB。时钟只能取 `16 MHz/n, n≥4` → **上限 4000 kHz**，填 8000 会被静默降回 4000 |
+| `VTref` | 3.300 V | 板载 ME6217 的 3.3 V 输出正常 |
+| SW-DP / AHB-AP / CPUID | `0x2BA01477` / `0x24770011` / `0x410FC241` | Cortex-M4 r0p1，**是真 nRF52840** |
+| `FICR.INFO.PART` / `VARIANT` / `PACKAGE` | `0x00052840` / `"AAC0"` / `0x2004` | nRF52840 QIAA、AAC0 批次，不是翻新片 |
+| `FICR.INFO.RAM` / `FLASH` | `0x100` / `0x400` | 256 KB RAM / 1024 KB flash，足量 |
+| `UICR.NFCPINS` `0x1000120C` | `0xFFFFFFFE` | 前一任固件已把 NFC 保护关掉，**P0.09/P0.10 已经是普通 GPIO** |
+| `UICR.REGOUT0` `0x10001304` | `0xFFFFFFFD`（VOUT = 0b101） | **已经是 3.3 V 档**，不用写 |
+| `UICR.APPROTECT` `0x10001208` | `0xFFFFFFFF` | 未锁，SWD 可自由访问（§11 #14） |
+| `UICR.PSELRESET[0]/[1]` | 两份都是 `0x00000012` | 硬件复位脚是 **P0.18** |
+| `UICR.NRFFW[0]/[1]` | `0x000F4000` / `0x000FE000` | bootloader 起始 + MBR 参数页，和下面那张 flash 布局对得上 |
+| `FICR.DEVICEID` | `8ED4F884 C77A8827` | 记下来，将来认板子用 |
+
+**flash 现状**：`0xF4000` 是 `UF2 Bootloader 0.6.0` / `Board-ID: nRF52840-nicenano` /
+`Model: nice!nano`，配 S140 6.1.1 —— **正好是本工程要求的那一版，不用换**。
+`0x26000` 的 app 是 Adafruit Arduino 环境残留（`Feather nRF52840 Express`、
+`Adafruit_LittleFS`、`/adafruit/bond_prph`），刷我们的 UF2 直接覆盖即可。
+`0xEC000` storage 区与 `0xFE000` 全 `FF`。
+
+⚠ **J-Link Commander 的 `testwspeed` / `testcspeed` 在这块板子上禁用**，`erase` 同理。
+`testwspeed` 默认往 `0x00000000` 写 128 KB 递增图案，**会擦掉 MBR + SoftDevice**。
+这次已经踩过一次：`0x0–0x20000` 被覆盖，事后用官方
+`nice_nano_bootloader-0.6.0_s140_6.1.1.hex` 回刷 + `verifybin` 才恢复
+（未被触及的 `0x20000–0x25DE7` 与 release 镜像 **0 字节差异**，证明板上原本就是这个镜像；
+app 区与 bootloader 区刷前刷后 SHA256 一致）。只读探测用 `mem32` / `savebin`，
+写 flash 用 `loadbin` + `verifybin` 并显式给地址范围。操作细节见
+[`FIRMWARE.md`](FIRMWARE.md) §2b。
+
+**这次没验的**：静态电流（上面第 3 条，也是 R1 的主项）、RTT 日志通路
+（当前 flash 里的 Adafruit 残留固件不产生 RTT 输出，见 [`FIRMWARE.md`](FIRMWARE.md) §2b）。
 
 **工具链**（已核实）：board target `promicro_nrf52840/nrf52840/uf2`，
 `CONFIG_USE_DT_CODE_PARTITION=y`，`CONFIG_BUILD_OUTPUT_UF2=y`，UF2 family `0xADA52840`。
@@ -658,7 +712,9 @@ mac = HMAC-SHA256(secret, nonce || counter || cmd)[0..15]
 ### §5.4 剩下的三个安全缺口
 
 1. **物理攻击面**。设备本身在车上，拆开就能读 flash（nRF52840 的 APPROTECT 可以开，
-   但克隆板的 bootloader 会不会绕开这条 `[未核实]`）。
+   但克隆板的 bootloader 会不会绕开这条 `[未核实]`）。**2026-09-04 实测：出厂
+   `UICR.APPROTECT = 0xFFFFFFFF`，即当前完全没锁，SWD 能直接把整片 flash 读走**
+   （§3.4）—— 也就是说这个攻击面现在是敞开的，不是理论风险。
 2. **离线首次配对**。设备从没上过 4G 时怎么拿到第一把 secret，方案未定。
 3. **锁死风险的逃生口**。手机没电 / 手机丢 / 4G 挂 / 设备挂，**必须保留机械钥匙**。
    这不是可选项，是安全需求（见 §7 BOM）。
@@ -780,9 +836,9 @@ functionality that does not require explicit user approval"*。
 
 | 项 | 用途 |
 | --- | --- |
-| J-Link（或 CMSIS-DAP） | SWD 烧录、`nrfjprog --recover`（§3.4 必需） |
+| J-Link（或 CMSIS-DAP） | SWD 烧录。~~`nrfjprog --recover`~~ —— **这块板子实测不需要**（§3.4）。手上这只是山寨 J-Link OB，**速度上限 4000 kHz**，脚本要带 `exec DisableAutoUpdateFW` |
 | 杜邦线 / 排针 | 接 J3 |
-| **示波器** | 测 VDDH 瞬态（§3.2）、静态电流（§3.4） |
+| **示波器** | 测 VDDH 瞬态（§3.2）、静态电流（§3.4，**仍未测**） |
 | ~~VNA~~ | **不再需要** —— NFC 天线调谐工作随 ADR-004 消失（§3.3） |
 
 ### §7.5 已放弃、不要采购
@@ -1131,8 +1187,8 @@ LBS 降级是 R9 的验收项之一：拔掉 GNSS 天线仍要出 `src=lbs` 的�
 
 | 阶段 | 内容 | 验收 |
 | --- | --- | --- |
-| **R0 环境** | NCS 工具链；`promicro_nrf52840/nrf52840/uf2` 点灯；J-Link 接通。**顺带：一根 UART 线接模组，验 `AT^WAKEUPHEX` 和 `CSCLK=3` 在 V1011 上到底能不能用**（§8.7） | blinky 跑起来，SWD 能连；`AT^WAKEUPHEX` 返回 OK 而不是 ERROR |
-| **R1 板子体检** | **实测静态电流**；查 D1 是不是肖特基；测 POWER_PIN/R4；确认 J3 引脚顺序 | 拿到真实的 µA 数字，不是标称值 |
+| **R0 环境** | NCS 工具链；`promicro_nrf52840/nrf52840/uf2` 点灯；~~J-Link 接通~~（✅ **2026-09-04 实测通了**，芯片体检结果见 §3.4）；**验 RTT 日志通路**（日志没有别的出口，见 [`FIRMWARE.md`](FIRMWARE.md) §2b）。**顺带：一根 UART 线接模组，验 `AT^WAKEUPHEX` 和 `CSCLK=3` 在 V1011 上到底能不能用**（§8.7） | blinky 跑起来，~~SWD 能连~~（已过）；**RTT 里看得到日志**；`AT^WAKEUPHEX` 返回 OK 而不是 ERROR |
+| **R1 板子体检** | **实测静态电流**（仍未做）；查 D1 是不是肖特基；测 POWER_PIN/R4；~~确认 J3 引脚顺序~~（第 9/第 11 焊盘已实测，其余仍只有 netlist 依据，§3.4） | 拿到真实的 µA 数字，不是标称值 |
 | **R2 传感器** | LIS2DW12 上 I2C；`SENSOR_TRIG_MOTION`（INT1，已确认可用）；~~读驱动源码定论 INT1/INT2~~（已定论，§11 #2）；**拍板 STATIONARY 要不要接第二根线** | 摇一下就有中断。静止判定当前走软件计时，不依赖 INT2 |
 | **R3 BLE** | GATT 服务起来（`ble_unlock.c`）；`requestMtu` 打通；安卓 App 按 MAC 直连 | 手机连上能收到 SELECT AID 的 `90 00`，且**锁屏状态下也能连**。**协议层已由 BabbleSim 提前验完**（8 条断言，见 [`FIRMWARE.md`](FIRMWARE.md) §5），R3 只剩「真手机 + 真射频」这一半 |
 | **R4 开锁协议** | ~~§5.2 三步协议；PSA HMAC；counter/nonce 持久化~~（**仿真已验**）；真机上复核 counter 掉电不回零 | 重放一次抓包必须被拒（回 `69 82`）—— 仿真里已过，真机再验一次 flash 持久化那一段 |
@@ -1180,7 +1236,7 @@ LBS 降级是 R9 的验收项之一：拔掉 GNSS 天线仍要出 `src=lbs` 的�
 | 10 | **Q1 P-MOS 及其栅源齐纳、GNSS 电源门控管、锁执行机构与驱动**都没给型号（§7） | R8 / 采购 | 仍待你定 |
 | 11 | **I2C 上拉阻值**待实测（§7）。~~NFC 调谐电容~~ 随 §3.3 删除 | R2 | 仍待实测 |
 | 13 | **离线首次配对**怎么拿第一把 secret（§5.4） | R4 | 仍待定；当前假设随固件烧录 |
-| 14 | **APPROTECT 在克隆板 bootloader 下是否有效 `[未核实]`**（§5.4） | R4 之后 | 仍未核实 |
+| 14 | **APPROTECT 在克隆板 bootloader 下是否有效 `[未核实]`**（§5.4） | R4 之后 | 仍未核实。**2026-09-04 只确认了出厂现状 `UICR.APPROTECT = 0xFFFFFFFF`（未锁）**（§3.4）—— 「写进去之后 SWD 会不会真被挡住」还是没验，那要写 UICR 才知道，先不动 |
 | 15 | **模组基站定位可用性**未实测，不可用则服务端调第三方 API（§9.5） | R9 | 仍待实测；`modem_lbs()` 已实现调用路径 |
 | 16 | **SIM 卡套餐、4G/GNSS 天线、线束**都还没选（§7.3） | 采购 | 仍待你定 |
 | 17 | **`AT^WAKEUPHEX` / `CSCLK=3` 在 AT 固件 V1011 上是否可用 `[未核实]`**（§8.7） | **提前到 R0**；不可用则功耗预算崩且无替代 | 仍未核实；`modem.c` 里失败会打 `LOG_ERR` |
@@ -1239,4 +1295,16 @@ LBS 降级是 R9 的验收项之一：拔掉 GNSS 天线仍要出 `src=lbs` 的�
 - **报文契约一字未改**：topic、字段、指令闭集、§5.2 的三步 APDU 全部不动。
   唯一变的是事件闭集里的一个名字（`nfc_err` → `ble_err`），那个事件从未被实际发出过。
 - 因此 §9 服务端、HA 集成、`MQTT-CONTRACT.md` 的实质内容都不受影响，只改了文案。
+
+2026-09-04 的净变化只有一件事：**第一次把主控板接上 J-Link 做了只读体检**。
+
+- §3.4 新增实测表（探针型号与 4 MHz 上限、芯片身份、UICR 四项、flash 现状），
+  并把「必须处理的三件事」里的第 1 条从待办改成「已确认不需要 `--recover`」。
+- §3.4 新增 `testwspeed` / `testcspeed` / `erase` 禁令 —— 这次真的擦掉过
+  MBR + SoftDevice，已用官方镜像回刷并逐字节校验恢复。
+- §10 的 R0 拆细：「J-Link 接通」划掉，**新增「验 RTT 日志通路」** ——
+  日志没有别的出口（`prj.conf` 关了 USB CDC ACM，两个 UARTE 被占满），
+  这一项不过关等于后面全程盲调。R1 的「确认 J3 引脚顺序」部分完成。
+- §11 #14 补上出厂现状（APPROTECT 未锁），但「锁上之后 SWD 是否真被挡住」仍未核实。
+- **静态电流仍然没测** —— 那是 R1 的主项，也是这块克隆板最大的未知数。
 

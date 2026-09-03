@@ -17,6 +17,11 @@
 > ⚠ 仍然**没有在真硬件上跑过**。仿真验的是协议与逻辑，验不了
 > 引脚接线、静态电流、GNSS/4G 的 UART 时序 —— 那些是 R0~R1 的事（§4）。
 >
+> **2026-09-04 补充**：主控板已经上过一次 J-Link，**SWD 通路可用、芯片体检合格、
+> bootloader 版本正好匹配**（结果见 [`DESIGN.md` §3.4](DESIGN.md)，
+> 这台机器上的探针限制与调用范式见 §2b）。但固件本身**还是没在真硬件上跑过** ——
+> 那次只做了只读探测，没有烧任何固件进去。
+>
 > 第一次构建暴露了 6 个真问题，全部已修，逐条记在 §3c ——
 > **其中两个是「编得过但功能静默失效」，比编译错误危险得多。**
 
@@ -114,6 +119,53 @@ nrfjprog -f NRF52 --program nice_nano_bootloader-0.6.0_s140_6.1.1.hex --chiperas
 ```
 
 **做了 `--recover` 就必须重刷 bootloader**，否则 REGOUT0 回落到 1.8 V，板子起不来。
+
+**手上这块板子已经读过了（2026-09-04）：`NFCPINS = 0xFFFFFFFE`（已开放）、
+`REGOUT0 = 0xFFFFFFFD`（已是 3.3 V）→ 两步都不用做，`--recover` 也不要做。**
+完整体检结果见 [`DESIGN.md` §3.4](DESIGN.md)。
+
+## 2b. 烧录与调试：这台机器上的实际情况（2026-09-04 实测）
+
+**探针是山寨 J-Link OB**（`VID_1366&PID_0101`，固件 `J-Link ARM-OB STM32 compiled
+Aug 22 2012`，HW V7.00，S/N 报 `-1`）。两个后果：
+
+- **速度上限 4000 kHz**。它只支持 `16 MHz/n, n≥4`，`-speed 8000` 会被静默降回 4000。
+- **不要让 J-Link 给它刷固件**。脚本第一行放 `exec DisableAutoUpdateFW`，
+  否则每次连接都可能试图更新这块克隆探针的固件。
+
+SWD 四线接法与实测的 UICR/flash 现状记在 [`DESIGN.md` §3.4](DESIGN.md)，不重复。
+调用范式（J-Link Commander V6.44e，已验证可用）：
+
+```
+JLink.exe -device nRF52840_xxAA -if SWD -speed 4000 -autoconnect 1 \
+          -ExitOnError 1 -CommanderScript probe.jlink
+```
+
+```
+exec DisableAutoUpdateFW
+si SWD
+speed 4000
+connect
+h
+mem32 0x10001208,1          ; 只读探测：mem32 / savebin
+savebin dump.bin, 0x26000, 0x20000
+g
+q
+```
+
+⚠ **`testwspeed` / `testcspeed` 在这块板子上禁用**，`erase` 同理。
+`testwspeed` 默认往 `0x00000000` 写 128 KB 递增图案，**会擦掉 MBR + SoftDevice**，
+而这块板子的 bootloader 依赖它们。已经踩过一次并完整恢复（过程与校验见
+[`DESIGN.md` §3.4](DESIGN.md)）。写 flash 只用 `loadbin` + `verifybin` 并显式给地址范围。
+
+**日志只能走 RTT，而 RTT 通路还没验过。** `prj.conf` 关掉了板级 USB CDC ACM
+（`CONFIG_BOARD_SERIAL_BACKEND_CDC_ACM=n`），两个 UARTE 被 GNSS 和 Air780EP 占满，
+所以 `CONFIG_LOG_BACKEND_RTT=y` 是唯一的日志出口。当前 flash 里是 Adafruit Arduino
+残留固件，不产生 RTT 输出，所以没法用它验证读通路。另外 **V6.44e 的 Commander
+没有 `rtt` / `rttread` 命令**（`?` 输出确认过），要用独立的
+`JLinkRTTLogger.exe -Device nRF52840_xxAA -If SWD -Speed 4000` 或 `JLinkRTTClient.exe`。
+**R0 点灯那一步同时是 RTT 通路的验收项** —— blinky 起来但 RTT 无输出，
+意味着后面所有阶段都在没有日志的情况下调试，必须当场解决。
 
 ## 3. 已知没做完的
 
@@ -268,8 +320,12 @@ M1 那两条在旧代码下仍然过——因为旧代码的失败方式是「�
    （`docs.openluat.com/4Gmodulepin/` 返回 404）。**布板前必须查
    `Air780EP硬件手册V1.1.pdf`。** overlay 里现在填的 P0.26 是**占位值**。
 
-顺带 R1 的那条也别忘：**板子到手第一件事是测静态电流**（§3.4 第 3 条）。
-同款克隆板实测过 0.42 µA / 7~8 µA / 750 µA 三种结果。
+第 1 条的验收要读日志，而**日志只能走 RTT，那条通路本身也还没验过**（§2b）——
+所以次序是：先烧个最小固件确认 RTT 出字，再去验 `AT^WAKEUPHEX`。
+
+顺带 R1 的那条也别忘：**板子到手第一件事是测静态电流**（DESIGN.md §3.4 第 3 条）。
+同款克隆板实测过 0.42 µA / 7~8 µA / 750 µA 三种结果。**2026-09-04 那次上机没量** ——
+而且量的时候必须拔掉调试器冷启动（§7 末尾那条：Debug Interface mode 下 System OFF 是仿真的）。
 
 ## 5. BabbleSim 运行时测试：开锁通道
 

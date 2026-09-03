@@ -12,3 +12,6 @@ __pycache__/
 build/
 .pytest_cache/
 .ruff_cache/
+
+# 上机调试的临时目录：J-Link 工具链、flash dump、bootloader 镜像，几百 MB，不进库
+.tmp/
