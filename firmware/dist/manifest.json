@@ -1,11 +1,11 @@
 {
   "artifacts": {
     "zephyr.hex": {
-      "sha256": "bd38359a03e7a6a4af9e46e9895a2e5a914b9510bebc437dee12be5a0ea4167f",
+      "sha256": "5b9f681457cf199d58d98ff6d5796b949479fa287fa0a382dc77affbbf7cbdcf",
       "size": 620792
     },
     "zephyr.uf2": {
-      "sha256": "22cdf7e7ade2e06b2cb087cbfdc627a0e9c8138ff0984493de8aada5c5536c88",
+      "sha256": "9fab375a1d77e45c14847c3f9450bb3b4e394ca609d94ad4b44cc8cbc41d59dc",
       "size": 441344
     }
   },
@@ -24,7 +24,7 @@
   "sources": {
     "firmware/nrf52840/CMakeLists.txt": "08c344e9c154ac4c95d1d5df16f381541f97ea78f4796aec87c2279abde95684",
     "firmware/nrf52840/Kconfig": "99e041102ea6147df86d7f22e0747e047f9af918575960d28c518f10e787bdb3",
-    "firmware/nrf52840/boards/promicro_nrf52840_nrf52840_uf2.overlay": "69337c65960f3273f7f1f5152e2f9cb1b7eea8bd55d0759248ed624e3b6357f6",
+    "firmware/nrf52840/boards/promicro_nrf52840_nrf52840_uf2.overlay": "cfe192d5c362065338d1d776a19b194c73a56677c497afef16f8de58893697f2",
     "firmware/nrf52840/prj.conf": "56e97a5a2b3c2a4841f9a6a4106b7b18cb97701945aa8c4acb2e9bdfb2e94a1a",
     "firmware/nrf52840/src/battery.c": "728b6a6f857fd98fe762b9b39fe8dea288d34ed4cdc4d8952d1c0752647ac17e",
     "firmware/nrf52840/src/battery.h": "78cccdfb868afa3ade11d7a4fb719749aa21b7c63385affbe15e6b82c6a5fa8e",

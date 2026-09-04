@@ -44,8 +44,8 @@ firmware/build.sh          # 构建 + 拷产物 + 刷新 manifest.json，一个�
 | `zephyr.hex` | 620 792 B |
 
 ```
-zephyr.uf2  sha256  22cdf7e7ade2e06b2cb087cbfdc627a0e9c8138ff0984493de8aada5c5536c88
-zephyr.hex  sha256  bd38359a03e7a6a4af9e46e9895a2e5a914b9510bebc437dee12be5a0ea4167f
+zephyr.uf2  sha256  9fab375a1d77e45c14847c3f9450bb3b4e394ca609d94ad4b44cc8cbc41d59dc
+zephyr.hex  sha256  5b9f681457cf199d58d98ff6d5796b949479fa287fa0a382dc77affbbf7cbdcf
 ```
 
 同一份源码在这台机器上重复构建两次，两个文件都**字节相同**（实测）。

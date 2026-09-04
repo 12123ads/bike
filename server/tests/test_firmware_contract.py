@@ -837,6 +837,70 @@ def test_battery_gate_and_divider_share_one_pin():
     )
 
 
+def test_i2c_has_internal_pullups_in_both_states():
+    """**没有 `bias-pull-up` 的话 I2C 一个字节都传不出去。**
+
+    这条不是风格检查。链路是：nrfx 的 `TWIM_PIN_INIT`（nrfx_twim.c:68）本来
+    会给 SCL/SDA 配 `NRF_GPIO_PIN_PULLUP`，但 Zephyr 的 twim 驱动传的是
+    `skip_gpio_cfg = true` + `skip_psel_cfg = true`（i2c_nrfx_twim.c:306），
+    那段整个被跳过 —— **引脚配置完全由 pinctrl 决定**。
+
+    本方案不装外部上拉电阻，所以这两行是总线唯一的上拉来源。删掉它们
+    编译照过、`west build` 零警告，症状是运行期 `lis2dw12` 探测不到
+    （`device_is_ready()` 假），而 `motion_init()` 那条路只打 LOG_ERR
+    不 fatal —— 于是设备照常启动，只是**唯一的外部唤醒源没了**。
+
+    实测过 pincfg 两种取值（从 `__pinctrl_state_pins_*__device_dts_ord_*`
+    解出来）：没有这两行是 `0x0C000018`/`0x0B000016`（pull 字段 = 0 =
+    `NRF_PULL_NONE`），有则是 `0x0C000618`/`0x0B000616`（= 3 = `NRF_PULL_UP`）。
+
+    `sleep` 态也必须有：那个状态带 `low-power-enable`，pinctrl 会强制
+    `dir=INPUT` + `input=DISCONNECT`，但 `NRF_GET_PULL` 照旧生效
+    （pinctrl_nrf.c:586）。保留上拉让总线休眠期间停在高电平而不是悬空 ——
+    悬空正是 §3.7「电压停在 VIL/VIH 之间会增加电流」要避免的情况。
+    """
+    text = overlay_text()
+    for state in ("i2c0_default", "i2c0_sleep"):
+        m = re.search(rf"{state}:\s*{state}\s*\{{(.*?)\n\t\}};", text, re.S)
+        assert m, f"overlay 里没有 {state}"
+        assert "bias-pull-up" in m.group(1), (
+            f"{state} 缺 bias-pull-up —— 本方案不装外部上拉电阻，"
+            f"这是总线唯一的上拉来源。少了它 pincfg 的 pull 字段是 "
+            f"NRF_PULL_NONE，I2C 完全不通，而编译不会报错")
+
+
+def test_i2c_stays_at_100khz_while_using_internal_pullups():
+    """用内部上拉就**必须**留在 100 kHz。
+
+    内部 RPU 最坏 16 kΩ（PS v1.1 GPIO 电气规格，11/13/16 kΩ min/typ/max）。
+    上升时间 t_r = 0.847·R·C（30%→70%）：
+
+    | 条件 | t_r | 规范上限 |
+    | 16 kΩ + 30 pF | 407 ns | 100 kHz → 1000 ns ✓ |
+    | 16 kΩ + 74 pF | 1000 ns | 恰好到顶 |
+    | 400 kHz | — | 300 ns → 要求 C ≤ 22 pF，做不到 |
+
+    所以「改成 400 kHz」和「用内部上拉」不能同时成立。谁要提速就得先装
+    外部 2.2~4.7 kΩ 并删掉 `bias-pull-up` —— 这条断言让那两件事必须一起改。
+    """
+    text = overlay_text()
+    m = re.search(r"&i2c0\s*\{(.*?)\n\};", text, re.S)
+    assert m, "overlay 里没有 &i2c0 节点"
+    body = m.group(1)
+
+    freq = re.search(r"clock-frequency\s*=\s*<([^>]+)>", body)
+    assert freq, "&i2c0 没有 clock-frequency"
+    value = freq.group(1).strip()
+
+    uses_internal = "bias-pull-up" in overlay_text()
+    if uses_internal:
+        assert value == "I2C_BITRATE_STANDARD", (
+            f"clock-frequency 是 {value} 而 pinctrl 还在用内部上拉 —— "
+            f"内部 RPU 最坏 16 kΩ 撑不起 400 kHz 的 300 ns 上升时间"
+            f"（要求总线电容 ≤ 22 pF）。提速前先装外部 2.2~4.7 kΩ "
+            f"并删掉 bias-pull-up")
+
+
 # --- dist/ 与源码同步（2026-09-04：编译产物入库之后的第一要务） ---------------
 
 DIST = FW.parent / "dist"

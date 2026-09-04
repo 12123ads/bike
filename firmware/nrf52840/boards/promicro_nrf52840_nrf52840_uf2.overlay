@@ -192,11 +192,16 @@
 /* --- I2C：LIS2DW12 ---------------------------------------------------------
  * 地址 0x19 要求 SA0/SDO 接 VDD_IO。
  * ⚠ SA0 接地的话内部 20.4~54.4 kΩ 上拉会白烧 110~160 µA（DESIGN.md §3.7）。
+ *
+ * ⚠ **不装外部上拉电阻**，用 nRF52840 的内部上拉（见下面 pinctrl 的
+ * `bias-pull-up`）。因此 `clock-frequency` **必须留在 100 kHz** ——
+ * 内部 RPU 最坏 16 kΩ，400 kHz 的 300 ns 上升时间要求总线电容 ≤ 22 pF，
+ * 达不到。改快之前先装外部 2.2~4.7 kΩ。
  */
 &i2c0 {
 	status = "okay";
 	compatible = "nordic,nrf-twim";
-	clock-frequency = <I2C_BITRATE_STANDARD>;
+	clock-frequency = <I2C_BITRATE_STANDARD>;   /* 100 kHz，见上面第 2 条 */
 	pinctrl-0 = <&i2c0_default>;
 	pinctrl-1 = <&i2c0_sleep>;
 	pinctrl-names = "default", "sleep";
@@ -274,17 +279,52 @@
 		};
 	};
 
+	/* ⚠ **`bias-pull-up` 这两行是 I2C 能不能通的前提，不是优化。**
+	 *
+	 * nrfx 的 `TWIM_PIN_INIT`（nrfx_twim.c:68）本来会给 SCL/SDA 配
+	 * `NRF_GPIO_PIN_PULLUP`，但 Zephyr 的 twim 驱动传的是
+	 * `skip_gpio_cfg = true` + `skip_psel_cfg = true`（i2c_nrfx_twim.c:306），
+	 * 那段整个被跳过 —— **引脚配置完全由 pinctrl 决定**。
+	 * 少了这两行，pincfg 的 pull 字段是 `NRF_PULL_NONE`（实测：`0x0C000018`
+	 * / `0x0B000016`），两根线上内外都没有上拉，I2C 一个字节都传不出去。
+	 * 加上之后是 `0x0C000618` / `0x0B000616`（pull=3=NRF_PULL_UP，
+	 * 从 `__pinctrl_state_pins_0__device_dts_ord_*` 解出来核对过）。
+	 *
+	 * 用内部上拉（RPU 11/13/16 kΩ min/typ/max，PS v1.1 GPIO 电气规格）
+	 * 换掉两只外部电阻，**代价是两条硬约束**：
+	 *
+	 * 1. **必须停在 100 kHz。** 上升时间 t_r = 0.847·R·C（30%→70%）：
+	 *    16 kΩ 最坏 + 30 pF ≈ 407 ns，100 kHz 的 1000 ns 上限够；
+	 *    400 kHz 只有 300 ns，要求 C ≤ 22 pF —— 做不到。
+	 *    所以 `clock-frequency` 必须留在 `I2C_BITRATE_STANDARD`。
+	 * 2. **总线电容 ≤ 74 pF**（16 kΩ 下正好 1000 ns）。短杜邦线挂一个
+	 *    LIS2DW12 完全够（焊盘 3 pF + 传感器两脚约 20 pF + 线材几 pF）。
+	 *    **再挂第二个 I2C 器件、或线拉到半米以上，余量就没了** —— 而 I2C
+	 *    的临界失效很难看：偶发 NACK、偶发读到错值，不是干脆不通。
+	 *    要扩展就装外部 2.2~4.7 kΩ 并把这两行删掉。
+	 *
+	 * 功耗上没有代价：上拉只在线被拉低时流 3.3 V / 13 kΩ = 254 µA，
+	 * 而 I2C 空闲是高电平、几分钟才采样几百微秒，平均下来是皮安级。
+	 */
 	i2c0_default: i2c0_default {
 		group1 {
 			psels = <NRF_PSEL(TWIM_SDA, 0, 24)>,
 				<NRF_PSEL(TWIM_SCL, 0, 22)>;
+			bias-pull-up;
 		};
 	};
 
+	/* sleep 态也要保留上拉。这个状态带 `low-power-enable`，pinctrl 会强制
+	 * `dir=INPUT` + `input=DISCONNECT`，但 `NRF_GET_PULL` 照旧生效
+	 * （pinctrl_nrf.c:586 那一次 `nrf_gpio_cfg`）。保留上拉让总线在休眠期间
+	 * 停在高电平而不是悬空 —— `PIN_CNF` 是 retained 寄存器，System OFF
+	 * 下也保持。悬空输入正是 §3.7 那条「电压停在 VIL/VIH 之间会增加电流」
+	 * 想避免的情况。 */
 	i2c0_sleep: i2c0_sleep {
 		group1 {
 			psels = <NRF_PSEL(TWIM_SDA, 0, 24)>,
 				<NRF_PSEL(TWIM_SCL, 0, 22)>;
+			bias-pull-up;
 			low-power-enable;
 		};
 	};

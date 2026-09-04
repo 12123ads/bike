@@ -10,7 +10,7 @@
 > | 产物 | `zephyr.uf2` 441 344 B，family `0xADA52840`，start `0x26000` ✓ |
 > | BabbleSim 运行时测试 | **两侧都 Passed**，8 条断言（见 §5） |
 > | native_sim ztest | **8 套 67 条全过**（见 §3d） |
-> | 文本层契约测试 | `server/tests/test_firmware_contract.py` **76 条全过** |
+> | 文本层契约测试 | `server/tests/test_firmware_contract.py` **82 条全过** |
 >
 > 上表是 **2026-09-04 最后一次构建**的数字（引脚复位那次）。**编译产物已入库**：
 > [`firmware/dist/`](../firmware/dist/) 里有 `zephyr.uf2` 和 `zephyr.hex` ——
@@ -355,6 +355,9 @@ done
 | `batt_gate`/`vbatt` 回 P0.04、`modem_pwrkey` 回 P0.12（引脚复核） | `test_overlay_only_uses_pins_the_board_exposes` 红，报「overlay 用了这块板没引出的脚：['P0.04', 'P0.12']」 |
 | 删掉 overlay 末尾的 `&i2c1 { status = "disabled"; }` | `test_overlay_disables_board_peripherals_that_steal_header_pins` 红，报「上游板级 DTS 把它设成 okay，它的 pinctrl 会占掉排针脚」 |
 | `batt_gate` 挪到 P0.06（引出但已是 uart0 TX） | 2 条红：脚位互斥那条 + 门控与分压器同脚那条 |
+| 删掉 `i2c0_default` 的 `bias-pull-up` | `test_i2c_has_internal_pullups_in_both_states` 红，报「i2c0_default 缺 bias-pull-up」 |
+| 只删 `i2c0_sleep` 的 `bias-pull-up` | 同一条红，报的是 `i2c0_sleep` —— 两个 state 分别钉 |
+| `clock-frequency` 改 `I2C_BITRATE_FAST` 但仍用内部上拉 | `test_i2c_stays_at_100khz_while_using_internal_pullups` 红 |
 
 M1 那两条在旧代码下仍然过——因为旧代码的失败方式是「静默丢弃」而不是
 「投递截断值」，而这两条断言的正是「不投递」。这个差异本身是实测得到的
@@ -428,6 +431,7 @@ firmware/tests/ble_unlock_bsim/run.sh /tmp/btest
 | LIS2DW12 STATIONARY 走 INT2 而本板只接 INT1（§3d） | `motion.c`、overlay | **已定论**：MOTION 在 INT1（可用），STATIONARY 在 INT2（线没接，事件不会来）。当前不依赖它，静止判定用 `last_still_ms` 软件计时。要真用得接第二根线或越过驱动写 `CTRL_REG7.int2_on_int1` |
 | ~~GPIO 分配~~（§3.5） | overlay | ✅ **2026-09-04 已核实并已改**：用了 **13 个**，余 **8 个**（P0.02 P0.09 P0.29 P1.01 P1.02 P1.04 P1.06 P1.07）。同时修掉三个**这块板没引出**的脚：`batt_gate` P0.04 → **P0.10**、`modem_pwrkey` P0.12 → **P1.00**、`modem_ri` P0.26 → 节点删除。SoC 有 48 个 GPIO 而板子只引出 21 个，填错 `west build` 照过 —— 白名单和四条护栏现在钉在 `test_firmware_contract.py`。顺带关掉上游板级 DTS 打开的 `i2c1`（抢 J2.12/J2.13）和 `spi2`（抢整个 J4） |
 | ADC 脚 | overlay | P0.31(AIN7)。只有 3 个真 ADC 脚，ZMK 的 A6~A10 别名不是 SAADC 通道 |
+| ~~I2C 上拉~~（§3.7） | overlay | ✅ **2026-09-04 已定并已改**：**不装外部电阻**，`i2c0_default`/`i2c0_sleep` 都加 `bias-pull-up` 用内部 RPU（11~16 kΩ）。改之前**两种上拉都没有** —— 而那不是设计选择，是 I2C 完全不通：nrfx 的 `TWIM_PIN_INIT` 会配 PULLUP，但 Zephyr twim 驱动传 `skip_gpio_cfg=true`，引脚配置全归 pinctrl。实测 pincfg `0x0C000018`(pull=NONE) → `0x0C000618`(pull=UP)。代价：锁在 100 kHz、总线电容 ≤ 74 pF（只挂这一个器件、线要短）。两条约束各有一条断言钉住 |
 | ~~电池采样分压比~~（§3.6 / §11 #27） | `battery.c`、overlay | ✅ **已定并已改**：**21:1**（`output-ohms=470000` / `full-ohms=4.7M+4.7M+470k`）。基准是引脚上限 **VDD 3.3 V**（不是 ADC 满量程 3.6 V —— 那是绝对最大值，按它算零余量）。`battery.c` 两条 `BUILD_ASSERT` 把比例和源阻抗（≤800 kΩ）钉成编译错误，都实测触发过。换算走 `voltage_divider_scale_dt()`。**电池不是 48 V 的话改 `PACK_MAX_MV`** |
 
 ## 7. 两个「决定不做」的，理由记在这里

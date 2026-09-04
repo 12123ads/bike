@@ -550,24 +550,72 @@ PACK+ ──[4.7 MΩ]──[4.7 MΩ]──┬── P0.31 (AIN7)
 | KX023 | Zephyr 里根本没有驱动 |
 | LM393 模块（震动开关） | TI SLCS005AH §5.8：`VCC=5 V, RL=∞, 25 °C` 下 ICC 典型 0.45 mA / 最大 1 mA，整模块 `[推断]` 2~4 mA。**比整机预算大三个量级，直接否掉** |
 
-**接线**：I2C 地址 0x19，要求 **SA0/SDO 接 VDD_IO**。
-注意 SA0 有内部上拉，数据手册 Table 2 给的是 **20.4~54.4 kΩ**——
-**如果把 SA0 接地，这个上拉会白烧 110~160 µA**。Zephyr 有 `disconnect-sdo-sa0-pull-up` 属性
-（原文用途 `to save current leakage`），但接 VDD_IO 更简单，本方案接 VDD_IO。
+**接线**（脚号见 §3.5 的实际分配表）：
+
+| 传感器脚 | 接到 | 焊盘 |
+| --- | --- | --- |
+| VDD + VDD_IO | 3.3 V（板载 ME6217 输出，实测 3.300 V） | J3.9 = EXTVCC |
+| GND | GND | J2.1/J2.4/J2.5 任一 |
+| SCL | P0.22（TWIM0） | J2.8 |
+| SDA | P0.24（TWIM0） | J2.9 |
+| INT1 | P1.11 | J3.3 |
+| **SA0 / SDO** | **VDD_IO** → 地址 0x19 | — |
+| **CS** | **拉高**（强制 I2C 模式，必须） | — |
+| INT2 | 不接（见下面的路由定论） | — |
+
+**SA0 接 VDD_IO 不是为了选地址，是为了不漏电。** 该脚内部上拉，数据手册
+Table 2 给 **20.4~54.4 kΩ**；接地的话 3.3 V 直接经它导通，白烧
+**110~160 µA** —— 比传感器本身大 100 倍。Zephyr 有
+`disconnect-sdo-sa0-pull-up` 属性（原文用途 `to save current leakage`），
+但接 VDD_IO 更简单，本方案接 VDD_IO。
+
+**3.3 V 从板载 LDO 取，固件不关它。** ADR-002 §3.5 曾要求「开机拉低 P0.13
+关掉 ME6217 省 100 µA」，ADR-003 §4.2 留了「除非 LIS2DW12 需要 3.3 V」的口子。
+**现在的实际状态是不关**：固件里没有任何一行碰 P0.13（全 `firmware/nrf52840`
+搜过），而克隆板的 `R4` 是 10 MΩ 上拉到 VDDH、ME6217 的 CE 高有效，
+所以不驱动就是默认开着。代价是 ~100 µA 静态,在 LX-P160 的 0.5~1.5 mA
+尺度下可接受（ADR-003 §5 的预算已按此计算）。
+⚠ 正品 nice!nano 的官方文档写「P0.13 置高关闭 VCC」，与克隆板原理图推出的
+极性**相反**。本工程用克隆板，**不要主动驱动 P0.13**；接传感器前先量一下
+J3.9 有没有 3.3 V。
+
+**I2C 不装外部上拉，用 nRF52840 的内部上拉。** 这一条 2026-09-04 才落地，
+之前 overlay 里**两种上拉都没有** —— 而那不是「靠外部电阻」的设计选择，
+是个 I2C 完全不通的状态：nrfx 的 `TWIM_PIN_INIT`（nrfx_twim.c:68）本来会配
+`NRF_GPIO_PIN_PULLUP`，但 Zephyr 的 twim 驱动传 `skip_gpio_cfg = true`
+（i2c_nrfx_twim.c:306），那段整个被跳过，引脚配置完全由 pinctrl 决定。
+现在 `i2c0_default`/`i2c0_sleep` 都加了 `bias-pull-up`，
+实测 pincfg 从 `0x0C000018`（pull=NONE）变成 `0x0C000618`（pull=UP）。
+
+两条硬约束，`test_firmware_contract.py` 各有一条断言钉住：
+
+| 约束 | 数字 |
+| --- | --- |
+| **必须留在 100 kHz** | RPU 最坏 16 kΩ（PS v1.1 GPIO 电气规格 11/13/16 kΩ）。t_r = 0.847·R·C：16 kΩ + 30 pF ≈ 407 ns ≤ 100 kHz 的 1000 ns ✓；400 kHz 只有 300 ns，要求 C ≤ 22 pF，做不到 |
+| **总线电容 ≤ 74 pF** | 16 kΩ 下正好 1000 ns。短杜邦线挂一个 LIS2DW12 够（焊盘 3 pF + 传感器约 20 pF + 线材几 pF）。再挂器件或线拉长就装外部 2.2~4.7 kΩ 并删掉 `bias-pull-up` |
+
+功耗上没有代价：上拉只在线被拉低时流 3.3 V / 13 kΩ = 254 µA，
+而 I2C 空闲是高电平、几分钟才采样几百微秒，平均是皮安级。
 
 **INT1 必须配成推挽输出、高有效，不能用开漏加上拉。** 理由是 nRF52840 手册唯一的那条定性警告：
 `When a pin is configured as digital input, increased current consumption occurs when
 the input voltage is between VIL and VIH`。推挽保证引脚永远不停在线性区，
 也省掉外部上拉的静态电流。这条和 §4.2 的「必须用 PORT 事件不能用 IN 事件」是同一个问题的两面。
+⚠ **但这是靠芯片复位默认值成立的，不是配置出来的**：`CTRL6.pp_od`（推挽/开漏）
+和 `CTRL6.h_lactive`（极性）Zephyr 驱动**一次都没写**（整个
+`drivers/sensor/st/lis2dw12` 搜过，只有 HAL 头里有函数声明，驱动侧零调用），
+也没有对应的 DTS 属性。结论是对的，换传感器型号时别以为这条自动满足。
 
 **DTS**（注意属性名是 `irq-gpios`，**不是** `int1-gpios`）：
 
 ```dts
 &i2c0 {
+    clock-frequency = <I2C_BITRATE_STANDARD>;   /* 100 kHz，见上面的上拉约束 */
+
     lis2dw12: lis2dw12@19 {
         compatible = "st,lis2dw12";
         reg = <0x19>;
-        irq-gpios = <&gpio0 N GPIO_ACTIVE_HIGH>;   /* 注意属性名是 irq-gpios */
+        irq-gpios = <&gpio1 11 GPIO_ACTIVE_HIGH>;   /* 注意属性名是 irq-gpios */
         int-pin = <1>;
         odr = <12>;                  /* 12.5 Hz */
         range = <2>;                 /* ±2 g，一格 31.25 mg */
@@ -575,22 +623,58 @@ the input voltage is between VIL and VIH`。推挽保证引脚永远不停在线
         wakeup-duration = <LIS2DW12_DT_WAKEUP_2_ODR>;
     };
 };
+
+&pinctrl {
+    i2c0_default: i2c0_default {
+        group1 {
+            psels = <NRF_PSEL(TWIM_SDA, 0, 24)>,
+                    <NRF_PSEL(TWIM_SCL, 0, 22)>;
+            bias-pull-up;        /* 总线唯一的上拉来源，不是优化 */
+        };
+    };
+    /* i2c0_sleep 同样要 bias-pull-up，见上 */
+};
 ```
+
+⚠ overlay 里 `motion_int`（`gpio-keys` 容器）和 `lis2dw12` 的 `irq-gpios`
+**是同一根物理线**（都是 P1.11）。两处声明是故意的：传感器驱动按边沿触发配它，
+而进 System OFF 前应用层必须把它重配成 level sense（GPIOTE 在 System OFF 下
+断电，只有 SENSE→DETECT 能唤醒），那需要一个独立于传感器驱动的
+`gpio_dt_spec`。见 `main.c` 的 `enter_system_off()`。
 
 阈值寄存器 `WAKE_UP_THS`(34h) 的 1 LSB = FS/64，±2 g 下即 **31.25 mg**。
 **注意阈值不是 devicetree 属性，只能运行时设**——Zephyr 侧用 `SENSOR_ATTR_UPPER_THRESH`
 （单位 mg，驱动内部用 `MG_TO_WK_THS_LSB` 换算）；持续时间才是 DTS 的 `wakeup-duration`（1 LSB = 1/ODR）。
 电瓶车**从 100~200 mg + `wakeup-duration` = 2~3 个 ODR 周期起调**，用来滤掉单次敲击。
-触发用 `SENSOR_TRIG_MOTION`（动了）与 `SENSOR_TRIG_STATIONARY`（停了）两个；
-静止判定时长在硅片里，`sleep-duration` 最多 15 × 512/ODR。
+触发只用 `SENSOR_TRIG_MOTION`（动了）；静止不用硬件事件，见下。
 
-**已知矛盾，未解决（R2 阶段定论）**：INT1/INT2 的路由在原文档里自相矛盾。
-ADR-002 §1.4 的接线表写「INT1 → 任意空闲 GPIO；**INT2 不用**」，§1.7 的 DTS 也只写
-`int-pin = <1>`；但 §1.6 的状态机说 `SENSOR_TRIG_STATIONARY` 走的是 **`int2_sleep_chg`**。
-两者不能同时成立。需要读 Zephyr `drivers/sensor/st/lis2dw12` 源码，
-看 `CONFIG_LIS2DW12_SLEEP` 打开时驱动写的是 `CTRL4_INT1_PAD_CTRL` 还是 `CTRL5_INT2_PAD_CTRL`。
-如果 STATIONARY 事件只出现在 INT2，就得多接一根线（§3.5 的余量装得下），
-或者退回软件计时判静止。
+**INT1/INT2 路由已定论（2026-09-02，读 NCS v3.4.0 驱动源码）**，
+解决了原文档的自相矛盾（ADR-002 §1.4/§1.7 说「INT2 不用」，§1.6 说
+STATIONARY 走 `int2_sleep_chg`）：
+
+| 触发 | 驱动写的寄存器位 | 落在哪个脚 |
+| --- | --- | --- |
+| `SENSOR_TRIG_MOTION` | `ctrl4_int1_pad_ctrl.int1_wu` | **INT1**（已接） |
+| `SENSOR_TRIG_STATIONARY` | `ctrl5_int2_pad_ctrl.int2_sleep_chg` | **INT2**（没接线） |
+
+两处 `route_set` 是不同寄存器（`lis2dw12_trigger.c:77-98`）—— 所以
+**ADR-002 §1.6 对、§1.4/§1.7 错**。本板只接 INT1，STATIONARY 的中断线
+物理上不存在，而 `sensor_trigger_set()` 仍然**返回 0**（驱动只写寄存器，
+从不检查引脚接没接）。
+
+**本实现的选择：软件计时判静止**（`CONFIG_EBIKE_STILL_AFTER_S`，默认 30 s）。
+`motion.c` **刻意不注册** STATIONARY —— 注册它只多写一个寄存器位，
+代价是让读代码的人以为硬件静止检测可用。上一版就栽在这里：`main.c` 的
+`moving` 只在 STILL 分支清，事件永不到达 → **车动过一次之后 BLE 广播永远
+关不掉**，§2.4 那条防跟踪保证静默失效，而日志里看不出任何异常。
+
+要换回硬件方案得先动硬件，两条路（需要时在 R2 拍板）：
+
+- 接第二根线到 INT2（§3.5 有 8 个余量脚，建议 P1.01/P1.02/P1.07，
+  别占 P0.02/P0.29 那两个模拟脚）；
+- 写 `CTRL_REG7.int2_on_int1` 把 INT2 事件并到 INT1（芯片支持，HAL 有
+  `lis2dw12_all_on_int1_set()`）—— **但 Zephyr 驱动从不调它，也没有 DTS
+  属性**，要自己在 `motion_init()` 里越过驱动直接写 I2C。
 
 ---
 
@@ -867,8 +951,8 @@ CONFIG_EBIKE_LOW_VOLT_3)` 保证下限不会反过来吞掉真实的深度欠压
 | 项 | 规格 | 数量 | 用途 |
 | --- | --- | --- | --- |
 | 主控板 | nRF52840 ProMicro / nice!nano 克隆板 | 1 | 见 §3.4 的全部注意事项 |
-| 加速度计 | **LIS2DW12**（模块或裸片） | 1 | 运动唤醒，SA0 接 VDD_IO |
-| I2C 上拉电阻 | 4.7 k 典型，**具体值待实测** | 2 | TWIM0 |
+| 加速度计 | **LIS2DW12**（模块或裸片） | 1 | 运动唤醒，SA0 接 VDD_IO，CS 拉高 |
+| ~~I2C 上拉电阻~~ | — | **0** | **不用买**：走 nRF52840 内部上拉（RPU 11~16 kΩ），代价是锁在 100 kHz + 只挂这一个器件（§3.7）。扩展 I2C 才需要 2.2~4.7 kΩ × 2 |
 | GNSS 模块 | **ATGM336H-5N** | 1 | 支持北斗 |
 | GNSS 电源门控开关管 | **型号未定** | 1 | 见 §3.5 |
 | 4G 模组 | **Air780EP**，刷 AT 固件 | 1 | 见 §8 |
@@ -1249,7 +1333,7 @@ LBS 降级是 R9 的验收项之一：拔掉 GNSS 天线仍要出 `src=lbs` 的�
 | --- | --- | --- |
 | **R0 环境** | NCS 工具链；`promicro_nrf52840/nrf52840/uf2` 点灯；~~J-Link 接通~~（✅ **2026-09-04 实测通了**，芯片体检结果见 §3.4）；**验 RTT 日志通路**（日志没有别的出口，见 [`FIRMWARE.md`](FIRMWARE.md) §2b）。**顺带：一根 UART 线接模组，验 `AT^WAKEUPHEX` 和 `CSCLK=3` 在 V1011 上到底能不能用**（§8.7） | blinky 跑起来，~~SWD 能连~~（已过）；**RTT 里看得到日志**；`AT^WAKEUPHEX` 返回 OK 而不是 ERROR |
 | **R1 板子体检** | **实测静态电流**（仍未做）；查 D1 是不是肖特基；测 POWER_PIN/R4；~~确认 J3 引脚顺序~~（第 9/第 11 焊盘已实测，其余仍只有 netlist 依据，§3.4） | 拿到真实的 µA 数字，不是标称值 |
-| **R2 传感器** | LIS2DW12 上 I2C；`SENSOR_TRIG_MOTION`（INT1，已确认可用）；~~读驱动源码定论 INT1/INT2~~（已定论，§11 #2）；**拍板 STATIONARY 要不要接第二根线** | 摇一下就有中断。静止判定当前走软件计时，不依赖 INT2 |
+| **R2 传感器** | LIS2DW12 上 I2C（**不装外部上拉，走内部 RPU**，§3.7）；`SENSOR_TRIG_MOTION`（INT1，已确认可用）；~~读驱动源码定论 INT1/INT2~~（已定论，§11 #2）；**拍板 STATIONARY 要不要接第二根线** | `i2c scan` 看到 0x19（看不到就是 CS 没拉高，或线太长/挂了第二个器件超出内部上拉能力）；摇一下就有中断；单次轻敲不触发；静置 30 s 出一次 still。静止判定走软件计时，不依赖 INT2 |
 | **R3 BLE** | GATT 服务起来（`ble_unlock.c`）；`requestMtu` 打通；安卓 App 按 MAC 直连 | 手机连上能收到 SELECT AID 的 `90 00`，且**锁屏状态下也能连**。**协议层已由 BabbleSim 提前验完**（8 条断言，见 [`FIRMWARE.md`](FIRMWARE.md) §5），R3 只剩「真手机 + 真射频」这一半 |
 | **R4 开锁协议** | ~~§5.2 三步协议；PSA HMAC；counter/nonce 持久化~~（**仿真已验**）；真机上复核 counter 掉电不回零 | 重放一次抓包必须被拒（回 `69 82`）—— 仿真里已过，真机再验一次 flash 持久化那一段 |
 | **R5 服务端 + HA** | ~~先定 schema~~（已定，见 [`MQTT-CONTRACT.md`](MQTT-CONTRACT.md)）；~~broker 加 8883 listener + acl_file~~（改内置 broker，不动 `/opt/mqtt`）；落库→坐标转换→retain；FastAPI + Bearer；**docker compose 封装**；HA 四件套 | 灌 20 条造的报文，`/track` 正确；`state` retain 生效；HA 地图上出现车，误差圈可见；重启 HA 立即有位置 |
