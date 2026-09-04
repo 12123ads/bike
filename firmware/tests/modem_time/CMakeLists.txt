@@ -6,8 +6,9 @@
 # 两种错法都产出一个「看起来完全合理」的时间戳，只有对着已知答案算才发现。
 #
 # 被测的是 firmware/nrf52840/src/modem.c 的**原件**，一行没为测试改过。
-# modem.c 需要 uart1 和 modem_pwrkey 两个 DT 节点，overlay 里用
-# uart-emul + gpio-emul 顶上（见 boards/native_sim.overlay）。
+# modem.c 需要 uart1、modem_dtr、modem_ri 三个 DT 节点（PWRKEY 已在
+# 硬件上接地、节点删除），overlay 里用 uart-emul + gpio-emul 顶上
+# （见 boards/native_sim.overlay）。
 
 cmake_minimum_required(VERSION 3.20.0)
 

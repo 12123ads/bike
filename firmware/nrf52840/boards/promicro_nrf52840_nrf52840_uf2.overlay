@@ -28,9 +28,16 @@
  *    i2c1 尤其阴险：`CONFIG_I2C_NRFX_TWIM=y` 让 twim1 真的实例化，
  *    `pm_device_driver_init()` 的 RESUME 会 `pinctrl_apply_state(DEFAULT)`，
  *    **开机就把那两个脚配成 I2C**（ELF 里 `__device_dts_ord_73` 实测存在）。
+ *    ⚠ spi2 关掉这件事现在是**必需**而不是预防：`modem_ri`/`modem_dtr` 用了
+ *    P1.01/P1.02，正是 spi2 的默认 SCK/MOSI。
  *
- * 用掉 13 个（下面逐个数），余 8 个：P0.02 P0.09 P0.29 P1.01 P1.02 P1.04
- * P1.06 P1.07。锁要 3 根线、INT2 那根第二中断线都装得下。
+ * 用掉 14 个（下面逐个数），余 7 个：P0.02 P0.09 P0.29 P1.00 P1.04 P1.06 P1.07。
+ * 锁要 3 根线、INT2 那根第二中断线都装得下。
+ *
+ * 2026-09-04 第二次改动（PWRKEY 已在硬件上接地）：
+ *   `modem_pwrkey` P1.00 → **节点删除**（驱动一个已接地的脚 = 短路，见下面
+ *   那段长注释）；新增 `modem_ri` P1.01（直连）、`modem_dtr` P1.02（开漏）。
+ *   净变化：用掉的脚 13 → 14，P1.00 回到余量池。
  */
 
 /* `power-mode` / `wakeup-duration` 用的是 LIS2DW12 的 dt-bindings 宏，
@@ -44,7 +51,7 @@
 	aliases {
 		/* ⚠ **只保留真正被 DT_ALIAS 取用的那一个。**
 		 * 其余五个（lock-drive / lock-sense / batt-gate / gnss-power /
-		 * modem-pwrkey）删掉了：所有 .c 文件一律用
+		 * modem-dtr）删掉了：所有 .c 文件一律用
 		 * `DT_NODELABEL(...)`，那些别名是纯装饰，留着只会让人以为
 		 * 换引脚时改别名就够了。
 		 *
@@ -118,21 +125,86 @@
 			label = "GNSS power";
 		};
 
-		/* Air780EP PWRKEY：开集拉低 >1 s 开机。
-		 * ⚠ 模组内部已有 5.6k 上拉，**不要外加上拉**（DESIGN.md §8.1）。
-		 * 模组上电不自启动，所以这根线是必须的 —— 它接不上就是整条 4G
-		 * 链路起不来。
+		/* Air780EP MAIN_DTR（PIN19）—— 主控 → 模组的唤醒 / 退出 PSM+。
 		 *
-		 * ⚠ **曾经填 P0.12，那个脚这块板没引出**（文件头 §1）。这条比
-		 * P0.26 那条严重得多：P0.26 没有任何代码取用，而这根线
-		 * `modem.c:26` 一直在用。
-		 * 现在用 **P1.00 = J2.10**，和 modem 的 uart1（P0.17/P0.20 = J2.6/J2.7）
-		 * 同在 J2；P1.00 是 normal-drive 脚，驱动开集三极管没问题。 */
-		modem_pwrkey: modem_pwrkey {
-			gpios = <&gpio1 0 GPIO_ACTIVE_LOW>;
-			label = "Air780EP PWRKEY";
+		 * ⚠⚠ **必须开漏，绝不能推挽输出高。**
+		 * DTR 配成 AGPIO 时在 LDO_AON 域，PIN100 接地后与主控同为 3.3 V，
+		 * 所以「电平不匹配」这个前提消失了 —— 官方那条「Wakeup IO 不要
+		 * 直连主控」的告警说的是 WAKEUP 类（LDO_1.8V 域，2 V 固定）。
+		 * 但 AGPIOWU 还有一条独立约束：**单脚驱动能力只有 30 µA**
+		 * （「由于切换电路的存在，作为 AGPIO 其每路的驱动能力也只有 30uA」）。
+		 * 推挽输出高就是拿 3.3 V 域去顶一个 30 µA 的脚。
+		 *
+		 * `GPIO_OPEN_DRAIN` 只 sink 不 source：拉低靠 nRF，高电平靠模组
+		 * 内部上拉。拉低电流由模组内部串的 5.6 kΩ 限住：
+		 * 3.3 V / 5.6 kΩ ≈ 0.59 mA，nRF 的 sink 能力远超它。
+		 * **外部不要再加任何上拉** —— 内部已经上拉到 LDO_AON。
+		 *
+		 * 极性：低有效（拉低=唤醒 / 退出 PSM+；释放成高=重进 PSM+）。
+		 * `GPIO_ACTIVE_LOW` + `GPIO_OPEN_DRAIN` ⇒ 逻辑 1 = 物理低 = 拉低。
+		 *
+		 * 为什么是必需的而不是可选的：PWRKEY 已在硬件上接地（上电即开机、
+		 * **无法关机**，UM1.0.7 §5.3.4.1.2），省电档只能走 PSM+，而退出 PSM+
+		 * 的三条路是「拉低 DTR / 拉高 VBUS / 发 AT+POWERMODE="CLOSE"」——
+		 * VBUS 本项目不接，命令那条要先用 UART 唤醒再发、多一个来回。
+		 * DTR 是一次 GPIO 翻转就解决的那条。 */
+		modem_dtr: modem_dtr {
+			gpios = <&gpio1 2 (GPIO_ACTIVE_LOW | GPIO_OPEN_DRAIN)>;
+			label = "Air780EP MAIN_DTR（开漏，只拉低）";
 		};
 	};
+
+	ebike_inputs {
+		compatible = "gpio-keys";
+
+		/* Air780EP MAIN_RI（PIN20）—— 模组 → 主控的唯一通知线。
+		 * 空闲高，有事出一个 **120 ms 低脉冲**。
+		 *
+		 * **可以直连，零外围器件。** 判据是电压域：
+		 *   RI 的 Pad Name 是 `AGPIO4`（Air780EP_GPIO_table.pdf p1），
+		 *   属 AGPIO 类而非 WAKEUP 类，电压域是 LDO_AON —— 而
+		 *   「VDD_EXT 和 LDO_AON 都是通过 pm.ioVol() 设置输出电压，且对
+		 *   二者同时进行修改，所有 IO 电平都同时修改且保持一致」。
+		 * PIN100 已接地 ⇒ LDO_AON = 3.3 V ⇒ VOH = 0.8 × 3.3 = 2.64 V，
+		 * 高于 nRF 的 VIH = 0.7 × 3.3 = 2.31 V，**余量 0.33 V**。
+		 * （之前一版说「必须加三极管」是把 RI 当成了 WAKEUP 类 ——
+		 * 那一类才是 LDO_1.8V 域的 2 V 固定电平，VOH 只有 1.6 V 打不动。）
+		 *
+		 * ⚠ 两条约束：
+		 * 1. **单脚 ≤5 mA 且全部 AGPIO 合计 ≤5 mA**（LDO_AON 总 10 mA）。
+		 *    nRF 输入是高阻，零问题 —— 但这根线上**不要挂分压电阻、LED、
+		 *    外部上拉**。所以这里用 `GPIO_PULL_UP` 的**内部**上拉，
+		 *    而不是外接电阻：空闲期模组已经驱动高，内部上拉只在模组侧
+		 *    高阻（未开机/PSM+ 切换瞬间）时兜住电平，不额外耗 AGPIO 预算。
+		 * 2. **上电或复位瞬间可能有 ~1 ms 异常高电平。** RI 是低有效脉冲，
+		 *    毛刺方向无害（不会被误判成脉冲）。真在意可外加 10 kΩ 下拉，
+		 *    但那会和内部上拉打架 —— 二选一，别都装。
+		 *
+		 * 走三极管方案会**反相**（模组低脉冲 → 主控看到高脉冲），直连没有
+		 * 这个问题，所以中断沿就是 ACTIVE_LOW，和手册的「120 ms 低脉冲」一致。
+		 *
+		 * ⚠ `AT+CFGRI=1` 之后**每条例行 URC 都会出脉冲**，必须配
+		 * `AT^WAKEUPHEX` 把它限定到魔术下行串，否则网络心跳会把主控
+		 * 反复叫醒、功耗预算崩（§8.7 / §11 #17，那条命令的可用性仍未核实）。 */
+		modem_ri: modem_ri {
+			gpios = <&gpio1 1 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+			label = "Air780EP MAIN_RI（直连）";
+		};
+	};
+
+	/* ⚠ **PWRKEY 没有节点，是故意的。**
+	 *
+	 * 硬件上 PWRKEY 已经**直接接地**（上电即开机）。手册对这种接法明写
+	 * 「在上电开机模式下，**将无法关机**」（UM1.0.7 §5.3.4.1.2 p55）。
+	 * 曾经有个 `modem_pwrkey` 节点（P1.00，ACTIVE_LOW），它必须删掉 ——
+	 * 那个节点的 init 是 `GPIO_OUTPUT_INACTIVE`，ACTIVE_LOW 下 inactive
+	 * = 物理**高**，接到已接地的 PWRKEY 上就是 nRF 的 GPIO 驱动 3.3 V
+	 * 直接对地：**硬短路**。
+	 *
+	 * 连带的两处后果都已在 modem.c 里处理：
+	 * - `power_on()` 不再触发开机，只轮询等模组自启后响应 AT；
+	 * - 重连阶梯 3 级改用 `AT+CFUN=1,1`（软重启），不再 PWRKEY 硬关机。
+	 */
 
 	/* 电池电压采样。ADC 只有 3 个真脚（DESIGN.md §3.5）：
 	 * P0.02(AIN0) / P0.29(AIN5) / P0.31(AIN7)。用 P0.31。

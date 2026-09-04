@@ -1,18 +1,22 @@
 /*
- * native_sim 上顶掉 modem.c 的两个硬件依赖。
+ * native_sim 上顶掉 modem.c 的硬件依赖。
  *
- * modem.c 要 `DT_NODELABEL(uart1)` 和 `DT_NODELABEL(modem_pwrkey)`。
- * 真板子上前者是 nRF52840 的 UARTE1、后者是一根 GPIO；这里换成
- * uart-emul 和 gpio-emul，两者都能在主机上跑。
+ * modem.c 要 `DT_NODELABEL(uart1)`、`DT_NODELABEL(modem_dtr)` 和
+ * `DT_NODELABEL(modem_ri)`（PWRKEY 已在硬件上接地，节点不存在了）。
+ * uart 换成 uart-emul；两根 GPIO 挂到 native_sim 自带的 gpio0（gpio-emul）。
  *
  * ⚠ 必须**改写** native_sim 自带的 uart1，不能新建一个同名 label 的节点 ——
  * native_sim.dts 里已经有 `uart1: uart_1`（zephyr,native-pty-uart，默认
  * disabled），再声明一个会得到
  * `devicetree error: Label 'uart1' appears on /uart-emul and on /uart_1`。
  *
- * ⚠ 波特率写 0（uart-emul 自己的测试也是这么写的）—— 仿真不模拟时序，
- * 9600 那个数字在这里没有意义。测试也不依赖时序：它直接把字节塞进
- * emul 的 RX FIFO。
+ * ⚠ 波特率写 0（uart-emul 自己的测试也是这么写的）—— 仿真不模拟时序。
+ *
+ * ⚠ modem_dtr 在真板 overlay 里是 `GPIO_ACTIVE_LOW | GPIO_OPEN_DRAIN`，
+ * 这里**两个标志都不能带**：gpio-emul 的 pin_configure 对
+ * `GPIO_OPEN_DRAIN` 直接返回 -ENOTSUP（gpio_emul.c「GPIO_OPEN_DRAIN」
+ * 那一行）。极性 ACTIVE_LOW 倒是留着也无妨，但测试只断言「脚存在、
+ * 可配置」，照最简写。
  */
 
 &uart1 {
@@ -27,11 +31,21 @@
 	ebike_outputs {
 		compatible = "gpio-leds";
 
-		/* PWRKEY。真板子上是 ACTIVE_LOW（开集拉低开机），
-		 * 这里极性无关紧要 —— 测试不碰 power_on()。 */
-		modem_pwrkey: modem_pwrkey {
-			gpios = <&gpio0 12 GPIO_ACTIVE_LOW>;
-			label = "Air780EP PWRKEY";
+		/* MAIN_DTR。真板上是 P1.02 开漏只拉低；脚号和驱动方式
+		 * 在这里都无关紧要 —— 测试不碰 DTR。 */
+		modem_dtr: modem_dtr {
+			gpios = <&gpio0 2 GPIO_ACTIVE_HIGH>;
+			label = "Air780EP MAIN_DTR";
+		};
+	};
+
+	ebike_inputs {
+		compatible = "gpio-keys";
+
+		/* MAIN_RI。真板上是 P1.01 直连低有效；同样只要求存在。 */
+		modem_ri: modem_ri {
+			gpios = <&gpio0 1 GPIO_ACTIVE_LOW>;
+			label = "Air780EP MAIN_RI";
 		};
 	};
 };

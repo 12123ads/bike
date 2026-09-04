@@ -1,14 +1,16 @@
 /*
- * native_sim 上顶掉 modem.c 的两个硬件依赖。
+ * native_sim 上顶掉 modem.c 的硬件依赖。
  *
  * 和 modem_time 那份的唯一差别是 **FIFO 尺寸**：这里要喂超过 LINE_MAX(640)
  * 的整行，256 字节的 FIFO 会在 emul 层先截断，测出来的就不是 read_line 的
  * 溢出处理了。
  *
- * ⚠ 必须**改写** native_sim 自带的 uart1，不能新建一个同名 label 的节点 ——
- * native_sim.dts 里已经有 `uart1: uart_1`（zephyr,native-pty-uart，默认
- * disabled），再声明一个会得到
- * `devicetree error: Label 'uart1' appears on /uart-emul and on /uart_1`。
+ * modem.c 要 uart1 + modem_dtr + modem_ri 三个节点（PWRKEY 已接地删除）。
+ * ⚠ gpio-emul 不支持 GPIO_OPEN_DRAIN（返回 -ENOTSUP），所以 DTR 在这里
+ * 不带那个标志 —— 见 modem_time 那份 overlay 的完整说明。
+ *
+ * ⚠ 必须**改写** native_sim 自带的 uart1，不能新建同名 label 节点
+ * （否则 `Label 'uart1' appears on ... and on ...`）。
  *
  * ⚠ 波特率写 0（uart-emul 自己的测试也是这么写的）—— 仿真不模拟时序。
  */
@@ -25,11 +27,18 @@
 	ebike_outputs {
 		compatible = "gpio-leds";
 
-		/* PWRKEY。真板子上是 ACTIVE_LOW（开集拉低开机），
-		 * 这里极性无关紧要 —— 测试不碰 power_on()。 */
-		modem_pwrkey: modem_pwrkey {
-			gpios = <&gpio0 12 GPIO_ACTIVE_LOW>;
-			label = "Air780EP PWRKEY";
+		modem_dtr: modem_dtr {
+			gpios = <&gpio0 2 GPIO_ACTIVE_HIGH>;
+			label = "Air780EP MAIN_DTR";
+		};
+	};
+
+	ebike_inputs {
+		compatible = "gpio-keys";
+
+		modem_ri: modem_ri {
+			gpios = <&gpio0 1 GPIO_ACTIVE_LOW>;
+			label = "Air780EP MAIN_RI";
 		};
 	};
 };

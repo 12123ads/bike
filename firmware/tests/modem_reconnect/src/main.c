@@ -211,7 +211,7 @@ static void respond(const char *cmd)
 	}
 
 	/* 其余一律 OK：ATE0 / AT+IPR / AT+CFGRI / AT^WAKEUPHEX / AT+SSLCFG /
-	 * AT+MCONFIG / AT+MQTTMODE / AT+MDISCONNECT / AT+CIPSHUT / AT+CPOWD。 */
+	 * AT+MCONFIG / AT+MQTTMODE / AT+MDISCONNECT / AT+CIPSHUT / AT+CFUN。 */
 	reply("OK");
 }
 
@@ -342,10 +342,14 @@ ZTEST(modem_reconnect, test_level2_redials_pdp_without_restart)
 		     "先附着后拆承载了，顺序反了");
 }
 
-/* --- 3 级：模组重启 ----------------------------------------------------------- */
+/* --- 3 级：模组软重启 --------------------------------------------------------- */
 
 /* 1 级和 2 级都失败才该重启模组。
- * `inject(3, ...)` 让 SSLMIPSTART 一直失败到 3 级之后才好。 */
+ * `inject(3, ...)` 让 SSLMIPSTART 一直失败到 3 级之后才好。
+ *
+ * ⚠ 3 级的命令是 `AT+CFUN=1,1`（软重启），**不是** AT+CPOWD：
+ * PWRKEY 已在硬件上接地，关掉的模组没人能开回来（手册明写「上电开机
+ * 模式下无法关机」），CPOWD 这条路整个不该出现。 */
 ZTEST(modem_reconnect, test_level3_restarts_modem)
 {
 	/* 1 级失败 1 次、2 级失败 1 次，第 3 级里的那次成功 → 注入 2 次失败。 */
@@ -358,22 +362,27 @@ ZTEST(modem_reconnect, test_level3_restarts_modem)
 		trace_dump();
 	}
 
-	/* 3 级的标志：软关机 + 重新开机训练 + 完整重跑。 */
-	zassert_equal(trace_count("AT+CPOWD"), 1, "没发软关机");
+	/* 3 级的标志：软重启 + 重新开机训练 + 完整重跑。
+	 * ⚠ 断言的是 AT+CFUN=1,1，用前缀 "AT+CFUN" 就够 —— 那个命令
+	 * 只在这一处出现。 */
+	zassert_equal(trace_count("AT+CFUN"), 1, "没发软重启 AT+CFUN=1,1");
+	zassert_equal(trace_count("AT+CPOWD"), 0,
+		      "PWRKEY 已接地 —— CPOWD 关掉的模组开不回来，"
+		      "这条路必须整个不存在");
 	zassert_true(trace_count_exact("AT") >= 1,
 		     "没重新做开机波特率训练 —— 模组没真的重启");
 	zassert_true(trace_count("AT^WAKEUPHEX") >= 1,
 		     "重启后没重配 WAKEUPHEX —— 那个配置随重启丢了");
 
-	/* 顺序：关机在**重新开机**之前。
+	/* 顺序：软重启在**重新开机**之前。
 	 *
 	 * ⚠ 这里不能拿 `AT+CGREG?` 当基准。第一版写的是
 	 * `trace_first("AT+CPOWD") < trace_first("AT+CGREG?")`，测试红了 ——
 	 * 而**代码是对的、断言是错的**：2 级已经跑过一次 stage_attach，
-	 * 所以 trace 里第一条 CGREG 来自 2 级，本来就在 3 级的 CPOWD 前面。
+	 * 所以 trace 里第一条 CGREG 来自 2 级，本来就在 3 级动作的前面。
 	 * 正确的基准是重启后那次开机训练（裸 `AT`），它只可能出现在 3 级。 */
-	zassert_true(trace_first("AT+CPOWD") < trace_first_exact("AT"),
-		     "关机不在重新开机训练之前，顺序反了");
+	zassert_true(trace_first("AT+CFUN") < trace_first_exact("AT"),
+		     "软重启不在重新开机训练之前，顺序反了");
 }
 
 /* --- 全败：不能死循环 --------------------------------------------------------- */

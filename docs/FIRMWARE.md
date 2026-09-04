@@ -32,6 +32,12 @@
 > 根本没引出的脚**（`batt_gate` P0.04、`modem_pwrkey` P0.12、`modem_ri` P0.26），
 > 前两个有代码在用。已全部改到引出脚上，白名单钉成断言（§6 / DESIGN.md §3.5）。
 >
+> **同日第三件事（PWRKEY 已接地）**：硬件上 PWRKEY 直接接地（上电即开机、
+> 无法关机）。`modem_pwrkey` 节点删除（驱动已接地的脚 = 短路），RI P1.01
+> 直连 + DTR P1.02 开漏进 overlay 与 modem.c，重连 3 级改 `AT+CFUN=1,1`
+> 软重启，`modem_disconnect()` 不再发 AT+CPOWD（关掉的模组开不回来）。
+> 详见 DESIGN.md §3.5 / §8.3、FIRMWARE.md §3 第 1/2 条。
+>
 > 第一次构建暴露了 6 个真问题，全部已修，逐条记在 §3c ——
 > **其中两个是「编得过但功能静默失效」，比编译错误危险得多。**
 
@@ -222,8 +228,8 @@ UF2 头部的 family/起始地址/块数、FLASH/RAM 用量与警告数。
 
 | # | 缺什么 | 后果 | 在哪 |
 | --- | --- | --- | --- |
-| ~~1~~ | ~~**断线重连阶梯**~~ | ✅ **2026-09-03 已修**：`modem_reconnect()` 三级 —— **1 级** 只重建 MQTT 会话（`MDISCONNECT` → `stage_session`，~5~10 s）；**2 级** 加 `CIPSHUT` + 重新附着（~15~70 s）；**3 级** `CPOWD` + PWRKEY 硬关机 + 完整重跑（~30~90 s）。`modem_connect()` 拆成 `stage_boot`/`stage_attach`/`stage_session` 三段供阶梯复用。**不做无限重试** —— 三级全败就返回错误让上层放弃本轮（§4.4：死循环会抽干车电池）。`connected` 从裸 `bool` 改成 `atomic_t`。`uplink.c` 的 `publish_retry()` 按 `modem_is_connected()` 而非 `rc` 决定要不要重连（-E2BIG/-ENOMEM 重连一百次也没用）。5 条 ztest（假模组 + AT 命令 trace）钉住「只重跑坏掉的那一层」，3 个变异体全被抓 | `firmware/tests/modem_reconnect` |
-| 2 | **睡眠仲裁器 + RI 监听** | 省电档下第一条 AT 命令可能丢。**依赖 MAIN_DTR/MAIN_RI 脚号，而那个至今无来源**（§8.7 硬门禁 / §11 #18）。2026-09-04 **删掉了 overlay 里的 `modem_ri` 节点**：它没有任何 C 代码取用，而且原来填的 P0.26 是这块板没引出的脚（DESIGN.md §3.5）—— `AT+CFGRI=1` 发了但主控侧没人监听那根线，「模组主动唤醒主控」目前是半条链。定脚号时从 §3.5 的 8 个余量里取 | 同上第 2 条 / overlay |
+| ~~1~~ | ~~**断线重连阶梯**~~ | ✅ **2026-09-03 已修，2026-09-04 随 PWRKEY 接地改 3 级**：`modem_reconnect()` 三级 —— **1 级** 只重建 MQTT 会话（`MDISCONNECT` → `stage_session`，~5~10 s）；**2 级** 加 `CIPSHUT` + 重新附着（~15~70 s）；**3 级** **`AT+CFUN=1,1` 软重启** + 完整重跑（~30~90 s；旧的 `CPOWD`+PWRKEY 硬关机路已删 —— PWRKEY 接地后关掉的模组开不回来）。`modem_connect()` 拆成 `stage_boot`/`stage_attach`/`stage_session` 三段供阶梯复用。**不做无限重试** —— 三级全败就返回错误让上层放弃本轮（§4.4：死循环会抽干车电池）。`connected` 从裸 `bool` 改成 `atomic_t`。`uplink.c` 的 `publish_retry()` 按 `modem_is_connected()` 而非 `rc` 决定要不要重连（-E2BIG/-ENOMEM 重连一百次也没用）。5 条 ztest（假模组 + AT 命令 trace）钉住「只重跑坏掉的那一层」+「3 级必须软重启且 CPOWD 不存在」 | `firmware/tests/modem_reconnect` |
+| ~~2~~ | ~~**睡眠仲裁器 + RI 监听**~~ | ✅ **2026-09-04 接线定稿**：RI **P1.01** 直连（`modem_ri_pending()` 边沿中断 + `modem_poll()` 读取）、DTR **P1.02** 开漏（`modem_wake()` 拉低 100 ms / `modem_hold_awake()` 保持 —— PSM+ 退出的那条路）。§11 #18 关闭。**仍缺的**：仲裁器本体（「每次写 AT 前判断模组醒没醒、没醒先唤醒」—— `modem.c` 末尾「还缺什么」#1）与 PSM+ 档切换（#5） | `modem.c` / overlay |
 | ~~3~~ | ~~**NITZ → Unix 秒换算**~~ | ✅ **2026-09-03 已修**：`parse_modem_time()` 走 `timeutil_timegm64()`。两条要命的规则来自合宙 AT 手册 V1.6.8：**±zz 单位是 1/4 小时**（东八区 `+32` 不是 `+08`，当小时读差 24 h）、**hh:mm:ss 是本地时间必须减偏移**（不减差 8 h，⚠ 与 nRF91 相反，别照抄 NCS `date_time_modem.c`）。顺带修掉两个静默 bug：URC 前缀是 `+NITZ:` 不是 `+CTZV:`（这家族没有 CTZV，旧代码永远匹配不上）、`AT+CTZR=1` 是只读命令发过去只会回 ERROR。11 条 ztest 钉住，4 个变异体全部被抓 | `firmware/tests/modem_time` |
 | 4 | **证书灌入**（`AT+FSCREATE`/`AT+FSWRITE`） | **这是 R6 的阻塞项**：`AT+SSLCFG="cacert",0,"ca.crt"` 引用的文件必须先在模组 FS 里，而现在没有任何代码灌它。**注意这条命令现在失败即中止连接**（以前是静默忽略），所以证书没灌就连不上，症状很明确 | 同上第 4 条 / §8.8 / §11 #24 |
 | 5 | **PSM+ / PRO 双档** | 只有「连上」和「关机」两态。`dn/cmd` 的 `tier` 指令会明确 ack 失败而不是假装成功 | 同上第 5 条 / §11 #20 |
@@ -309,7 +315,7 @@ done
 | `modem_time` | NITZ 串 → Unix 秒（±zz 是 1/4 小时、hh:mm:ss 是本地时间），以及「宁可上报 0 也不上报像时间的错数」的拒绝路径 | 11 passed |
 | `modem_downlink` | **下行 URC 解析 + AT 应答匹配 + 下行不在命令流里就地投递**（审计 M1/M2/R1） | 12 passed |
 | `motion_still` | 运动/静止状态机与软件静止计时 | 4 passed |
-| `modem_reconnect` | 三级重连阶梯「只重跑坏掉的那一层」 | 5 passed |
+| `modem_reconnect` | 三级重连阶梯「只重跑坏掉的那一层」+ **3 级必须是 `AT+CFUN=1,1` 软重启、CPOWD 全程不出现**（PWRKEY 接地） | 5 passed |
 | `gnss_nmea` | NMEA 校验和**真的挡住坏行**、ddmm.mmmm 换算、南纬西经取负、quality=0 不当定位（审计 R4） | 11 passed |
 | `uplink_events` | 事件队列**发送期间不持 `ev_lock`**、发失败留到下一轮、`dn/secret` 接线（审计 M3） | 7 passed |
 | `unlock_slots` | 密钥槽位复用**不继承旧 counter**、同 uid 轮换**保留** counter（审计 M7） | 8 passed |
@@ -429,7 +435,7 @@ firmware/tests/ble_unlock_bsim/run.sh /tmp/btest
 | --- | --- | --- |
 | 锁用电磁锁还是电机锁（§7 第 1 条） | `lock.c` | 一根线、高有效、500 ms 脉冲。电机锁要改成半桥两根线 |
 | LIS2DW12 STATIONARY 走 INT2 而本板只接 INT1（§3d） | `motion.c`、overlay | **已定论**：MOTION 在 INT1（可用），STATIONARY 在 INT2（线没接，事件不会来）。当前不依赖它，静止判定用 `last_still_ms` 软件计时。要真用得接第二根线或越过驱动写 `CTRL_REG7.int2_on_int1` |
-| ~~GPIO 分配~~（§3.5） | overlay | ✅ **2026-09-04 已核实并已改**：用了 **13 个**，余 **8 个**（P0.02 P0.09 P0.29 P1.01 P1.02 P1.04 P1.06 P1.07）。同时修掉三个**这块板没引出**的脚：`batt_gate` P0.04 → **P0.10**、`modem_pwrkey` P0.12 → **P1.00**、`modem_ri` P0.26 → 节点删除。SoC 有 48 个 GPIO 而板子只引出 21 个，填错 `west build` 照过 —— 白名单和四条护栏现在钉在 `test_firmware_contract.py`。顺带关掉上游板级 DTS 打开的 `i2c1`（抢 J2.12/J2.13）和 `spi2`（抢整个 J4） |
+| ~~GPIO 分配~~（§3.5） | overlay | ✅ **2026-09-04 已核实并已改，同日二次改动（PWRKEY 接地）**：用了 **14 个**，余 **7 个**（P0.02 P0.09 P0.29 P1.00 P1.04 P1.06 P1.07）。第一次修掉三个没引出的脚（`batt_gate` P0.04 → P0.10、`modem_pwrkey` P0.12 → P1.00、`modem_ri` P0.26 删除）；第二次随 PWRKEY 硬件接地删掉 `modem_pwrkey` 节点（驱动已接地的脚 = 短路），新增 RI **P1.01**（直连）与 DTR **P1.02**（开漏）。SoC 有 48 个 GPIO 而板子只引出 21 个，填错 `west build` 照过 —— 白名单和护栏（含 DTR 必须开漏、RI 直连内部上拉、禁 PWRKEY 节点、禁 CPOWD）钉在 `test_firmware_contract.py`。`i2c1`（抢 J2.12/J2.13）和 `spi2`（抢整个 J4）保持关闭 |
 | ADC 脚 | overlay | P0.31(AIN7)。只有 3 个真 ADC 脚，ZMK 的 A6~A10 别名不是 SAADC 通道 |
 | ~~I2C 上拉~~（§3.7） | overlay | ✅ **2026-09-04 已定并已改**：**不装外部电阻**，`i2c0_default`/`i2c0_sleep` 都加 `bias-pull-up` 用内部 RPU（11~16 kΩ）。改之前**两种上拉都没有** —— 而那不是设计选择，是 I2C 完全不通：nrfx 的 `TWIM_PIN_INIT` 会配 PULLUP，但 Zephyr twim 驱动传 `skip_gpio_cfg=true`，引脚配置全归 pinctrl。实测 pincfg `0x0C000018`(pull=NONE) → `0x0C000618`(pull=UP)。代价：锁在 100 kHz、总线电容 ≤ 74 pF（只挂这一个器件、线要短）。两条约束各有一条断言钉住 |
 | ~~电池采样分压比~~（§3.6 / §11 #27） | `battery.c`、overlay | ✅ **已定并已改**：**21:1**（`output-ohms=470000` / `full-ohms=4.7M+4.7M+470k`）。基准是引脚上限 **VDD 3.3 V**（不是 ADC 满量程 3.6 V —— 那是绝对最大值，按它算零余量）。`battery.c` 两条 `BUILD_ASSERT` 把比例和源阻抗（≤800 kΩ）钉成编译错误，都实测触发过。换算走 `voltage_divider_scale_dt()`。**电池不是 48 V 的话改 `PACK_MAX_MV`** |

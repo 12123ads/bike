@@ -1126,3 +1126,73 @@ def test_mconnect_carries_keepalive(modem_c):
     """keepalive 的正确位置：AT+MCONNECT=<clean_session>,<keepalive>。"""
     assert 'AT+MCONNECT=1,60' in modem_c, \
         "keepalive 不在 AT+MCONNECT 里 —— 检查它是不是又被塞进 MCONFIG"
+
+
+def test_modem_dtr_is_open_drain():
+    """MAIN_DTR 必须开漏、绝不能推挽输出高。
+
+    DTR 是 AGPIOWU 类（Pad `AGPIOWU2`），PIN100 接地后 LDO_AON 与主控同为
+    3.3 V，电平不匹配的前提消失了 —— 但单脚驱动能力只有 30 µA
+    （合宙原文「作为 AGPIO 其每路的驱动能力也只有 30uA」）。推挽输出高
+    = 拿 3.3 V 域去顶一个 30 µA 的脚。`GPIO_OPEN_DRAIN` 只 sink 不 source，
+    高电平交给模组内部上拉（内部串 5.6 kΩ，外部不要再加）。
+    """
+    text = overlay_text()
+    m = re.search(r"modem_dtr:\s*modem_dtr\s*\{(.*?)\n\t\};", text, re.S)
+    assert m, "overlay 里没有 modem_dtr 节点"
+    body = m.group(1)
+    assert "GPIO_OPEN_DRAIN" in body, (
+        "modem_dtr 不是开漏 —— AGPIOWU 单脚驱动只有 30 µA，"
+        "推挽输出高会硬顶这根线")
+    assert "GPIO_ACTIVE_LOW" in body, (
+        "modem_dtr 极性不是低有效 —— 拉低才是唤醒/退出 PSM+")
+
+
+
+def test_modem_ri_is_direct_with_internal_pullup():
+    """MAIN_RI 直连的三个前提同时钉住。
+
+    RI（Pad `AGPIO4`）在 LDO_AON 域，PIN100 接地后 VOH = 2.64 V >
+    nRF 的 VIH 2.31 V —— 直连可行。但前提是：
+    1. **低有效**：模组的「120 ms 低脉冲」不能被反转极性（三极管方案会）；
+    2. **内部上拉**：单脚 ≤5 mA 且全部 AGPIO 合计 ≤5 mA 是 LDO_AON 的预算，
+       外部分压电阻 / LED / 外部上拉都会吃掉它，所以用 `GPIO_PULL_UP`
+       兜住模组侧高阻瞬间，不占 AGPIO 预算。
+    """
+    text = overlay_text()
+    m = re.search(r"modem_ri:\s*modem_ri\s*\{(.*?)\n\t\};", text, re.S)
+    assert m, "overlay 里没有 modem_ri 节点"
+    body = m.group(1)
+    assert "GPIO_ACTIVE_LOW" in body, "modem_ri 不是低有效 —— 120 ms 低脉冲会被极性反转"
+    assert "GPIO_PULL_UP" in body, (
+        "modem_ri 没配内部上拉 —— 模组未开机/PSM+ 切换瞬间线悬空，"
+        "而外部上拉会吃 LDO_AON 的 5 mA 预算")
+
+
+
+def test_modem_pwrkey_node_is_gone():
+    """PWRKEY 已在硬件上接地 —— overlay 里不允许再出现它的节点。
+
+    那个节点曾经的 init 是 `GPIO_OUTPUT_INACTIVE`，ACTIVE_LOW 下 inactive
+    = 物理高，接到已接地的 PWRKEY 上就是 3.3 V 对地硬短路。
+    """
+    text = overlay_text()
+    assert "modem_pwrkey:" not in text, (
+        "modem_pwrkey 节点又回来了 —— PWRKEY 硬件接地，驱动它就是短路")
+
+
+
+def test_modem_never_sends_cpowd(modem_c):
+    """PWRKEY 接地后 AT+CPOWD 是禁手。
+
+    手册明写「在上电开机模式下，将无法关机」（UM1.0.7 §5.3.4.1.2）：
+    CPOWD 关掉的模组没人能开回来。`modem_disconnect()` 每轮上报结束都
+    调一次 —— 发这条命令的第一次「成功」就是设备的最后一次上报。
+    断言只认**代码行**（制表符开头），注释里的手册引用不算。
+    """
+    live = [ln for ln in modem_c.splitlines()
+            if ln.lstrip().startswith(("at_cmd", "(void)at_cmd"))
+            and "CPOWD" in ln]
+    assert not live, (
+        f"modem.c 又在发 AT+CPOWD：{live} —— PWRKEY 已接地，"
+        f"关掉的模组开不回来（软重启用 AT+CFUN=1,1）")

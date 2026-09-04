@@ -22,8 +22,16 @@
 LOG_MODULE_REGISTER(modem, CONFIG_EBIKE_LOG_LEVEL);
 
 static const struct device *const uart = DEVICE_DT_GET(DT_NODELABEL(uart1));
-static const struct gpio_dt_spec pwrkey =
-	GPIO_DT_SPEC_GET(DT_NODELABEL(modem_pwrkey), gpios);
+/* MAIN_DTR（PIN19）：主控 → 模组，开漏只拉低。唤醒 / 退出 PSM+。
+ * MAIN_RI（PIN20）：模组 → 主控，120 ms 低脉冲。直连，见 overlay 的推导。
+ *
+ * ⚠ **没有 PWRKEY**。它在硬件上已经直接接地（上电即开机），驱动一个已接地
+ * 的脚就是短路。代价是手册那条「在上电开机模式下，将无法关机」——
+ * 所以省电与恢复手段全在 AT 侧：`AT+CFUN=1,1` 软重启、`AT+POWERMODE` 低功耗档。 */
+static const struct gpio_dt_spec dtr =
+	GPIO_DT_SPEC_GET(DT_NODELABEL(modem_dtr), gpios);
+static const struct gpio_dt_spec ri =
+	GPIO_DT_SPEC_GET(DT_NODELABEL(modem_ri), gpios);
 
 /* 9600 baud ≈ 1 字节/ms。一行 AT 应答通常 < 64 字节，
  * 但 MQTT 下行的 URC 会带整个 payload，所以行缓冲要够大。
@@ -563,47 +571,149 @@ static int at_query(const char *cmd, char *resp, size_t resp_len)
 	return at_cmd_expect(cmd, "OK", AT_TIMEOUT_MS, resp, resp_len);
 }
 
-/* --- 开机 / 关机 ------------------------------------------------------------- */
+/* --- 开机 / 唤醒 -------------------------------------------------------------- */
 
-static int power_on(void)
+/* 等模组自启并响应 AT。
+ *
+ * ⚠ **PWRKEY 在硬件上已经直接接地**，所以这里不再触发开机 —— 模组随 VBAT
+ * 上电自启（合宙称之为「变相实现上电开机」）。代价是手册明写的那一条：
+ * 「在上电开机模式下，**将无法关机**」（UM1.0.7 §5.3.4.1.2 p55）。
+ * 主控没有开关机手段，只有 AT 侧的软重启与低功耗档。
+ *
+ * 保留的那一半仍然必需：模组自启到 AT 口可用要几秒，而
+ * `AT+IPR` 默认自适应，文档明说「发一个 AT 往往不够，要连发几个」（§8.3）。
+ * 所以这里连发最多 30 次、每次等 500 ms。
+ *
+ * 这个函数现在也是重连阶梯 3 级（软重启）之后的等待点。 */
+static int wait_modem_ready(void)
 {
-	/* PWRKEY 开集拉低 >1 s。给 1.5 s 余量。
-	 * ⚠ 模组内部已有 5.6k 上拉，不要外加（§8.1）。 */
-	int rc = gpio_pin_set_dt(&pwrkey, 1);   /* ACTIVE_LOW，1 = 拉低 */
-	if (rc != 0) {
-		return rc;
-	}
-	k_sleep(K_MSEC(1500));
-	rc = gpio_pin_set_dt(&pwrkey, 0);
-	if (rc != 0) {
-		return rc;
-	}
-
-	/* 模组启动要几秒。期间连发 AT 训练波特率 ——
-	 * 文档明说「发一个 AT 往往不够，要连发几个」（§8.3）。 */
 	for (int i = 0; i < 30; i++) {
-		k_sleep(K_MSEC(500));
 		if (at_cmd_expect("AT", "OK", 500, NULL, 0) == 0) {
 			LOG_INF("模组已响应（第 %d 次尝试）", i + 1);
 			return 0;
 		}
+		k_sleep(K_MSEC(500));
 	}
-	LOG_ERR("模组开机后 15 s 内无响应");
+	LOG_ERR("15 s 内模组无响应 —— 检查 VBAT 与 PWRKEY 是否真的接地");
 	return -ETIMEDOUT;
 }
 
-/* 硬关机：PWRKEY 拉低。用在两处 ——
- *   modem_disconnect() 的 AT+CPOWD=1 失败时；
- *   modem_reconnect() 的 3 级（模组卡死到 AT 都不应答，软关机没意义）。
+/* 软重启。**PWRKEY 接地之后这是唯一的「重启模组」手段**。
  *
- * 手册对 PWRKEY 关机脉宽没给单独的数（只写了开机 >1 s），
- * 这里沿用开机的 1.5 s。返回值刻意不看：走到这里已经是兜底路径，
- * 连 GPIO 都失败的话也没有下一招。 */
-static void power_off_hard(void)
+ * `AT+CFUN=1,1` 的第二参数 rst=1 = 「被用来主动重启模块，重启后进入全功能
+ * 模式」（AT 手册 V1.6.8 §4.1）。手册在两处故障处理里都把它和 `AT+RESET`
+ * 并列成「连接建立不起来时」的手段（§13 / §17）。
+ *
+ * 为什么不用 `AT+CPOWD`：那是关机，而 PWRKEY 接地下关机之后没人能把它
+ * 开回来 —— 要么立刻自启（关机档不存在），要么彻底关住（系统死）。
+ * 两种行为手册都没明文，标 `[未核实]`，所以这条路整个不走。
+ *
+ * 返回值刻意不看：模组卡到 AT 都不应答时它当然会失败，
+ * 而那正是要重启的情形。后面靠 `wait_modem_ready()` 判有没有真的活过来。 */
+static void reset_soft(void)
 {
-	(void)gpio_pin_set_dt(&pwrkey, 1);   /* ACTIVE_LOW，1 = 拉低 */
-	k_sleep(K_MSEC(1500));
-	(void)gpio_pin_set_dt(&pwrkey, 0);
+	(void)at_cmd("AT+CFUN=1,1");
+}
+
+/* --- DTR：唤醒 / 退出 PSM+ ---------------------------------------------------
+ *
+ * DTR 是**开漏**（overlay 里 `GPIO_ACTIVE_LOW | GPIO_OPEN_DRAIN`）：
+ * 只主动拉低，高电平交给模组内部上拉。绝不能推挽输出高 ——
+ * AGPIOWU 的单脚驱动能力只有 30 µA。
+ *
+ * 语义（AT 手册 V1.6.8 §4.14/§4.15 + 低功耗文档 §7.2）：
+ *   `AT+CSCLK=1` 档：拉低 ~50 ms 把模组从休眠拽起来
+ *   PSM+ 档：**拉低 = 退出 PSM+；释放成高 = 重新进入 PSM+**
+ *
+ * 注意「唤醒」≠「退出 PSM+」：手册明说「只唤醒是无法联网和连接服务器的，
+ * 只有退出 PSM+ 模式才能联网」。UART 发字节只能唤醒，DTR 拉低才能退出。 */
+
+/* 拉低多久。手册对 CSCLK=1 给的是 ~50 ms；PSM+ 只说「拉低即退出」没给时长。
+ * 取 100 ms 覆盖两者，代价可忽略。 */
+#define DTR_PULSE_MS 100
+
+int modem_wake(void)
+{
+	if (!gpio_is_ready_dt(&dtr)) {
+		return -ENODEV;
+	}
+	/* ACTIVE_LOW：逻辑 1 = 物理低 = 拉低 */
+	int rc = gpio_pin_set_dt(&dtr, 1);
+
+	if (rc != 0) {
+		return rc;
+	}
+	k_sleep(K_MSEC(DTR_PULSE_MS));
+	/* 释放成高（开漏下就是放手，让模组内部上拉把线拉起来）。
+	 * PSM+ 档下这一步会让模组**重新进入** PSM+ —— 所以调用方要在
+	 * 释放之前把该做的 AT 交互做完，或者干脆保持拉低。 */
+	return gpio_pin_set_dt(&dtr, 0);
+}
+
+int modem_hold_awake(bool hold)
+{
+	if (!gpio_is_ready_dt(&dtr)) {
+		return -ENODEV;
+	}
+	return gpio_pin_set_dt(&dtr, hold ? 1 : 0);
+}
+
+/* --- RI：模组主动通知「有下行」 -----------------------------------------------
+ *
+ * RI 是整个架构里**模组唯一能主动捅主控一下**的手段。没有它，下行只能靠
+ * 轮询（每个上报周期取一次服务端队列），最坏时延 = 一个上报周期。
+ *
+ * 直连（overlay 里有电压域推导）：AGPIO4 在 LDO_AON 域，PIN100 接地后
+ * VOH = 0.8 × 3.3 = 2.64 V > nRF 的 VIH 2.31 V。走三极管方案会反相，
+ * 直连不会 —— 所以中断沿就是 ACTIVE_LOW，和手册的「120 ms 低脉冲」一致。
+ *
+ * ⚠ **这里刻意用边沿中断而不是 level sense**，与 `motion_int` 相反：
+ * RI 不是 System OFF 的唤醒源。模组在 System OFF 期间要么关着要么在 PSM+，
+ * 而 PSM+ 下的 RI 脉冲只是个周期定时器（服务端根本找不到离线的模组，
+ * §8.4），那件事主控自己的 RTC 做更省。所以 RI 只在**主控醒着**的时候有用，
+ * 边沿中断（GPIOTE IN 事件）就够，不需要占 SENSE。
+ *
+ * ⚠ 回调里**只置标志**，一个 AT 命令都不发：这是 GPIO 中断上下文，
+ * 而 `at_cmd()` 会拿 `at_lock` 并阻塞等应答。真正的读取在 `modem_poll()`
+ * 里做 —— 那条路本来就在处理 URC，RI 只是让它别等到下一个周期。
+ */
+
+static struct gpio_callback ri_cb_data;
+static atomic_t ri_pending;
+
+static void ri_isr(const struct device *port, struct gpio_callback *cb,
+		   gpio_port_pins_t pins)
+{
+	ARG_UNUSED(port);
+	ARG_UNUSED(cb);
+	ARG_UNUSED(pins);
+
+	atomic_set(&ri_pending, 1);
+}
+
+static int ri_listen_init(void)
+{
+	if (!gpio_is_ready_dt(&ri)) {
+		return -ENODEV;
+	}
+	int rc = gpio_pin_configure_dt(&ri, GPIO_INPUT);
+
+	if (rc != 0) {
+		return rc;
+	}
+	/* 低脉冲 → 下降沿。`GPIO_INT_EDGE_TO_ACTIVE` 配合 ACTIVE_LOW
+	 * 就是「变成低电平的那一刻」，不用自己算极性。 */
+	rc = gpio_pin_interrupt_configure_dt(&ri, GPIO_INT_EDGE_TO_ACTIVE);
+	if (rc != 0) {
+		return rc;
+	}
+	gpio_init_callback(&ri_cb_data, ri_isr, BIT(ri.pin));
+	return gpio_add_callback_dt(&ri, &ri_cb_data);
+}
+
+bool modem_ri_pending(void)
+{
+	return atomic_set(&ri_pending, 0) != 0;
 }
 
 /* --- 公开接口 --------------------------------------------------------------- */
@@ -614,9 +724,14 @@ int modem_init(modem_dn_cb cb)
 		LOG_ERR("modem UART 未就绪");
 		return -ENODEV;
 	}
-	if (!gpio_is_ready_dt(&pwrkey)) {
-		LOG_ERR("PWRKEY GPIO 未就绪");
+	if (!gpio_is_ready_dt(&dtr)) {
+		LOG_ERR("DTR GPIO 未就绪");
 		return -ENODEV;
+	}
+	if (!gpio_is_ready_dt(&ri)) {
+		/* RI 挂了不 fatal：它只是「下行来了」的提前通知，
+		 * 轮询路径（每个上报周期取一次下行队列）仍然工作。 */
+		LOG_WRN("RI GPIO 未就绪 —— 下行只能靠轮询，时延变成一个上报周期");
 	}
 
 	dn_cb = cb;
@@ -627,15 +742,25 @@ int modem_init(modem_dn_cb cb)
 	k_sem_init(&rx_sem, 0, 1);
 	k_mutex_init(&at_lock);
 
-	int rc = gpio_pin_configure_dt(&pwrkey, GPIO_OUTPUT_INACTIVE);
+	/* DTR 开漏，初值「释放」= 逻辑 0 = 高阻，让模组内部上拉把线拉高。
+	 * ⚠ 不能用 GPIO_OUTPUT_ACTIVE：那会一开机就把模组钉在「已唤醒」，
+	 * 而 PSM+ 要靠 DTR 为高才进得去。 */
+	int rc = gpio_pin_configure_dt(&dtr, GPIO_OUTPUT_INACTIVE);
 	if (rc != 0) {
 		return rc;
+	}
+
+	rc = ri_listen_init();
+	if (rc != 0) {
+		LOG_WRN("RI 监听挂载失败 rc=%d —— 下行只能靠轮询", rc);
 	}
 
 	uart_irq_callback_user_data_set(uart, uart_isr, NULL);
 	uart_irq_rx_enable(uart);
 
-	LOG_INF("modem 就绪（未开机）");
+	/* 「未开机」这个说法在 PWRKEY 接地之后不再准确：模组随 VBAT 自启，
+	 * 到这里它可能已经在跑了。真正的判据是 stage_boot 里的 AT 轮询。 */
+	LOG_INF("modem 就绪（模组随 VBAT 自启，等 AT 应答）");
 	return 0;
 }
 
@@ -647,14 +772,14 @@ int modem_init(modem_dn_cb cb)
  *   stage_attach   等 CGREG + 取时间          —— PDP/承载出问题才需要重跑
  *   stage_session  TLS + MQTT + 订阅          —— 单纯 MQTT 掉线只需要这一段
  *
- * 9600 baud 下这个区别是实打实的时间：stage_boot 里的开机等待最坏 15 s、
+ * 9600 baud 下这个区别是实打实的时间：stage_boot 里等模组就绪最坏 15 s、
  * stage_attach 里的附着轮询最坏 60 s，而 stage_session 大约 5~10 s。
  * 每次掉线都从 stage_boot 重来，等于把一次 5 秒的恢复做成 80 秒。
  */
 
 static int stage_boot(void)
 {
-	int rc = power_on();
+	int rc = wait_modem_ready();
 	if (rc != 0) {
 		return rc;
 	}
@@ -893,19 +1018,20 @@ int modem_reconnect(void)
 	LOG_WRN("2 级重连失败，升级到模组重启");
 	k_sleep(K_MSEC(RECONNECT_BACKOFF_MS));
 
-	/* --- 3 级：整个模组断电重启 --------------------------------------- */
+	/* --- 3 级：整个模组软重启 ----------------------------------------- */
 	atomic_set(&connected, 0);
-	/* 软关机可能因为模组已经卡死而不应答，所以不看返回值，
-	 * 后面 power_off_hard() 无条件走一遍 PWRKEY。 */
-	(void)at_cmd("AT+CPOWD=1");
-	power_off_hard();
-	/* 关机后要等内部电源真的塌下去，否则下一次 PWRKEY 会被当成
-	 * 「已经开机」而不触发开机。手册没给这个时间，取 2 s 是保守值。 */
-	k_sleep(K_SECONDS(2));
+	/* AT+CFUN=1,1（软重启，见 reset_soft 的注释）。
+	 * 旧实现是 AT+CPOWD + PWRKEY 硬关开机 —— PWRKEY 接地后这条
+	 * 路死了：CPOWD 关掉的模组没人能开回来（要么立刻自启、要么彻底
+	 * 关住，手册没明文，`[未核实]`），而 power_off_hard() 这个函数
+	 * 已经随 PWRKEY 节点一起删除了。 */
+	reset_soft();
+	/* 软重启到 AT 口可用要几秒，wait_modem_ready() 里的 30×500 ms
+	 * 训练轮询就是为这段留的。 */
 
 	int rc = modem_connect();
 	if (rc == 0) {
-		LOG_INF("重连成功（3 级：模组重启）");
+		LOG_INF("重连成功（3 级：模组软重启）");
 		return 0;
 	}
 	LOG_ERR("三级重连全部失败 rc=%d —— 放弃本轮，等下个上报周期", rc);
@@ -919,13 +1045,19 @@ int modem_disconnect(void)
 		(void)at_cmd("AT+CIPSHUT");
 		atomic_set(&connected, 0);
 	}
-	/* 关机而不是进 PSM+：契约 §4.1 说了默认档是模组关机，
-	 * 下行靠服务端排队等设备下次上线（不靠 broker retain）。 */
-	int rc = at_cmd("AT+CPOWD=1");
-	if (rc != 0) {
-		LOG_WRN("软关机失败 rc=%d，改用 PWRKEY", rc);
-		power_off_hard();
-	}
+	/* ⚠ **不能发 AT+CPOWD**。契约 §4.1 的默认省电档说的是「模组关机」，
+	 * 但那是 PWRKEY 还能开机时的设计；现在 PWRKEY 已接地（上电即开机、
+	 * 无法关机，UM1.0.7 §5.3.4.1.2），CPOWD 关掉的模组没人能开回来：
+	 * 要么 VBAT 掉电重来、要么永远关着。每轮上报结束都调一次本函数
+	 * （uplink_cycle），第一次「成功关机」就是最后一次上报。
+	 *
+	 * 所以现在断开 = 只拆会话。模组留在全功能档空耗（~20 mA）——
+	 * 这是**已知未了项**：真正的省电档要等 PSM+ 切换落地（本文件末尾
+	 * 「还缺什么」#3），届时这一步换成 `AT+POWERMODE` 进 PSM+、
+	 * 下轮用 DTR 拉低退出（modem_wake）。在那之前宁可耗电也不冒险关机。
+	 *
+	 * 也没有 fallback：旧实现的 `power_off_hard()`（PWRKEY 硬关机）
+	 * 已随 PWRKEY 节点删除。 */
 	return 0;
 }
 

@@ -9,13 +9,10 @@
  * 1. **9600 baud 锁死**（§8.1）。AT+IPR 默认自适应太脆，而两种低功耗模式
  *    都要求 9600 才能可靠唤醒。出厂 `AT+IPR=9600;&W` 设一次。
  *    后果：单包 4100 字节在 HEX 模式下是 8200 字符 ≈ 8.5 秒。
- *
- * 2. **模组上电不自启动**（§8.3）。PWRKEY 开集拉低 >1 s 才开机。
- *    内部已有 5.6k 上拉，不要外加。
- *
- * 3. **`AT^WAKEUPHEX` 的可用性未核实**（§8.7 的硬门禁 / §11 #17）。
- *    不配它的话，每条例行 URC 都会把主控从 System OFF 拽出来，功耗预算直接崩，
- *    而且**没有替代的过滤手段**。R0 阶段就要用一根 UART 线验这一条。
+ * 2. **PWRKEY 已在硬件上接地**（2026-09-04）：模组随 VBAT 上电自启，
+ *    **无法关机**（UM1.0.7 §5.3.4.1.2）。所以没有 PWRKEY GPIO，也没有
+ *    power_on/power_off；重启只有 AT+CFUN=1,1 软重启，省电档只能走
+ *    PSM+（用 DTR 拉低退出，见 modem_wake）。
  */
 
 #ifndef EBIKE_MODEM_H
@@ -61,6 +58,26 @@ int modem_poll(uint32_t timeout_ms);
 
 /* AT+CSQ 的 rssi 档，负数表示读不到。用于 up/tele 的 csq 字段。 */
 int modem_csq(void);
+
+/* --- DTR / RI（PWRKEY 接地后的唤醒与通知线） ---------------------------------
+ *
+ * modem_disconnect 的注释里说了「不关机」。中间态的省电靠这两个：
+ * PSM+ 档进来用 AT+POWERMODE（还没接，见 modem.c 末尾「还缺什么」#3），
+ * 出来用 DTR；RI 是模组 → 主控的「有下行」通知（120 ms 低脉冲），
+ * 拉低 AT+CFGRI 后才出。当前接线：DTR 开漏只拉低，RI 直连，见
+ * boards/ 那份 overlay 的电压域推导。 */
+
+/* 拉低 DTR ~100 ms 再释放。CSCLK=1 档 = 从休眠唤醒；
+ * PSM+ 档 = 退出（⚠ 释放成高 = 重新进入，见 modem.c 的语义表）。 */
+int modem_wake(void);
+
+/* 把 DTR 保持拉低（hold=true）或释放（hold=false）。
+ * PSM+ 下要在「醒着」做一串 AT 交互时用，做完再释放。 */
+int modem_hold_awake(bool hold);
+
+/* RI 线是否来过脉冲（读即清除）。true = 下行可能在路上，
+ * 调用方可以把 modem_poll 提前跑。未接 RI 时恒 false。 */
+bool modem_ri_pending(void);
 
 /* 运营商 NITZ 时间（免费、无往返，§8.1）。0 = 还没拿到。
  * 契约 §5.6：拿到之前上行的 t 填 0。 */
