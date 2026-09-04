@@ -13,8 +13,9 @@
 > | 文本层契约测试 | `server/tests/test_firmware_contract.py` **76 条全过** |
 >
 > 上表是 **2026-09-04 最后一次构建**的数字（引脚复位那次）。**编译产物已入库**：
-> [`firmware/dist/`](../firmware/dist/) 里有 `zephyr.uf2` 和 `zephyr.hex`，
-> 带 sha256 和复现命令 —— 手上没装 NCS 也能直接烧。
+> [`firmware/dist/`](../firmware/dist/) 里有 `zephyr.uf2` 和 `zephyr.hex` ——
+> 手上没装 NCS 也能直接烧。改了固件源码跑 **`firmware/build.sh`**（构建 + 拷产物 +
+> 刷新 `manifest.json` 一个动作），四条断言钉住 dist/ 与源码同步，见 §2c。
 >
 > 工具链：NCS **v3.4.0**（Zephyr 4.4.0）+ Zephyr SDK 1.0.1，
 > board target `promicro_nrf52840/nrf52840/uf2`。装在 `/opt/ncs`。
@@ -53,7 +54,18 @@
 
 ## 2. 怎么编译
 
-本机 `/opt/ncs` 已经装好了（NCS v3.4.0 + Zephyr SDK 1.0.1）。三行：
+**日常就用这一条**（本机 `/opt/ncs` 已经装好 NCS v3.4.0 + Zephyr SDK 1.0.1）：
+
+```bash
+firmware/build.sh
+```
+
+它做三件事：全量构建（带 `-DCONFIG_COMPILER_WARNINGS_AS_ERRORS=y`）、把
+`zephyr.uf2`/`zephyr.hex` 拷进 [`firmware/dist/`](../firmware/dist/)、
+刷新 `dist/manifest.json`。**改了固件源码就跑它，然后把 `dist/` 和源码一起提交** ——
+理由见 §2c。想换构建目录给 `BUILD_DIR=`，默认 `/tmp/ebike-fw-build`。
+
+手动构建（调试时不想动 `dist/`）：
 
 ```bash
 export ZEPHYR_BASE=/opt/ncs/zephyr
@@ -66,13 +78,16 @@ export ZEPHYR_SDK_INSTALL_DIR=/opt/zephyr-sdk/zephyr-sdk-1.0.1
 产物在 `/tmp/bbuild/nrf52840/zephyr/`：`zephyr.uf2`（拖进 UF2 盘）、
 `zephyr.hex`（J-Link 烧）、`zephyr.elf`（gdb 用）。
 
-想连警告一起当错误（CI 应该这么跑）：
+⚠ **`-p always` 不是保险**：overlay 或 Kconfig 改动在增量构建下不一定重新
+生成 devicetree，产物会是旧脚号的。这个踩过（引脚复位那次）。
+
+想连警告一起当错误（CI 应该这么跑，`build.sh` 已经默认这样）：
 
 ```bash
 ... west build ... -- -DCONFIG_COMPILER_WARNINGS_AS_ERRORS=y
 ```
 
-**从零装工具链**（换机器时）：
+### 2a. 从零装工具链（换机器时）
 
 ```bash
 apt-get install -y git cmake ninja-build gperf ccache dfu-util \
@@ -175,6 +190,31 @@ q
 `JLinkRTTLogger.exe -Device nRF52840_xxAA -If SWD -Speed 4000` 或 `JLinkRTTClient.exe`。
 **R0 点灯那一步同时是 RTT 通路的验收项** —— blinky 起来但 RTT 无输出，
 意味着后面所有阶段都在没有日志的情况下调试，必须当场解决。
+
+### 2c. 编译产物入库，以及怎么保证它不过期
+
+`firmware/dist/` 里有 `zephyr.uf2`、`zephyr.hex`、`manifest.json`，
+**手上没装 NCS 也能直接烧**（这块板的升级方式就是拖 UF2 文件）。
+
+代价是一个真实风险：**git 不知道 `zephyr.uf2` 和 `src/*.c` 有依赖关系。**
+源码改了忘记重编，仓库里就躺着一份「看起来是最新的」固件 —— 而这种不同步
+只在**烧板子之后**暴露，症状是「代码明明改了但行为没变」，比编译错误难查得多。
+
+所以 `manifest.json` 记下**每个固件源文件的 sha256**（列表来自
+`git ls-files firmware/nrf52840`，27 个文件）、产物的 sha256 与大小、
+UF2 头部的 family/起始地址/块数、FLASH/RAM 用量与警告数。
+四条断言在 `server/tests/test_firmware_contract.py` 里消费它：
+
+| 断言 | 抓什么 |
+| --- | --- |
+| `test_dist_is_not_stale` | **改了源码没重编**（也抓新增文件没进清单、清单里的文件已删除） |
+| `test_dist_artifacts_match_manifest` | 产物被手改过或拷错了 |
+| `test_dist_build_was_clean_and_bootable` | UF2 family 不是 `0xADA52840`（拖进 U 盘会被**静默忽略**）、起始地址不是 `0x26000`（会覆盖 SoftDevice）、有警告 |
+| `test_dist_fits_the_app_partition` | FLASH/RAM 逼近上限 —— 钉的是趋势，要在加功能之前发现，不是等某次构建突然链接失败 |
+
+也可以单独查：`python3 firmware/dist/manifest.py check`。
+
+**不要手写 `manifest.json`** —— `build.sh` 生成它。
 
 ## 3. 已知没做完的
 

@@ -10,7 +10,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -832,6 +835,111 @@ def test_battery_gate_and_divider_share_one_pin():
         f"而 vbatt.power-gpios 是 &gpio{vb_pin.group(1)} {vb_pin.group(2)} —— "
         f"同一个门控 MOSFET 的两处声明必须一致"
     )
+
+
+# --- dist/ 与源码同步（2026-09-04：编译产物入库之后的第一要务） ---------------
+
+DIST = FW.parent / "dist"
+MANIFEST = DIST / "manifest.json"
+
+
+@pytest.fixture(scope="module")
+def manifest() -> dict:
+    if not MANIFEST.exists():
+        pytest.fail(
+            f"没有 {MANIFEST} —— dist/ 里的二进制没有清单就无法判断它和源码"
+            f"是否同步。跑 firmware/build.sh")
+    return json.loads(MANIFEST.read_text(encoding="utf-8"))
+
+
+def test_dist_artifacts_match_manifest(manifest):
+    """`dist/` 里的二进制必须和清单里的 sha256 一致。
+
+    有人手改或手拷过产物，这条会红。
+    """
+    for name, want in manifest["artifacts"].items():
+        p = DIST / name
+        assert p.exists(), f"清单里有 {name} 但 dist/ 里没有"
+        assert p.stat().st_size == want["size"], \
+            f"{name} 大小 {p.stat().st_size} ≠ 清单的 {want['size']}"
+        got = hashlib.sha256(p.read_bytes()).hexdigest()
+        assert got == want["sha256"], (
+            f"{name} 的 sha256 与清单不符 —— 产物被手改过或拷错了。"
+            f"跑 firmware/build.sh 重新生成")
+
+
+def test_dist_is_not_stale(manifest):
+    """**改了固件源码就必须重编 dist/。**
+
+    这是编译产物入库唯一的真实风险：git 不知道 `dist/zephyr.uf2` 和
+    `src/*.c` 有依赖关系，源码改了忘记重编，仓库里就躺着一份「看起来是
+    最新的」固件。而这种不同步只在**烧板子之后**暴露，症状是「代码明明改了
+    但行为没变」—— 比编译错误难查得多。
+
+    清单记的是每个源文件的 sha256（列表来自 `git ls-files firmware/nrf52840`，
+    不是 rglob —— 后者会把编辑器临时文件和未跟踪的实验文件也算进去，
+    那会让这条测试在别人的机器上无缘无故红）。
+    """
+    recorded: dict[str, str] = manifest["sources"]
+
+    out = subprocess.run(
+        ["git", "ls-files", "firmware/nrf52840"],
+        cwd=FW.parents[1], capture_output=True, text=True, check=True).stdout
+    now = {rel: hashlib.sha256((FW.parents[1] / rel).read_bytes()).hexdigest()
+           for rel in sorted(out.splitlines()) if rel.strip()}
+
+    added = sorted(set(now) - set(recorded))
+    removed = sorted(set(recorded) - set(now))
+    changed = sorted(r for r in set(now) & set(recorded) if now[r] != recorded[r])
+
+    assert not (added or removed or changed), (
+        "dist/ 里的固件不是当前源码编出来的 —— 跑 firmware/build.sh。\n"
+        f"  改了没重编：{changed}\n"
+        f"  新增未进清单：{added}\n"
+        f"  清单里已删除：{removed}")
+
+
+def test_dist_build_was_clean_and_bootable(manifest):
+    """清单必须证明这份产物是**零警告**编出来的、而且 bootloader 认得。
+
+    三个数字都是「不对就烧不进去或烧进去不跑」：
+
+    - UF2 family `0xADA52840` —— bootloader 的 `UF2_FAMILY` 就是这个值，
+      不匹配的话拖进 U 盘会被静默忽略（文件消失但固件没换）。
+    - start `0x26000` —— app 分区起点（DESIGN.md §3.4 的 flash 布局）。
+      要 `CONFIG_USE_DT_CODE_PARTITION=y` 才会链到这里，少了就从 0x0 开始，
+      覆盖 SoftDevice。
+    - warnings=0 —— `-DCONFIG_COMPILER_WARNINGS_AS_ERRORS=y` 下警告即错误，
+      所以非零意味着清单是别的方式编出来的。
+    """
+    assert manifest["warnings_as_errors"] is True, \
+        "这份产物不是带 WARNINGS_AS_ERRORS 编的"
+    assert manifest["memory"]["warnings"] == 0, \
+        f"构建有 {manifest['memory']['warnings']} 条警告"
+    assert manifest["uf2"]["family"] == "0xADA52840", (
+        f"UF2 family 是 {manifest['uf2']['family']} —— bootloader 只认 "
+        f"0xADA52840，不匹配的文件拖进 U 盘会被静默忽略")
+    assert manifest["uf2"]["start"] == "0x26000", (
+        f"UF2 起始地址是 {manifest['uf2']['start']} 而不是 0x26000 —— "
+        f"检查 CONFIG_USE_DT_CODE_PARTITION，从 0x0 开始会覆盖 SoftDevice")
+    assert manifest["board"] == "promicro_nrf52840/nrf52840/uf2", \
+        f"board target 变成了 {manifest['board']}"
+
+
+def test_dist_fits_the_app_partition(manifest):
+    """产物必须装进 app 分区，而且留够余量。
+
+    app 分区是 `0x26000 + 0xC6000` = 811 008 B（DESIGN.md §3.4）。
+    这条不是重复 linker 的工作 —— linker 只知道 `zephyr.hex` 装不装得下，
+    而**这里钉的是趋势**：占用率逼近上限时要在加功能之前发现，不是在
+    某次构建突然链接失败时。80% 是个宽松的门槛，当前 27%。
+    """
+    percent = manifest["memory"]["flash"]["percent"]
+    assert percent < 80.0, (
+        f"FLASH 用了 {percent}% —— 逼近 app 分区上限（0xC6000 = 792 KB），"
+        f"该考虑裁功能或挪分区了")
+    assert manifest["memory"]["ram"]["percent"] < 80.0, \
+        f"RAM 用了 {manifest['memory']['ram']['percent']}%"
 
 
 def test_kconfig_symbols_that_are_link_time_landmines(prj_conf):

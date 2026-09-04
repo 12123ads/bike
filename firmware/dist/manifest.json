@@ -1,0 +1,59 @@
+{
+  "artifacts": {
+    "zephyr.hex": {
+      "sha256": "bd38359a03e7a6a4af9e46e9895a2e5a914b9510bebc437dee12be5a0ea4167f",
+      "size": 620792
+    },
+    "zephyr.uf2": {
+      "sha256": "22cdf7e7ade2e06b2cb087cbfdc627a0e9c8138ff0984493de8aada5c5536c88",
+      "size": 441344
+    }
+  },
+  "board": "promicro_nrf52840/nrf52840/uf2",
+  "memory": {
+    "flash": {
+      "bytes": 220652,
+      "percent": 27.21
+    },
+    "ram": {
+      "bytes": 61616,
+      "percent": 23.5
+    },
+    "warnings": 0
+  },
+  "sources": {
+    "firmware/nrf52840/CMakeLists.txt": "08c344e9c154ac4c95d1d5df16f381541f97ea78f4796aec87c2279abde95684",
+    "firmware/nrf52840/Kconfig": "99e041102ea6147df86d7f22e0747e047f9af918575960d28c518f10e787bdb3",
+    "firmware/nrf52840/boards/promicro_nrf52840_nrf52840_uf2.overlay": "69337c65960f3273f7f1f5152e2f9cb1b7eea8bd55d0759248ed624e3b6357f6",
+    "firmware/nrf52840/prj.conf": "56e97a5a2b3c2a4841f9a6a4106b7b18cb97701945aa8c4acb2e9bdfb2e94a1a",
+    "firmware/nrf52840/src/battery.c": "728b6a6f857fd98fe762b9b39fe8dea288d34ed4cdc4d8952d1c0752647ac17e",
+    "firmware/nrf52840/src/battery.h": "78cccdfb868afa3ade11d7a4fb719749aa21b7c63385affbe15e6b82c6a5fa8e",
+    "firmware/nrf52840/src/ble_unlock.c": "7f1b6f676e23169f953b7e03449992bfe7b2853b07d83c1cbf7b9198066d5e69",
+    "firmware/nrf52840/src/ble_unlock.h": "4d99cfd0d273f445e2c2a9427f7dba3a6eb5bfe9fe233834a63701098792441c",
+    "firmware/nrf52840/src/crypto.c": "e364d4e6691d2855af109f0677716931b08ef4568ad87a95283beb98806f8630",
+    "firmware/nrf52840/src/crypto.h": "e963be373cfdcfa8ccf21d32a73a7f63d4d929193512e52b114c304830c1b92c",
+    "firmware/nrf52840/src/gnss.c": "5b928e030ba70be9cb1006229e2ac355aa2a1e10a4c5591722041d3507a7bf4c",
+    "firmware/nrf52840/src/gnss.h": "42ec94cd4832f13aaa9eb2b83f5742d0fb03f70d70c494fc77fc7461c4981ac5",
+    "firmware/nrf52840/src/lock.c": "852d98cc0fbd2f3ad0c5816a236e0c7876dc394f161047269e79cf2ad4dd7daf",
+    "firmware/nrf52840/src/lock.h": "f8d3e3cfa85efc80fe441fe7f45ec55c4c2f12c8413d70dc8b48146f0160d880",
+    "firmware/nrf52840/src/main.c": "d8541b9ea5571381f38e0f7c46c0d7c8a4b12a7da65310b771cabc7935f01a81",
+    "firmware/nrf52840/src/modem.c": "148fac3fb88082343cfc48e7ee3be0068a81364fff82523e842a3f6a05906bf7",
+    "firmware/nrf52840/src/modem.h": "280bfa7eed226f70d3c0a217b0286a78dc50cb190ea84113fb94ae195d231f2a",
+    "firmware/nrf52840/src/motion.c": "1656fd1811decd68958e6f0ef7755a1d18e260c9112ac3031339c926d741e4e4",
+    "firmware/nrf52840/src/motion.h": "1f188315b7a15db316072908d732d23b22cf6e3eefb0e08ffd5147dc0e8d100a",
+    "firmware/nrf52840/src/nvstore.c": "4698c1045f8cda44136e18273a9f1b62e181e109cac2ddcefdc757fda9bfd799",
+    "firmware/nrf52840/src/nvstore.h": "de97853ffc9d73263c2156f1284a3a1e058700ae40ce23d8a43a6eadf125f85e",
+    "firmware/nrf52840/src/proto.c": "b397cf896702d802d8939fae369c952c227c340ecb0a1a24a93a908356eb0969",
+    "firmware/nrf52840/src/proto.h": "ea127ef4e8ae60e0c66c93749164ecf200ca593451e063e9987c283d326ffba2",
+    "firmware/nrf52840/src/unlock.c": "09f890217b3f3937f54bafc05e4e699b147cdb07b4dad70d9689bbc237dbc8e9",
+    "firmware/nrf52840/src/unlock.h": "7ff7ec4e6d779fb0c06363ad5f31cf16727a9221731f339ec7dc7dccf52679e4",
+    "firmware/nrf52840/src/uplink.c": "686a6b0f97587dd3f4c109d2fcaa98eee94f33d05f6efa6063135ef3dde8c742",
+    "firmware/nrf52840/src/uplink.h": "da95e9099d659c8abb88307ad72a131e23ca7ea393338dc7722520e6a16180bf"
+  },
+  "uf2": {
+    "blocks": 862,
+    "family": "0xADA52840",
+    "start": "0x26000"
+  },
+  "warnings_as_errors": true
+}
