@@ -27,7 +27,7 @@
 	ebike_outputs {
 		compatible = "gpio-leds";
 
-		/* 分压门控 MOSFET。真 overlay 里是 P0.04，这里随便挑一个
+		/* 分压门控 MOSFET。真 overlay 里是 P0.10（J3.2），这里随便挑一个
 		 * gpio-emul 的脚 —— 测试断言的是「采完必须回到 0」，不是脚号。 */
 		batt_gate: batt_gate {
 			gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;

@@ -1,18 +1,36 @@
 /*
  * 板级 overlay：nRF52840 ProMicro 克隆板。
  *
- * ⚠ 两处必须自己确认的（DESIGN.md §3.4 / §3.5）：
+ * ⚠ 三件必须对着实物/netlist 核的事（DESIGN.md §3.4 / §3.5）：
  *
- * 1. **pinctrl 冲突**：上游 promicro_nrf52840-pinctrl.dtsi 的 uart0 是
+ * 1. **只能用引出到排针的脚。** SoC 有 48 个 GPIO，这块板子只把 **21 个**
+ *    引到焊盘，其余的**只到芯片焊盘、哪儿都不通** —— 而 devicetree 对此
+ *    一无所知，填一个没引出的脚**编译照过**，直到接线时才发现没地方接。
+ *    这个坑已经踩过三次（P0.04 门控、P0.12 PWRKEY、P0.26 RI，都在
+ *    2026-09-04 从 `sasodoma/nrf52840-promicro` 的 netlist 逐脚复核时抓到）。
+ *
+ *    **引出脚白名单**（逐个 pad 追 net → 元件焊盘数出来的）：
+ *      J2 十个：P0.06 P0.08 P0.17 P0.20 P0.22 P0.24 P1.00 P0.11 P1.04 P1.06
+ *      J3 八个：P0.09 P0.10 P1.11 P1.13 P1.15 P0.02 P0.29 P0.31
+ *      J4 三个：P1.01 P1.02 P1.07
+ *    板内占用不引出：P0.00/P0.01（Y2 晶振）、P0.13（ME6217 CE）、P0.15（蓝 LED）。
+ *    J3 第 10 个焊盘是 RESET（UICR.PSELRESET = P0.18），不能当 GPIO 用。
+ *    `server/tests/test_firmware_contract.py` 把这份白名单钉成断言。
+ *
+ * 2. **pinctrl 冲突**：上游 promicro_nrf52840-pinctrl.dtsi 的 uart0 是
  *    TX=P0.09 / RX=P0.10。下面把 uart0 挪到 P0.06/P0.08，并新开 uart1
- *    给 Air780EP。**引脚号是按 J2/J4 的可用脚挑的，实物到手要对着板子核一遍。**
+ *    给 Air780EP。
  *    （挪开的原始理由是 P0.09/P0.10 要给 NFCT；开锁改走 BLE 之后那两个脚
- *    自由了，但这里不挪回去 —— 已核过的引脚分配没有理由再动一次。
- *    它们现在是**余量**，见下。）
+ *    自由了，其中 P0.10 现在给了 `batt_gate`，P0.09 是余量。）
  *
- * 2. **GPIO 余量是 21 个**（NFCT 不再占用 P0.09/P0.10 —— BLE 用片上无线，
- *    不吃引脚）。下面用掉 17 个，余 4 个：锁要 3 根线也装得下，
- *    INT2 那根潜在的第二中断线也有地方接。
+ * 3. **上游板级 DTS 会悄悄抢走排针脚**，文件末尾统一关掉：
+ *    `i2c1`（P1.04/P1.06 = J2.12/J2.13）、`spi2`（P1.01/P1.02/P1.07 = 整个 J4）。
+ *    i2c1 尤其阴险：`CONFIG_I2C_NRFX_TWIM=y` 让 twim1 真的实例化，
+ *    `pm_device_driver_init()` 的 RESUME 会 `pinctrl_apply_state(DEFAULT)`，
+ *    **开机就把那两个脚配成 I2C**（ELF 里 `__device_dts_ord_73` 实测存在）。
+ *
+ * 用掉 13 个（下面逐个数），余 8 个：P0.02 P0.09 P0.29 P1.01 P1.02 P1.04
+ * P1.06 P1.07。锁要 3 根线、INT2 那根第二中断线都装得下。
  */
 
 /* `power-mode` / `wakeup-duration` 用的是 LIS2DW12 的 dt-bindings 宏，
@@ -25,8 +43,8 @@
 / {
 	aliases {
 		/* ⚠ **只保留真正被 DT_ALIAS 取用的那一个。**
-		 * 其余六个（lock-drive / lock-sense / batt-gate / gnss-power /
-		 * modem-pwrkey / modem-ri）删掉了：所有 .c 文件一律用
+		 * 其余五个（lock-drive / lock-sense / batt-gate / gnss-power /
+		 * modem-pwrkey）删掉了：所有 .c 文件一律用
 		 * `DT_NODELABEL(...)`，那些别名是纯装饰，留着只会让人以为
 		 * 换引脚时改别名就够了。
 		 *
@@ -79,9 +97,18 @@
 		/* 电池采样分压的门控 MOSFET。分压器常通是 5.96 µA @58.8 V
 		 * （4.7M+4.7M/470k，见下面 vbatt 节点），和 nRF52840 自己
 		 * GPIOTE PORT 的 2.36 µA 同一量级，所以只在测的瞬间开
-		 * （DESIGN.md §3.6）。 */
+		 * （DESIGN.md §3.6）。
+		 *
+		 * ⚠ **曾经填 P0.04，那个脚这块板没引出**（文件头 §1）。P0.04 大概
+		 * 是从两处抄来的：正品 nice!nano 的 `BATIN/P0.04`，以及克隆板那份
+		 * 画错的原理图 —— `archive/ADR-001 §5.6` 早就记了「R10/R11 铜箔
+		 * 实际走到 P0.24 不是 P0.04」。而 P0.24 在本 overlay 里是 i2c0 SDA，
+		 * 所以那两个 0201 焊盘**永远不要贴件**：贴上就是往 I2C 数据线上
+		 * 挂一个分压器。
+		 * 现在用 **P0.10 = J3.2**，和 ADC 脚 P0.31 同在 J3，走线短。
+		 * 不占 P0.02/P0.29 是因为只有 3 个真 ADC 脚，别拿去做数字输出。 */
 		batt_gate: batt_gate {
-			gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
+			gpios = <&gpio0 10 GPIO_ACTIVE_HIGH>;
 			label = "battery divider gate";
 		};
 
@@ -93,33 +120,17 @@
 
 		/* Air780EP PWRKEY：开集拉低 >1 s 开机。
 		 * ⚠ 模组内部已有 5.6k 上拉，**不要外加上拉**（DESIGN.md §8.1）。
-		 * 模组上电不自启动，所以这根线是必须的。 */
-		modem_pwrkey: modem_pwrkey {
-			gpios = <&gpio0 12 GPIO_ACTIVE_LOW>;
-			label = "Air780EP PWRKEY";
-		};
-	};
-
-	ebike_inputs {
-		compatible = "gpio-keys";
-
-		/* MAIN_RI：AT+CFGRI=1 之后出 120 ms 低脉冲。
-		 * ⚠ 必须配 AT^WAKEUPHEX 把 RI 限定到魔术下行串，否则每条例行 URC
-		 * 都会把主控从 System OFF 拽出来，功耗预算直接崩（DESIGN.md §8.3）。
-		 * ⚠⚠ 这两条命令在 AT 固件 V1011 上能不能用**未核实**（§8.7），
-		 * R0 阶段用一根 UART 线先验。
+		 * 模组上电不自启动，所以这根线是必须的 —— 它接不上就是整条 4G
+		 * 链路起不来。
 		 *
-		 * ⚠⚠⚠ **两件事都还没落地，这个节点目前只是声明**：
-		 * 1. P0.26 是**占位脚号**（DESIGN.md §11 #18）。真实的 MAIN_RI
-		 *    脚号至今无来源（`docs.openluat.com/4Gmodulepin/` 404），
-		 *    **布板前必须查 `Air780EP硬件手册V1.1.pdf`**。
-		 * 2. **没有任何 C 代码取用它**（全 src 搜 `modem_ri` 只有这里）。
-		 *    modem.c 发了 `AT+CFGRI=1`，但主控侧没人监听这根线 ——
-		 *    「模组主动唤醒主控」这条链目前是半条。
-		 *    定完脚号之后还要写监听代码。 */
-		modem_ri: modem_ri {
-			gpios = <&gpio0 26 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
-			label = "Air780EP MAIN_RI (占位脚号，无代码取用)";
+		 * ⚠ **曾经填 P0.12，那个脚这块板没引出**（文件头 §1）。这条比
+		 * P0.26 那条严重得多：P0.26 没有任何代码取用，而这根线
+		 * `modem.c:26` 一直在用。
+		 * 现在用 **P1.00 = J2.10**，和 modem 的 uart1（P0.17/P0.20 = J2.6/J2.7）
+		 * 同在 J2；P1.00 是 normal-drive 脚，驱动开集三极管没问题。 */
+		modem_pwrkey: modem_pwrkey {
+			gpios = <&gpio1 0 GPIO_ACTIVE_LOW>;
+			label = "Air780EP PWRKEY";
 		};
 	};
 
@@ -151,7 +162,7 @@
 		io-channels = <&adc 7>;
 		output-ohms = <470000>;
 		full-ohms = <(4700000 + 4700000 + 470000)>;
-		power-gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
+		power-gpios = <&gpio0 10 GPIO_ACTIVE_HIGH>;
 	};
 };
 
@@ -279,8 +290,30 @@
 	};
 };
 
-/* SPI1 在 ZMK 的默认 pinctrl 里把 MOSI 放在 P0.10 —— 本工程不用 SPI，关掉，
- * 顺带把 P0.10 留作余量脚（文件头 §2）。 */
+/* --- 关掉上游板级 DTS 打开、但本工程不用的外设 ----------------------------------
+ * 每一个都在抢排针脚（文件头 §3）。`status = "disabled"` 之后驱动不实例化，
+ * pinctrl 也就不会在 init 时被应用。
+ *
+ * ⚠ pwm0（P0.15）**故意不关**：P0.15 是板载蓝 LED，不引出、不占排针脚，
+ * 而 `pwmleds`/`mcuboot-led0` 那几个节点引用着它，关掉只增加风险不换来余量。
+ */
+
+/* i2c1 = P1.04/P1.06 = J2.12/J2.13。这个是真丢脚：CONFIG_I2C_NRFX_TWIM=y
+ * 会让 twim1 实例化并在 init 里应用 pinctrl（文件头 §3）。 */
+&i2c1 {
+	status = "disabled";
+};
+
+/* spi2 = P1.01/P1.02/P1.07 = 整个 J4。当前 CONFIG_SPI 没开所以还没丢，
+ * 但谁哪天开了 SPI 就会连带吃掉 J4 三个脚 —— 提前关掉。
+ * 板级 aliases 里的 `spi = &spi2` 留着无害：没有代码 DEVICE_DT_GET 它。 */
+&spi2 {
+	status = "disabled";
+};
+
+/* spi1 在 SoC dtsi 里本来就是 disabled，这里显式写一遍是因为 ZMK 的
+ * `spi1_default` 把 MOSI 放在 P0.10 —— 而 P0.10 现在是 `batt_gate`。
+ * 将来若真把 BOARD_ROOT 换成 ZMK 的 nice_nano，这一行是那条冲突的护栏。 */
 &spi1 {
 	status = "disabled";
 };

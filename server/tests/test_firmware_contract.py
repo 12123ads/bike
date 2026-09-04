@@ -677,6 +677,163 @@ def test_overlay_includes_lis2dw12_dt_bindings():
             "用了 LIS2DW12_DT_* 宏但没 include 对应的 dt-bindings 头"
 
 
+# --- 引出脚白名单（2026-09-04：overlay 里三个脚这块板根本没引出） --------------
+#
+# 克隆板（sasodoma/nrf52840-promicro 的 KiCad netlist，逐个 pad 追 net →
+# 元件焊盘数出来的）只把 21 个 GPIO 引到排针：
+EXPOSED_PINS = {
+    # J2 十个
+    "P0.06", "P0.08", "P0.17", "P0.20", "P0.22", "P0.24",
+    "P1.00", "P0.11", "P1.04", "P1.06",
+    # J3 八个（第 9~13 个焊盘是 EXTVCC / RESET / GND / VBAT / VBAT）
+    "P0.09", "P0.10", "P1.11", "P1.13", "P1.15", "P0.02", "P0.29", "P0.31",
+    # J4 三个
+    "P1.01", "P1.02", "P1.07",
+}
+
+# 板内占用、不引出：晶振两脚、LDO 使能、蓝 LED。
+# 列出来是为了让「为什么 21 而不是 25」有据可查，断言不用它。
+BOARD_INTERNAL_PINS = {"P0.00", "P0.01", "P0.13", "P0.15"}
+
+
+def overlay_text() -> str:
+    return (FW / "boards" / "promicro_nrf52840_nrf52840_uf2.overlay").read_text(
+        encoding="utf-8")
+
+
+def overlay_gpio_specs(text: str) -> list[tuple[str, str]]:
+    """overlay 里所有 `<&gpioN pin ...>` 的 (原文, "P0.04") 对。
+
+    覆盖 `gpios`、`irq-gpios`、`power-gpios` —— 三种属性名都出现过，
+    按属性名逐个写正则会漏，所以直接扫 phandle 本身。注释里不会出现
+    `&gpio0 4` 这种写法（都是 `P0.04` 的散文形式），所以不必剥注释。
+    """
+    out = []
+    for m in re.finditer(r"<\s*&gpio([01])\s+(\d+)", text):
+        port, pin = int(m.group(1)), int(m.group(2))
+        out.append((m.group(0), f"P{port}.{pin:02d}"))
+    return out
+
+
+def test_overlay_only_uses_pins_the_board_exposes():
+    """overlay 里每个 GPIO 都必须是这块板**真的引出到排针**的脚。
+
+    这是三个真实缺陷的护栏，全部在 2026-09-04 对着 netlist 复核时抓到：
+
+    - `batt_gate` + `vbatt.power-gpios` = **P0.04**：只到芯片焊盘 U1.J1，
+      板上哪儿都不通。`battery.c:20` 一直在用它 —— 门控接不上就没法采样。
+      P0.04 大概是从正品 nice!nano 的 `BATIN/P0.04` 或克隆板那份画错的
+      原理图抄来的（`archive/ADR-001 §5.6` 记了「R10/R11 铜箔实际走到
+      P0.24 不是 P0.04」，而 P0.24 在本 overlay 里是 i2c0 SDA）。
+    - `modem_pwrkey` = **P0.12**：只到 U1.U1。`modem.c:26` 在用，
+      而模组上电不自启动 —— 这根线接不上就是整条 4G 链路起不来。
+    - `modem_ri` = **P0.26**：只到 U1.G1。没有任何 C 代码取用，
+      节点已删除（脚号本身也无来源，见 §11 #18）。
+
+    为什么 `west build` 抓不到：`gpio0` 在 SoC 里有 32 个脚，P0.26 是
+    合法的 **SoC** 引脚，devicetree 无从知道**这块板**有没有把它引出来。
+    这类错误只有对着 netlist 查才发现 —— 所以钉在这里。
+    """
+    text = overlay_text()
+    specs = overlay_gpio_specs(text)
+    assert specs, "overlay 里一个 gpio phandle 都没扫到 —— 正则失效了"
+
+    bad = sorted({pin for _, pin in specs} - EXPOSED_PINS)
+    assert not bad, (
+        f"overlay 用了这块板没引出的脚：{bad}。"
+        f"只能用 J2/J3/J4 引出的 21 个（见 overlay 文件头的白名单）；"
+        f"其余的只到芯片焊盘、哪儿都不通，而 west build 不会报错"
+    )
+
+
+def test_overlay_pinctrl_psels_only_use_exposed_pins():
+    """`NRF_PSEL(...)` 选的脚同样必须引出 —— uart/i2c 走的是 pinctrl，
+    不是 gpio phandle，上面那条扫不到它们。
+    """
+    text = overlay_text()
+    psels = [(m.group(0), f"P{int(m.group(2))}.{int(m.group(3)):02d}")
+             for m in re.finditer(
+                 r"NRF_PSEL\(\s*(\w+)\s*,\s*(\d)\s*,\s*(\d+)\s*\)", text)]
+    assert psels, "overlay 里没有 NRF_PSEL —— 正则失效了"
+
+    bad = sorted({pin for _, pin in psels} - EXPOSED_PINS)
+    assert not bad, f"pinctrl 选了没引出的脚：{bad}"
+
+
+def test_overlay_pins_are_not_double_assigned():
+    """一根物理线只能有一个用途 —— 唯一的例外是 `motion_int` 与
+    `lis2dw12.irq-gpios`（同一根 P1.11，两处声明是故意的，见 overlay 注释），
+    以及 `batt_gate` 与 `vbatt.power-gpios`（同一个门控 MOSFET）。
+
+    没有这一条，把 `batt_gate` 挪到 P0.10 这种改动很容易撞上 uart0 的
+    原始脚位（P0.09/P0.10 曾经是 uart0 默认脚）而没人发现。
+    """
+    text = overlay_text()
+    gpio_pins = [pin for _, pin in overlay_gpio_specs(text)]
+    psel_pins = [f"P{int(m.group(2))}.{int(m.group(3)):02d}"
+                 for m in re.finditer(
+                     r"NRF_PSEL\(\s*(\w+)\s*,\s*(\d)\s*,\s*(\d+)\s*\)", text)]
+
+    # pinctrl 每个脚都在 default + sleep 两个 state 里各出现一次 —— 去重。
+    overlap = sorted(set(gpio_pins) & set(psel_pins))
+    assert not overlap, (
+        f"这些脚同时被 gpio phandle 和 pinctrl 占用：{overlap} —— "
+        f"两个所有者会互相改 PIN_CNF"
+    )
+
+
+def test_overlay_disables_board_peripherals_that_steal_header_pins():
+    """上游板级 DTS 打开的 `i2c1` / `spi2` 必须显式关掉。
+
+    `promicro_nrf52840_nrf52840_common.dts` 把两者都设成 `status = "okay"`：
+
+    - `i2c1` 的 pinctrl 是 P1.04/P1.06 = **J2.12/J2.13**。这个是真丢脚：
+      `CONFIG_I2C_NRFX_TWIM=y` 让 twim1 实例化，`i2c_nrfx_twim_init()` →
+      `pm_device_driver_init()` → RESUME → `pinctrl_apply_state(DEFAULT)`，
+      **开机就把那两个脚配成 I2C**。ELF 里 `__device_dts_ord_*` 实测存在过。
+    - `spi2` 的 pinctrl 是 P1.01/P1.02/P1.07 = **整个 J4**。当前
+      `CONFIG_SPI` 没开所以还没丢，但谁开了 SPI 就会连带吃掉三个脚。
+
+    `pwm0`（P0.15 = 板载蓝 LED，不引出）刻意不关：关掉只增加风险
+    （`pwmleds` / `mcuboot-led0` 引用着它）而不换来任何余量。
+    """
+    text = overlay_text()
+    for label in ("i2c1", "spi2"):
+        m = re.search(rf"&{label}\s*\{{(.*?)\}};", text, re.S)
+        assert m, (
+            f"overlay 没有关掉 &{label} —— 上游板级 DTS 把它设成 okay，"
+            f"它的 pinctrl 会占掉排针脚"
+        )
+        assert 'status = "disabled"' in m.group(1), \
+            f"&{label} 存在但没设 status = \"disabled\""
+
+
+def test_battery_gate_and_divider_share_one_pin():
+    """`batt_gate` 和 `vbatt` 的 `power-gpios` 必须是同一个脚。
+
+    它们是同一个门控 MOSFET 的两处声明（battery.c 用前者，
+    `VOLTAGE_DIVIDER_DT_SPEC_GET` 读后者）。改脚号时漏改一处，
+    症状是「门控开了但采样读的是另一条永远关着的路」—— 读数恒为噪声底，
+    而那正好会被新加的 `MIN_PLAUSIBLE_MV` 判成采样链故障。
+    """
+    text = overlay_text()
+    gate = re.search(r"batt_gate:\s*batt_gate\s*\{(.*?)\}", text, re.S)
+    assert gate, "overlay 里没有 batt_gate 节点"
+    gate_pin = re.search(r"<\s*&gpio([01])\s+(\d+)", gate.group(1))
+    assert gate_pin, "batt_gate 没有 gpios 属性"
+
+    vb = re.search(r"vbatt:\s*vbatt\s*\{(.*?)\n\t\};", text, re.S)
+    assert vb, "overlay 里没有 vbatt 节点"
+    vb_pin = re.search(r"power-gpios\s*=\s*<\s*&gpio([01])\s+(\d+)", vb.group(1))
+    assert vb_pin, "vbatt 没有 power-gpios 属性"
+
+    assert gate_pin.groups() == vb_pin.groups(), (
+        f"batt_gate 是 &gpio{gate_pin.group(1)} {gate_pin.group(2)}，"
+        f"而 vbatt.power-gpios 是 &gpio{vb_pin.group(1)} {vb_pin.group(2)} —— "
+        f"同一个门控 MOSFET 的两处声明必须一致"
+    )
+
+
 def test_kconfig_symbols_that_are_link_time_landmines(prj_conf):
     """三个默认 n / 需要显式打开的符号，缺了都是**链接期**才报错。
 

@@ -5,11 +5,16 @@
 > | | 结果 |
 > | --- | --- |
 > | `west build` | **通过**，零警告（`-DCONFIG_COMPILER_WARNINGS_AS_ERRORS=y` 也过） |
-> | FLASH | 218 688 B / 792 KB = **26.96 %** |
-> | RAM | 62 192 B / 256 KB = **23.72 %** |
-> | 产物 | `zephyr.uf2` 437 760 B，family `0xADA52840`，start `0x26000` ✓ |
+> | FLASH | 220 652 B / 792 KB = **27.21 %** |
+> | RAM | 61 616 B / 256 KB = **23.50 %** |
+> | 产物 | `zephyr.uf2` 441 344 B，family `0xADA52840`，start `0x26000` ✓ |
 > | BabbleSim 运行时测试 | **两侧都 Passed**，8 条断言（见 §5） |
-> | 文本层契约测试 | `server/tests/test_firmware_contract.py` **58 条全过** |
+> | native_sim ztest | **8 套 67 条全过**（见 §3d） |
+> | 文本层契约测试 | `server/tests/test_firmware_contract.py` **76 条全过** |
+>
+> 上表是 **2026-09-04 最后一次构建**的数字（引脚复位那次）。**编译产物已入库**：
+> [`firmware/dist/`](../firmware/dist/) 里有 `zephyr.uf2` 和 `zephyr.hex`，
+> 带 sha256 和复现命令 —— 手上没装 NCS 也能直接烧。
 >
 > 工具链：NCS **v3.4.0**（Zephyr 4.4.0）+ Zephyr SDK 1.0.1，
 > board target `promicro_nrf52840/nrf52840/uf2`。装在 `/opt/ncs`。
@@ -21,6 +26,10 @@
 > bootloader 版本正好匹配**（结果见 [`DESIGN.md` §3.4](DESIGN.md)，
 > 这台机器上的探针限制与调用范式见 §2b）。但固件本身**还是没在真硬件上跑过** ——
 > 那次只做了只读探测，没有烧任何固件进去。
+>
+> **同日第二件事**：对着克隆板 netlist 逐脚复核 overlay，抓到**三个这块板
+> 根本没引出的脚**（`batt_gate` P0.04、`modem_pwrkey` P0.12、`modem_ri` P0.26），
+> 前两个有代码在用。已全部改到引出脚上，白名单钉成断言（§6 / DESIGN.md §3.5）。
 >
 > 第一次构建暴露了 6 个真问题，全部已修，逐条记在 §3c ——
 > **其中两个是「编得过但功能静默失效」，比编译错误危险得多。**
@@ -174,7 +183,7 @@ q
 | # | 缺什么 | 后果 | 在哪 |
 | --- | --- | --- | --- |
 | ~~1~~ | ~~**断线重连阶梯**~~ | ✅ **2026-09-03 已修**：`modem_reconnect()` 三级 —— **1 级** 只重建 MQTT 会话（`MDISCONNECT` → `stage_session`，~5~10 s）；**2 级** 加 `CIPSHUT` + 重新附着（~15~70 s）；**3 级** `CPOWD` + PWRKEY 硬关机 + 完整重跑（~30~90 s）。`modem_connect()` 拆成 `stage_boot`/`stage_attach`/`stage_session` 三段供阶梯复用。**不做无限重试** —— 三级全败就返回错误让上层放弃本轮（§4.4：死循环会抽干车电池）。`connected` 从裸 `bool` 改成 `atomic_t`。`uplink.c` 的 `publish_retry()` 按 `modem_is_connected()` 而非 `rc` 决定要不要重连（-E2BIG/-ENOMEM 重连一百次也没用）。5 条 ztest（假模组 + AT 命令 trace）钉住「只重跑坏掉的那一层」，3 个变异体全被抓 | `firmware/tests/modem_reconnect` |
-| 2 | **睡眠仲裁器 + RI 监听** | 省电档下第一条 AT 命令可能丢。**依赖 MAIN_DTR/MAIN_RI 脚号，而那个至今无来源**（§8.7 硬门禁 / §11 #18）。而且 overlay 里的 `modem_ri` 节点**没有任何 C 代码取用** —— `AT+CFGRI=1` 发了但主控侧没人监听那根线，「模组主动唤醒主控」目前是半条链 | 同上第 2 条 / overlay |
+| 2 | **睡眠仲裁器 + RI 监听** | 省电档下第一条 AT 命令可能丢。**依赖 MAIN_DTR/MAIN_RI 脚号，而那个至今无来源**（§8.7 硬门禁 / §11 #18）。2026-09-04 **删掉了 overlay 里的 `modem_ri` 节点**：它没有任何 C 代码取用，而且原来填的 P0.26 是这块板没引出的脚（DESIGN.md §3.5）—— `AT+CFGRI=1` 发了但主控侧没人监听那根线，「模组主动唤醒主控」目前是半条链。定脚号时从 §3.5 的 8 个余量里取 | 同上第 2 条 / overlay |
 | ~~3~~ | ~~**NITZ → Unix 秒换算**~~ | ✅ **2026-09-03 已修**：`parse_modem_time()` 走 `timeutil_timegm64()`。两条要命的规则来自合宙 AT 手册 V1.6.8：**±zz 单位是 1/4 小时**（东八区 `+32` 不是 `+08`，当小时读差 24 h）、**hh:mm:ss 是本地时间必须减偏移**（不减差 8 h，⚠ 与 nRF91 相反，别照抄 NCS `date_time_modem.c`）。顺带修掉两个静默 bug：URC 前缀是 `+NITZ:` 不是 `+CTZV:`（这家族没有 CTZV，旧代码永远匹配不上）、`AT+CTZR=1` 是只读命令发过去只会回 ERROR。11 条 ztest 钉住，4 个变异体全部被抓 | `firmware/tests/modem_time` |
 | 4 | **证书灌入**（`AT+FSCREATE`/`AT+FSWRITE`） | **这是 R6 的阻塞项**：`AT+SSLCFG="cacert",0,"ca.crt"` 引用的文件必须先在模组 FS 里，而现在没有任何代码灌它。**注意这条命令现在失败即中止连接**（以前是静默忽略），所以证书没灌就连不上，症状很明确 | 同上第 4 条 / §8.8 / §11 #24 |
 | 5 | **PSM+ / PRO 双档** | 只有「连上」和「关机」两态。`dn/cmd` 的 `tier` 指令会明确 ack 失败而不是假装成功 | 同上第 5 条 / §11 #20 |
@@ -303,6 +312,9 @@ done
 | `flush_events` 持锁发送（M3） | `uplink_events` 1 条红（那条用例耗时从 0.5 s 变 10 s —— 探针真的被卡住了） |
 | `del`/`wipe` 不清 counter（M7） | `unlock_slots` 5 条红 |
 | 删掉 `battery_read_mv` 的下限判断 | `battery_floor` 3 条红（6 passed / 3 failed），报「raw=2 换算出 21 mV，battery_read_mv 却当成有效读数返回了」 |
+| `batt_gate`/`vbatt` 回 P0.04、`modem_pwrkey` 回 P0.12（引脚复核） | `test_overlay_only_uses_pins_the_board_exposes` 红，报「overlay 用了这块板没引出的脚：['P0.04', 'P0.12']」 |
+| 删掉 overlay 末尾的 `&i2c1 { status = "disabled"; }` | `test_overlay_disables_board_peripherals_that_steal_header_pins` 红，报「上游板级 DTS 把它设成 okay，它的 pinctrl 会占掉排针脚」 |
+| `batt_gate` 挪到 P0.06（引出但已是 uart0 TX） | 2 条红：脚位互斥那条 + 门控与分压器同脚那条 |
 
 M1 那两条在旧代码下仍然过——因为旧代码的失败方式是「静默丢弃」而不是
 「投递截断值」，而这两条断言的正是「不投递」。这个差异本身是实测得到的
@@ -320,7 +332,9 @@ M1 那两条在旧代码下仍然过——因为旧代码的失败方式是「�
 
 2. **MAIN_DTR / MAIN_RI 的具体脚号。** 至今无来源
    （`docs.openluat.com/4Gmodulepin/` 返回 404）。**布板前必须查
-   `Air780EP硬件手册V1.1.pdf`。** overlay 里现在填的 P0.26 是**占位值**。
+   `Air780EP硬件手册V1.1.pdf`。** overlay 里的 `modem_ri` 节点已删除
+   （原来填的 P0.26 这块板没引出，DESIGN.md §3.5），定了脚号之后
+   从余量里取一个、连监听代码一起加。
 
 第 1 条的验收要读日志，而**日志只能走 RTT，那条通路本身也还没验过**（§2b）——
 所以次序是：先烧个最小固件确认 RTT 出字，再去验 `AT^WAKEUPHEX`。
@@ -372,7 +386,7 @@ firmware/tests/ble_unlock_bsim/run.sh /tmp/btest
 | --- | --- | --- |
 | 锁用电磁锁还是电机锁（§7 第 1 条） | `lock.c` | 一根线、高有效、500 ms 脉冲。电机锁要改成半桥两根线 |
 | LIS2DW12 STATIONARY 走 INT2 而本板只接 INT1（§3d） | `motion.c`、overlay | **已定论**：MOTION 在 INT1（可用），STATIONARY 在 INT2（线没接，事件不会来）。当前不依赖它，静止判定用 `last_still_ms` 软件计时。要真用得接第二根线或越过驱动写 `CTRL_REG7.int2_on_int1` |
-| GPIO 分配（§3.5 现在有 21 个可用） | overlay | 用了 17 个，余 4 个（BLE 不占引脚，P0.09/P0.10 释放）。锁要 3 根线也装得下 |
+| ~~GPIO 分配~~（§3.5） | overlay | ✅ **2026-09-04 已核实并已改**：用了 **13 个**，余 **8 个**（P0.02 P0.09 P0.29 P1.01 P1.02 P1.04 P1.06 P1.07）。同时修掉三个**这块板没引出**的脚：`batt_gate` P0.04 → **P0.10**、`modem_pwrkey` P0.12 → **P1.00**、`modem_ri` P0.26 → 节点删除。SoC 有 48 个 GPIO 而板子只引出 21 个，填错 `west build` 照过 —— 白名单和四条护栏现在钉在 `test_firmware_contract.py`。顺带关掉上游板级 DTS 打开的 `i2c1`（抢 J2.12/J2.13）和 `spi2`（抢整个 J4） |
 | ADC 脚 | overlay | P0.31(AIN7)。只有 3 个真 ADC 脚，ZMK 的 A6~A10 别名不是 SAADC 通道 |
 | ~~电池采样分压比~~（§3.6 / §11 #27） | `battery.c`、overlay | ✅ **已定并已改**：**21:1**（`output-ohms=470000` / `full-ohms=4.7M+4.7M+470k`）。基准是引脚上限 **VDD 3.3 V**（不是 ADC 满量程 3.6 V —— 那是绝对最大值，按它算零余量）。`battery.c` 两条 `BUILD_ASSERT` 把比例和源阻抗（≤800 kΩ）钉成编译错误，都实测触发过。换算走 `voltage_divider_scale_dt()`。**电池不是 48 V 的话改 `PACK_MAX_MV`** |
 
