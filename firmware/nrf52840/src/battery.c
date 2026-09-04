@@ -82,6 +82,33 @@ BUILD_ASSERT(CONFIG_EBIKE_LOW_VOLT_1 > CONFIG_EBIKE_LOW_VOLT_2 &&
 	     "need EBIKE_LOW_VOLT_1 > EBIKE_LOW_VOLT_2 > EBIKE_LOW_VOLT_3, "
 	     "otherwise the middle level never triggers.");
 
+/* 采样链的**合理性下限**（毫伏）。低于这个值一律当读失败，不当欠压。
+ *
+ * 为什么需要：整数换算链是 `(raw * 600 * 6 >> 12) * 21`，一个 ADC LSB 是
+ * 17.6 mV 引脚电压 → **370 mV 电池电压**。于是 `raw = 2`（满量程的 0.05%）
+ * 就换算成 21 mV，直接命中 `battery_low_level()` 的第 3 级 →
+ * `enter_system_off()`。而在悬空/断线的高阻输入上读到两个 count 是常态
+ * （ADC 自身 ±3% 的 gain 误差、几个 LSB 的偏移误差都在这个量级），不是异常。
+ *
+ * 不挡的症状：**车电池好好的，车却自己进 System OFF**，摇一下醒来报一轮
+ * 又睡回去；上报的 lowbatt 里写着 `v=0.0`。日志和报文都指向「电池空了」，
+ * 而真实故障在采样链上 —— 是个查不出来的假欠压。
+ *
+ * 20 V 的物理依据：整机由 LX-P160 供电，**它的输入下限是 28 V**（§3.1）。
+ * 车电池真的低于 28 V 时这块板子根本不在运行，所以「板子在跑 + 采到 20 V
+ * 以下」只可能是采样链坏了：线没接、门控 MOS 常闭、分压电阻虚焊。
+ *
+ * 同型先例：modem.c 的 `MIN_PLAUSIBLE_UTC`（时间也是「不可能的值 = 没拿到」）。
+ */
+#define MIN_PLAUSIBLE_MV 20000
+
+/* 下限必须低于第三阈值，否则真实的深度欠压会被当成读失败吞掉 ——
+ * 那就把 §6 第 4 级（主动 System OFF 保护车电池）整个废了。 */
+BUILD_ASSERT(MIN_PLAUSIBLE_MV < CONFIG_EBIKE_LOW_VOLT_3,
+	     "MIN_PLAUSIBLE_MV must stay below EBIKE_LOW_VOLT_3, otherwise a "
+	     "real deep undervoltage is swallowed as a sampling failure and "
+	     "the level-3 System OFF fallback never triggers.");
+
 /* 门控打开后等多久再采。Rs = 448 kΩ 配引脚电容（PS v1.1 给的 CSAMPLE 2.5 pF，
  * 加走线和 ESD 结电容按 20 pF 估）的 RC 常数约 9 µs，给 500 µs 是几十倍余量；
  * 这段时间流的 6 µA 可以忽略。
@@ -168,6 +195,17 @@ int battery_read_mv(void)
 		/* full-ohms 缺失才会走到这 —— overlay 里写着，正常不可能 */
 		LOG_ERR("分压换算失败 rc=%d（overlay 少了 full-ohms？）", rc);
 		return rc;
+	}
+
+	/* 合理性下限（见 MIN_PLAUSIBLE_MV）。**返回负数就够了** ——
+	 * 两个下游都已经正确处理负数：uplink.c 的 `has_volt = mv > 0` 为假
+	 * （`v` 字段整个不发，不是发假的 0.0），`battery_low_level()` 的
+	 * `mv <= 0` 把它当读失败而不是欠压。 */
+	if (batt_mv < MIN_PLAUSIBLE_MV) {
+		LOG_ERR("电池读数 %d mV 低于合理下限 %d mV —— 采样链有问题"
+			"（分压线没接？门控 MOS？电阻虚焊？），当读失败处理",
+			batt_mv, MIN_PLAUSIBLE_MV);
+		return -ENODATA;
 	}
 
 	LOG_DBG("电池 %d mV（ADC %d mV，分压 %u/%u）", batt_mv, mv,

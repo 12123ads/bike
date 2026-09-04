@@ -249,7 +249,7 @@ DTS 属性** —— 走这条路必须自己越过驱动直接写 I2C 寄存器�
 export ZEPHYR_BASE=/opt/ncs/zephyr
 export ZEPHYR_SDK_INSTALL_DIR=/opt/zephyr-sdk/zephyr-sdk-1.0.1
 for t in modem_time modem_downlink motion_still modem_reconnect \
-         gnss_nmea uplink_events unlock_slots; do
+         gnss_nmea uplink_events unlock_slots battery_floor; do
     /opt/zephyrtool/bin/west build -p always -b native_sim -d /tmp/t_$t \
         firmware/tests/$t && /tmp/t_$t/$t/zephyr/zephyr.exe
 done
@@ -264,6 +264,7 @@ done
 | `gnss_nmea` | NMEA 校验和**真的挡住坏行**、ddmm.mmmm 换算、南纬西经取负、quality=0 不当定位（审计 R4） | 11 passed |
 | `uplink_events` | 事件队列**发送期间不持 `ev_lock`**、发失败留到下一轮、`dn/secret` 接线（审计 M3） | 7 passed |
 | `unlock_slots` | 密钥槽位复用**不继承旧 counter**、同 uid 轮换**保留** counter（审计 M7） | 8 passed |
+| `battery_floor` | **采样链坏了不能被当成「电池耗尽」**：`raw=2` 换算出 21 mV 而旧判据只有 `mv <= 0` 一个 LSB 宽 → 假欠压 → 主动 System OFF。顺带钉住三个等级边界、真实深度欠压仍判 3、两条路径都关门控 | 9 passed |
 
 `modem_downlink` 为什么值得单独一套：它盯的三条都**编得过、跑得起来、
 只是静默做错事** —— 和 §3c 里最难抓的那两个同型。
@@ -301,6 +302,7 @@ done
 | `checksum_ok` 用 `strtol`（R4） | `gnss_nmea` 1 条红，报「1.033333,2.050000（9 星）被当成有效定位」 |
 | `flush_events` 持锁发送（M3） | `uplink_events` 1 条红（那条用例耗时从 0.5 s 变 10 s —— 探针真的被卡住了） |
 | `del`/`wipe` 不清 counter（M7） | `unlock_slots` 5 条红 |
+| 删掉 `battery_read_mv` 的下限判断 | `battery_floor` 3 条红（6 passed / 3 failed），报「raw=2 换算出 21 mV，battery_read_mv 却当成有效读数返回了」 |
 
 M1 那两条在旧代码下仍然过——因为旧代码的失败方式是「静默丢弃」而不是
 「投递截断值」，而这两条断言的正是「不投递」。这个差异本身是实测得到的

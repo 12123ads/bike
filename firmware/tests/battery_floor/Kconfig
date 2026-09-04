@@ -1,0 +1,25 @@
+# battery.c 需要的项目 Kconfig 符号。
+#
+# 真固件的定义在 firmware/nrf52840/Kconfig。**三个欠压阈值必须与真固件的
+# 默认值一致**（46000 / 44000 / 42000）：测试的等级边界断言直接踩在它们上面，
+# 而 battery.c 的 `BUILD_ASSERT(MIN_PLAUSIBLE_MV < CONFIG_EBIKE_LOW_VOLT_3)`
+# 也用它们做输入 —— 这里改了就不是在测真固件的那份行为。
+
+config EBIKE_LOW_VOLT_1
+	int "第一欠压阈值（毫伏）"
+	default 46000
+
+config EBIKE_LOW_VOLT_2
+	int "第二欠压阈值（毫伏）"
+	default 44000
+
+config EBIKE_LOW_VOLT_3
+	int "第三欠压阈值（毫伏）"
+	default 42000
+
+config EBIKE_LOG_LEVEL
+	int "本项目模块的日志等级"
+	default 4
+	range 0 4
+
+source "Kconfig.zephyr"

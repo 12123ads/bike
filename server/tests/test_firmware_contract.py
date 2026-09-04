@@ -381,6 +381,44 @@ def test_battery_implements_four_levels():
         assert re.search(rf"return {lvl};", src), f"battery.c 不会返回等级 {lvl}"
 
 
+def test_battery_read_has_plausibility_floor():
+    """采样链坏了不能被当成「电池耗尽」。
+
+    整数换算链是 `(raw * 600 * 6 >> 12) * 21`，**一个 ADC LSB = 370 mV
+    电池电压**。原来 `battery_low_level()` 的读失败判据只有 `mv <= 0`，
+    于是 `raw = 2`（满量程的 0.05%，在断线的高阻输入上是常态）换算成
+    21 mV → 判第 3 级 → `main.c` 主动进 System OFF。车电池是好的，
+    行为却是「电池空了」，而且 lowbatt 里写着 `v=0.0`。
+
+    下限的物理依据：整机由 LX-P160 供电，输入下限 28 V（DESIGN.md §3.1）——
+    车电池真低于 28 V 时板子根本不在运行。
+
+    可执行的行为断言在 `firmware/tests/battery_floor`（9 条）；这里只钉住
+    「下限存在、且低于第三阈值」这两个不能被静默删掉的前提。
+    """
+    src = (FW / "src" / "battery.c").read_text(encoding="utf-8")
+
+    m = re.search(r"#define\s+MIN_PLAUSIBLE_MV\s+(\d+)", src)
+    assert m, "battery.c 没有合理性下限 —— 2 个 LSB 就会被判成电池耗尽"
+    floor = int(m.group(1))
+
+    # 下限必须真的用在读数路径上，不能只是个死常量
+    assert re.search(r"if \(batt_mv < MIN_PLAUSIBLE_MV\)", src), \
+        "MIN_PLAUSIBLE_MV 定义了但没在 battery_read_mv 里用"
+    # 必须返回负数：两个下游（has_volt / battery_low_level）都靠符号判失败
+    assert re.search(r"return -ENODATA;", src), \
+        "下限命中时没有返回负数 —— has_volt 和 battery_low_level 都靠符号判失败"
+
+    v3 = int(re.search(r"config EBIKE_LOW_VOLT_3.*?default (\d+)",
+                       KCONFIG.read_text(encoding="utf-8"), re.S).group(1))
+    assert floor < v3, \
+        f"下限 {floor} 不低于第三阈值 {v3} —— 真实的深度欠压会被当成读失败吞掉，" \
+        "§6 第 4 级就废了"
+    # LX-P160 输入下限 28 V：低于它板子不工作，所以下限必须明显在它之下
+    assert 10000 <= floor <= 28000, \
+        f"下限 {floor} mV 不在合理区间 —— 太低挡不住 LSB 噪声，太高会吞真实欠压"
+
+
 def test_reset_cause_maps_to_contract_closed_set():
     """契约 §5.1 的 `rst` 是 por/pin/wdt/soft/off 五值。
 
